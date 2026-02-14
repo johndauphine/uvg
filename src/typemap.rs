@@ -145,6 +145,7 @@ mod tests {
             column_default: None,
             is_identity: false,
             identity_generation: None,
+            identity: None,
             comment: None,
         }
     }

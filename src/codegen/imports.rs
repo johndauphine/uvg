@@ -71,20 +71,19 @@ impl ImportCollector {
             lines.push(format!("from {} import {}", module, names.join(", ")));
         }
 
-        // 2. Blank line separator if we had typing imports and have more
-        if !typing_imports.is_empty()
-            && (!bare_imports.is_empty()
-                || !sqlalchemy_imports.is_empty()
+        // 2. bare imports (e.g. `import datetime`) — no blank line after typing
+        bare_imports.sort();
+        for module in &bare_imports {
+            lines.push(format!("import {module}"));
+        }
+
+        // 3. Blank line separator before sqlalchemy imports
+        if (!typing_imports.is_empty() || !bare_imports.is_empty())
+            && (!sqlalchemy_imports.is_empty()
                 || !sqlalchemy_dialect_imports.is_empty()
                 || !sqlalchemy_orm_imports.is_empty())
         {
             lines.push(String::new());
-        }
-
-        // 3. bare imports (e.g. `import datetime`)
-        bare_imports.sort();
-        for module in &bare_imports {
-            lines.push(format!("import {module}"));
         }
 
         // 4. sqlalchemy imports
@@ -128,7 +127,7 @@ mod tests {
         ic.add("sqlalchemy", "Integer");
         ic.add("sqlalchemy.orm", "DeclarativeBase");
         let result = ic.render();
-        let expected = "from typing import Optional\n\nimport datetime\nfrom sqlalchemy import Integer\nfrom sqlalchemy.orm import DeclarativeBase";
+        let expected = "from typing import Optional\nimport datetime\n\nfrom sqlalchemy import Integer\nfrom sqlalchemy.orm import DeclarativeBase";
         assert_eq!(result, expected);
     }
 

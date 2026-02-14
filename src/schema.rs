@@ -38,7 +38,20 @@ pub struct ColumnInfo {
     pub column_default: Option<String>,
     pub is_identity: bool,
     pub identity_generation: Option<String>,
+    pub identity: Option<IdentityInfo>,
     pub comment: Option<String>,
+}
+
+/// Parameters for an identity column's underlying sequence.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct IdentityInfo {
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+    pub cache: i64,
 }
 
 /// Metadata for a constraint (PK, FK, Unique, Check).

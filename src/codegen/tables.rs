@@ -29,7 +29,7 @@ impl Generator for TablesGenerator {
         output.push_str("\n\nmetadata = MetaData()\n");
 
         for block in table_blocks {
-            output.push('\n');
+            output.push_str("\n\n");
             output.push_str(&block);
         }
 
@@ -70,6 +70,15 @@ fn generate_table(
                     col_args.push(format!("ForeignKey('{ref_col}')"));
                 }
             }
+        }
+
+        // Identity
+        if let Some(ref identity) = col.identity {
+            imports.add("sqlalchemy", "Identity");
+            col_args.push(format!(
+                "Identity(start={}, increment={}, minvalue={}, maxvalue={}, cycle=False, cache={})",
+                identity.start, identity.increment, identity.min_value, identity.max_value, identity.cache
+            ));
         }
 
         // Primary key
@@ -142,8 +151,29 @@ fn generate_table(
         }
     }
 
-    // Schema
-    lines.push(format!("    schema='{}'", table.schema));
+    // Primary key constraint
+    if !options.noconstraints {
+        for constraint in &table.constraints {
+            if constraint.constraint_type == ConstraintType::PrimaryKey {
+                imports.add("sqlalchemy", "PrimaryKeyConstraint");
+                let cols: Vec<String> = constraint
+                    .columns
+                    .iter()
+                    .map(|c| format!("'{c}'"))
+                    .collect();
+                lines.push(format!(
+                    "    PrimaryKeyConstraint({}, name='{}')",
+                    cols.join(", "),
+                    constraint.name
+                ));
+            }
+        }
+    }
+
+    // Schema (only if not 'public')
+    if table.schema != "public" {
+        lines.push(format!("    schema='{}'", table.schema));
+    }
     lines.push(")".to_string());
 
     lines.join("\n")
@@ -187,6 +217,7 @@ mod tests {
                         column_default: None,
                         is_identity: false,
                         identity_generation: None,
+                        identity: None,
                         comment: None,
                     },
                     ColumnInfo {
@@ -201,6 +232,7 @@ mod tests {
                         column_default: None,
                         is_identity: false,
                         identity_generation: None,
+                        identity: None,
                         comment: None,
                     },
                     ColumnInfo {
@@ -215,6 +247,7 @@ mod tests {
                         column_default: None,
                         is_identity: false,
                         identity_generation: None,
+                        identity: None,
                         comment: None,
                     },
                 ],

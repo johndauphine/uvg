@@ -1,7 +1,7 @@
 use sqlx::PgPool;
 
 use crate::error::UvgError;
-use crate::schema::ColumnInfo;
+use crate::schema::{ColumnInfo, IdentityInfo};
 
 pub async fn query_columns(
     pool: &PgPool,
@@ -28,9 +28,14 @@ pub async fn query_columns(
     .fetch_all(pool)
     .await?;
 
-    let columns = rows
-        .into_iter()
-        .map(|row| ColumnInfo {
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in rows {
+        let identity = if row.is_identity {
+            query_identity_info(pool, schema, table_name, &row.column_name).await?
+        } else {
+            None
+        };
+        columns.push(ColumnInfo {
             name: row.column_name,
             ordinal_position: row.ordinal_position,
             is_nullable: row.is_nullable,
@@ -42,11 +47,43 @@ pub async fn query_columns(
             column_default: row.column_default,
             is_identity: row.is_identity,
             identity_generation: row.identity_generation,
+            identity,
             comment: row.comment,
-        })
-        .collect();
+        });
+    }
 
     Ok(columns)
+}
+
+/// Query identity sequence parameters for an identity column.
+async fn query_identity_info(
+    pool: &PgPool,
+    schema: &str,
+    table_name: &str,
+    column_name: &str,
+) -> Result<Option<IdentityInfo>, UvgError> {
+    let qualified = format!("{schema}.{table_name}");
+    let row = sqlx::query_as::<_, IdentityRow>(
+        r#"
+        SELECT s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcycle, s.seqcache
+        FROM pg_sequence s
+        JOIN pg_class c ON c.oid = s.seqrelid
+        WHERE c.oid = pg_get_serial_sequence($1, $2)::regclass
+        "#,
+    )
+    .bind(&qualified)
+    .bind(column_name)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| IdentityInfo {
+        start: r.seqstart,
+        increment: r.seqincrement,
+        min_value: r.seqmin,
+        max_value: r.seqmax,
+        cycle: r.seqcycle,
+        cache: r.seqcache,
+    }))
 }
 
 #[derive(sqlx::FromRow)]
@@ -63,4 +100,14 @@ struct ColumnRow {
     is_identity: bool,
     identity_generation: Option<String>,
     comment: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct IdentityRow {
+    seqstart: i64,
+    seqincrement: i64,
+    seqmin: i64,
+    seqmax: i64,
+    seqcycle: bool,
+    seqcache: i64,
 }

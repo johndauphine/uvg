@@ -55,11 +55,10 @@ impl Generator for DeclarativeGenerator {
         }
 
         let mut output = imports.render();
-        output.push_str("\n\n\nclass Base(DeclarativeBase):\n    pass\n");
+        output.push_str("\n\nclass Base(DeclarativeBase):\n    pass");
 
         for block in class_blocks {
-            output.push('\n');
-            output.push('\n');
+            output.push_str("\n\n\n");
             output.push_str(&block);
         }
 
@@ -94,14 +93,21 @@ fn generate_class(
 
     // Table-level args (multi-column unique constraints, indexes, comments, schema)
     let table_args = build_table_args(table, imports, options);
-    if !table_args.is_empty() {
-        lines.push(format!("    __table_args__ = ({table_args})"));
+    if let Some(args_str) = table_args {
+        lines.push(format!("    __table_args__ = (\n{args_str}\n    )"));
     }
 
     // Blank line before columns
     lines.push(String::new());
 
-    // Columns
+    // Build column lines
+    struct ColLine {
+        is_pk: bool,
+        is_nullable: bool,
+        line: String,
+    }
+    let mut col_lines: Vec<ColLine> = Vec::new();
+
     for col in &table.columns {
         let mapped = map_column_type(col);
         imports.add(&mapped.import_module, &mapped.import_name);
@@ -120,21 +126,21 @@ fn generate_class(
             meta.needs_uuid = true;
         }
 
+        let is_pk = is_primary_key_column(&col.name, &table.constraints);
+
         // Python type annotation
         let python_type = &mapped.python_type;
-        let type_annotation =
-            if col.is_nullable && !is_primary_key_column(&col.name, &table.constraints) {
-                meta.needs_optional = true;
-                format!("Optional[{python_type}]")
-            } else {
-                python_type.clone()
-            };
+        let type_annotation = if col.is_nullable && !is_pk {
+            meta.needs_optional = true;
+            format!("Optional[{python_type}]")
+        } else {
+            python_type.clone()
+        };
 
         // mapped_column arguments
         let mut mc_args: Vec<String> = Vec::new();
 
-        // Type argument - only include if it's not a simple mapping
-        // (always include for clarity in this generator)
+        // Type argument
         mc_args.push(mapped.sa_type.clone());
 
         // Foreign key
@@ -148,8 +154,22 @@ fn generate_class(
             }
         }
 
+        // Identity
+        if let Some(ref identity) = col.identity {
+            imports.add("sqlalchemy", "Identity");
+            mc_args.push(format!(
+                "Identity(start={}, increment={}, minvalue={}, maxvalue={}, cycle=False, cache={})",
+                identity.start, identity.increment, identity.min_value, identity.max_value, identity.cache
+            ));
+        }
+
+        // nullable=False on non-nullable non-PK columns
+        if !col.is_nullable && !is_pk {
+            mc_args.push("nullable=False".to_string());
+        }
+
         // Primary key
-        if is_primary_key_column(&col.name, &table.constraints) {
+        if is_pk {
             mc_args.push("primary_key=True".to_string());
         }
 
@@ -175,10 +195,30 @@ fn generate_class(
         }
 
         let mc_str = mc_args.join(", ");
-        lines.push(format!(
+        let line = format!(
             "    {}: Mapped[{type_annotation}] = mapped_column({mc_str})",
             col.name
-        ));
+        );
+        col_lines.push(ColLine {
+            is_pk,
+            is_nullable: col.is_nullable,
+            line,
+        });
+    }
+
+    // Sort columns: PK first, then non-nullable non-PK, then nullable — all preserving ordinal order
+    let pk_cols: Vec<&ColLine> = col_lines.iter().filter(|c| c.is_pk).collect();
+    let non_nullable: Vec<&ColLine> = col_lines
+        .iter()
+        .filter(|c| !c.is_pk && !c.is_nullable)
+        .collect();
+    let nullable: Vec<&ColLine> = col_lines
+        .iter()
+        .filter(|c| !c.is_pk && c.is_nullable)
+        .collect();
+
+    for col_line in pk_cols.iter().chain(non_nullable.iter()).chain(nullable.iter()) {
+        lines.push(col_line.line.clone());
     }
 
     (lines.join("\n"), meta)
@@ -188,8 +228,27 @@ fn build_table_args(
     table: &TableInfo,
     imports: &mut ImportCollector,
     options: &GeneratorOptions,
-) -> String {
+) -> Option<String> {
     let mut args: Vec<String> = Vec::new();
+
+    // Primary key constraint
+    if !options.noconstraints {
+        for constraint in &table.constraints {
+            if constraint.constraint_type == ConstraintType::PrimaryKey {
+                imports.add("sqlalchemy", "PrimaryKeyConstraint");
+                let cols: Vec<String> = constraint
+                    .columns
+                    .iter()
+                    .map(|c| format!("'{c}'"))
+                    .collect();
+                args.push(format!(
+                    "PrimaryKeyConstraint({}, name='{}')",
+                    cols.join(", "),
+                    constraint.name
+                ));
+            }
+        }
+    }
 
     // Multi-column unique constraints
     if !options.noconstraints {
@@ -238,14 +297,10 @@ fn build_table_args(
     }
 
     if args.is_empty() {
-        String::new()
+        None
     } else {
-        // Single item needs trailing comma to be a tuple
-        if args.len() == 1 {
-            format!("{},", args[0])
-        } else {
-            args.join(", ")
-        }
+        let formatted: Vec<String> = args.iter().map(|a| format!("        {a},")).collect();
+        Some(formatted.join("\n"))
     }
 }
 
@@ -287,6 +342,7 @@ mod tests {
                             column_default: None,
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                         ColumnInfo {
@@ -301,6 +357,7 @@ mod tests {
                             column_default: None,
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                         ColumnInfo {
@@ -315,6 +372,7 @@ mod tests {
                             column_default: None,
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                         ColumnInfo {
@@ -329,6 +387,7 @@ mod tests {
                             column_default: None,
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                         ColumnInfo {
@@ -343,6 +402,7 @@ mod tests {
                             column_default: Some("now()".to_string()),
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                     ],
@@ -380,6 +440,7 @@ mod tests {
                             column_default: None,
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                         ColumnInfo {
@@ -394,6 +455,7 @@ mod tests {
                             column_default: None,
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                         ColumnInfo {
@@ -408,6 +470,7 @@ mod tests {
                             column_default: None,
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                         ColumnInfo {
@@ -422,6 +485,7 @@ mod tests {
                             column_default: None,
                             is_identity: false,
                             identity_generation: None,
+                            identity: None,
                             comment: None,
                         },
                     ],
@@ -458,13 +522,14 @@ mod tests {
         let output = gen.generate(&schema, &GeneratorOptions::default());
         assert!(output.contains("class Users(Base):"));
         assert!(output.contains("__tablename__ = 'users'"));
+        assert!(output.contains("PrimaryKeyConstraint('id', name='users_pkey'),"));
         assert!(output.contains("id: Mapped[int] = mapped_column(Integer, primary_key=True)"));
-        assert!(output.contains("name: Mapped[str] = mapped_column(String(100))"));
-        assert!(output.contains("email: Mapped[str] = mapped_column(String(255), unique=True)"));
+        assert!(output.contains("name: Mapped[str] = mapped_column(String(100), nullable=False)"));
+        assert!(output.contains("email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)"));
         assert!(output.contains("bio: Mapped[Optional[str]] = mapped_column(Text)"));
         assert!(output.contains("class Posts(Base):"));
         assert!(output
-            .contains("user_id: Mapped[int] = mapped_column(Integer, ForeignKey('users.id'))"));
+            .contains("user_id: Mapped[int] = mapped_column(Integer, ForeignKey('users.id'), nullable=False)"));
     }
 
     #[test]
