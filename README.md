@@ -1,6 +1,6 @@
 # UVg
 
-A Rust reimplementation of [sqlacodegen](https://github.com/agronholm/sqlacodegen) — connects to a PostgreSQL database, introspects its schema, and generates SQLAlchemy Python model code.
+A Rust reimplementation of [sqlacodegen](https://github.com/agronholm/sqlacodegen) — connects to a PostgreSQL or Microsoft SQL Server database, introspects its schema, and generates SQLAlchemy Python model code.
 
 Single binary, drop-in compatible CLI, same output.
 
@@ -19,10 +19,13 @@ uvg <database-url>
 Accepts SQLAlchemy-style URLs:
 
 ```bash
-# Declarative ORM classes (default)
+# PostgreSQL
 uvg postgresql://user:pass@localhost/mydb
 
-# Table objects
+# Microsoft SQL Server
+uvg mssql://user:pass@localhost/mydb
+
+# Table objects instead of declarative classes
 uvg --generator tables postgresql://user:pass@localhost/mydb
 
 # Filter specific tables
@@ -38,10 +41,11 @@ uvg --outfile models.py postgresql://user:pass@localhost/mydb
 |---|---|
 | `--generator <TYPE>` | `declarative` (default) or `tables` |
 | `--tables <LIST>` | Comma-delimited table names to include |
-| `--schemas <LIST>` | Schemas to introspect (default: `public`) |
+| `--schemas <LIST>` | Schemas to introspect (default: `public` for PG, `dbo` for MSSQL) |
 | `--noviews` | Skip views |
 | `--options <LIST>` | `noindexes`, `noconstraints`, `nocomments`, `use_inflect`, `nojoined`, `nobidi` |
 | `--outfile <PATH>` | Output file (default: stdout) |
+| `--trust-cert` | Trust the server certificate (MSSQL only) |
 
 ## Output Examples
 
@@ -85,13 +89,31 @@ t_users = Table(
 )
 ```
 
-## Supported PostgreSQL Types
+## Supported Databases
+
+### PostgreSQL
 
 Scalars: `bool`, `int2`, `int4`, `int8`, `float4`, `float8`, `numeric`, `text`, `varchar`, `char`, `bytea`, `date`, `time`, `timetz`, `timestamp`, `timestamptz`, `interval`
 
 Dialect types: `uuid`, `json`, `jsonb`, `inet`, `cidr`
 
 Arrays: `_int4`, `_text`, and other array types via the `ARRAY()` wrapper
+
+URL schemes: `postgresql://`, `postgresql+psycopg2://`
+
+### Microsoft SQL Server
+
+Scalars: `bit`, `tinyint`, `smallint`, `int`, `bigint`, `real`, `float`, `decimal`, `numeric`, `money`, `smallmoney`
+
+Strings: `char`, `varchar`, `nchar`, `nvarchar`, `text`, `ntext` (with collation)
+
+Date/time: `date`, `time`, `datetime`, `datetime2`, `smalldatetime`, `datetimeoffset`
+
+Binary: `binary`, `varbinary`, `image`
+
+Dialect types: `uniqueidentifier`
+
+URL schemes: `mssql://`, `mssql+pytds://`, `mssql+pyodbc://`, `mssql+pymssql://`
 
 ## Building from source
 
@@ -107,8 +129,12 @@ cargo build --release
 cargo test
 ```
 
-Integration tests require a live PostgreSQL database:
+Integration tests require a live database:
 
 ```bash
+# PostgreSQL
 DATABASE_URL=postgresql://user:pass@localhost/testdb cargo test --test integration -- --ignored
+
+# Microsoft SQL Server
+DATABASE_URL=mssql://user:pass@localhost/testdb cargo test --test integration -- --ignored
 ```
