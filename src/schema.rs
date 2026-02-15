@@ -1,8 +1,9 @@
-pub const DEFAULT_SCHEMA: &str = "public";
+use crate::dialect::Dialect;
 
 /// Represents an introspected database schema containing all tables and their metadata.
 #[derive(Debug, Clone)]
 pub struct IntrospectedSchema {
+    pub dialect: Dialect,
     pub tables: Vec<TableInfo>,
 }
 
