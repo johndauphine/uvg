@@ -151,8 +151,17 @@ impl Cli {
                 "MSSQL URL must include a database name".to_string(),
             ));
         }
-        let user = parsed.username().to_string();
-        let password = parsed.password().unwrap_or("").to_string();
+        let user = percent_encoding::percent_decode_str(parsed.username())
+            .decode_utf8_lossy()
+            .into_owned();
+        let password = parsed
+            .password()
+            .map(|p| {
+                percent_encoding::percent_decode_str(p)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
 
         Ok(ConnectionConfig::Mssql {
             host,

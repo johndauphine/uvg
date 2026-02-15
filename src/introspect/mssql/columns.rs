@@ -21,8 +21,8 @@ pub async fn query_columns(
             c.NUMERIC_SCALE,
             c.COLUMN_DEFAULT,
             COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS is_identity,
-            ic.seed_value,
-            ic.increment_value,
+            CAST(ic.seed_value AS BIGINT) AS seed_value,
+            CAST(ic.increment_value AS BIGINT) AS increment_value,
             CAST(ep.value AS NVARCHAR(MAX)) AS comment
         FROM INFORMATION_SCHEMA.COLUMNS c
         LEFT JOIN sys.identity_columns ic
@@ -62,11 +62,11 @@ pub async fn query_columns(
         let numeric_scale: Option<i32> = row.get::<i32, _>("NUMERIC_SCALE");
 
         let identity = if is_identity {
-            let seed: Option<tiberius::numeric::Numeric> = row.get("seed_value");
-            let incr: Option<tiberius::numeric::Numeric> = row.get("increment_value");
+            let seed: i64 = row.get::<i64, _>("seed_value").unwrap_or(1);
+            let incr: i64 = row.get::<i64, _>("increment_value").unwrap_or(1);
             Some(IdentityInfo {
-                start: numeric_to_i64(seed),
-                increment: numeric_to_i64(incr),
+                start: seed,
+                increment: incr,
                 min_value: 0,
                 max_value: 0,
                 cycle: false,
@@ -105,13 +105,3 @@ pub async fn query_columns(
     Ok(columns)
 }
 
-fn numeric_to_i64(val: Option<tiberius::numeric::Numeric>) -> i64 {
-    match val {
-        Some(n) => {
-            // Tiberius Numeric has int_part() for the integer portion
-            let s = format!("{n}");
-            s.parse::<f64>().unwrap_or(1.0) as i64
-        }
-        None => 1,
-    }
-}

@@ -2133,6 +2133,7 @@ dependencies = [
  "clap",
  "heck",
  "insta",
+ "percent-encoding",
  "sqlx",
  "thiserror 2.0.18",
  "tiberius",
