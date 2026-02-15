@@ -23,7 +23,8 @@ pub async fn query_columns(
             COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS is_identity,
             CAST(ic.seed_value AS BIGINT) AS seed_value,
             CAST(ic.increment_value AS BIGINT) AS increment_value,
-            CAST(ep.value AS NVARCHAR(MAX)) AS comment
+            CAST(ep.value AS NVARCHAR(MAX)) AS comment,
+            c.COLLATION_NAME
         FROM INFORMATION_SCHEMA.COLUMNS c
         LEFT JOIN sys.identity_columns ic
             ON ic.object_id = OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME))
@@ -99,6 +100,7 @@ pub async fn query_columns(
             },
             identity,
             comment: row.get::<&str, _>("comment").map(|s| s.to_string()),
+            collation: row.get::<&str, _>("COLLATION_NAME").map(|s| s.to_string()),
         });
     }
 

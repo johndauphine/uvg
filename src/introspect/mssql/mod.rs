@@ -68,6 +68,9 @@ pub async fn introspect(
         all_tables.extend(schema_tables);
     }
 
+    // Sort by byte order (case-sensitive) to match sqlacodegen's Python sort
+    all_tables.sort_by(|a, b| a.name.cmp(&b.name));
+
     Ok(IntrospectedSchema {
         dialect: Dialect::Mssql,
         tables: all_tables,

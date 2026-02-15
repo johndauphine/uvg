@@ -43,6 +43,7 @@ pub struct ColumnInfo {
     pub identity_generation: Option<String>,
     pub identity: Option<IdentityInfo>,
     pub comment: Option<String>,
+    pub collation: Option<String>,
 }
 
 /// Parameters for an identity column's underlying sequence.

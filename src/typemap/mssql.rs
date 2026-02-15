@@ -43,10 +43,7 @@ pub fn map_column_type(col: &ColumnInfo) -> MappedType {
             element_import: None,
         },
         "varchar" | "char" => {
-            let sa_type = match col.character_maximum_length {
-                Some(n) => format!("String({n})"),
-                None => "String".to_string(),
-            };
+            let sa_type = format_string_type("String", col.character_maximum_length, col.collation.as_deref());
             MappedType {
                 sa_type,
                 python_type: "str".to_string(),
@@ -56,10 +53,7 @@ pub fn map_column_type(col: &ColumnInfo) -> MappedType {
             }
         }
         "nvarchar" | "nchar" => {
-            let sa_type = match col.character_maximum_length {
-                Some(n) => format!("Unicode({n})"),
-                None => "Unicode".to_string(),
-            };
+            let sa_type = format_string_type("Unicode", col.character_maximum_length, col.collation.as_deref());
             MappedType {
                 sa_type,
                 python_type: "str".to_string(),
@@ -94,6 +88,17 @@ pub fn map_column_type(col: &ColumnInfo) -> MappedType {
             import_name: other.to_uppercase(),
             element_import: None,
         },
+    }
+}
+
+/// Format a String/Unicode type expression with optional length and collation.
+/// Matches sqlacodegen output: `String(50, 'collation')` or `Unicode(collation='collation')`.
+fn format_string_type(base: &str, length: Option<i32>, collation: Option<&str>) -> String {
+    match (length, collation) {
+        (Some(n), Some(c)) => format!("{base}({n}, '{c}')"),
+        (Some(n), None) => format!("{base}({n})"),
+        (None, Some(c)) => format!("{base}(collation='{c}')"),
+        (None, None) => base.to_string(),
     }
 }
 

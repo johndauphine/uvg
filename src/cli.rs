@@ -121,6 +121,7 @@ impl Cli {
         if url.starts_with("mssql://")
             || url.starts_with("mssql+pytds://")
             || url.starts_with("mssql+pyodbc://")
+            || url.starts_with("mssql+pymssql://")
         {
             return self.parse_mssql_url(url);
         }
@@ -135,6 +136,8 @@ impl Cli {
         let normalized = if let Some(rest) = raw.strip_prefix("mssql+pytds://") {
             format!("mssql://{rest}")
         } else if let Some(rest) = raw.strip_prefix("mssql+pyodbc://") {
+            format!("mssql://{rest}")
+        } else if let Some(rest) = raw.strip_prefix("mssql+pymssql://") {
             format!("mssql://{rest}")
         } else {
             raw.to_string()
