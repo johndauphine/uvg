@@ -242,4 +242,77 @@ mod tests {
         let output = gen.generate(&schema, &GeneratorOptions::default());
         insta::assert_yaml_snapshot!(output);
     }
+
+    #[test]
+    fn test_tables_generator_no_pk() {
+        let schema = IntrospectedSchema {
+            dialect: Dialect::Postgres,
+            tables: vec![TableInfo {
+                schema: "public".to_string(),
+                name: "audit_log".to_string(),
+                table_type: TableType::Table,
+                comment: None,
+                columns: vec![
+                    ColumnInfo {
+                        udt_name: "timestamptz".to_string(),
+                        ..test_column("ts")
+                    },
+                    ColumnInfo {
+                        udt_name: "text".to_string(),
+                        ..test_column("action")
+                    },
+                    ColumnInfo {
+                        is_nullable: true,
+                        udt_name: "text".to_string(),
+                        ..test_column("detail")
+                    },
+                ],
+                constraints: vec![],
+                indexes: vec![],
+            }],
+        };
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+
+        // Should generate a Table() without any primary_key=True
+        assert!(output.contains("t_audit_log = Table("));
+        assert!(!output.contains("primary_key=True"));
+        assert!(!output.contains("PrimaryKeyConstraint"));
+        assert!(output.contains("Column('ts', DateTime(timezone=True), nullable=False)"));
+        assert!(output.contains("Column('action', Text, nullable=False)"));
+        assert!(output.contains("Column('detail', Text)"));
+    }
+
+    #[test]
+    fn test_tables_generator_no_pk_snapshot() {
+        let schema = IntrospectedSchema {
+            dialect: Dialect::Postgres,
+            tables: vec![TableInfo {
+                schema: "public".to_string(),
+                name: "audit_log".to_string(),
+                table_type: TableType::Table,
+                comment: None,
+                columns: vec![
+                    ColumnInfo {
+                        udt_name: "timestamptz".to_string(),
+                        ..test_column("ts")
+                    },
+                    ColumnInfo {
+                        udt_name: "text".to_string(),
+                        ..test_column("action")
+                    },
+                    ColumnInfo {
+                        is_nullable: true,
+                        udt_name: "text".to_string(),
+                        ..test_column("detail")
+                    },
+                ],
+                constraints: vec![],
+                indexes: vec![],
+            }],
+        };
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        insta::assert_yaml_snapshot!(output);
+    }
 }

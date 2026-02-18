@@ -73,6 +73,13 @@ fn strip_mssql_parens(expr: &str) -> &str {
     s.trim()
 }
 
+/// Check if a table has any primary key constraint.
+pub fn has_primary_key(constraints: &[crate::schema::ConstraintInfo]) -> bool {
+    constraints
+        .iter()
+        .any(|c| c.constraint_type == crate::schema::ConstraintType::PrimaryKey)
+}
+
 /// Check if a column is part of the primary key.
 pub fn is_primary_key_column(
     col_name: &str,
