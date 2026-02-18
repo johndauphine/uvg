@@ -358,7 +358,7 @@ fn build_table_args(
 }
 
 /// Generate a Table() assignment for a table without a primary key.
-/// Uses `Base.metadata` as the metadata reference.
+/// Uses the provided `metadata_ref` (e.g. `Base.metadata` or standalone `metadata`) as the metadata reference.
 fn generate_table_fallback(
     table: &TableInfo,
     imports: &mut ImportCollector,
