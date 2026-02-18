@@ -1,5 +1,6 @@
 ---
 source: src/codegen/tables.rs
+assertion_line: 243
 expression: output
 ---
 "from sqlalchemy import Column, Integer, MetaData, PrimaryKeyConstraint, String, Table, Text\n\nmetadata = MetaData()\n\n\nt_users = Table(\n    'users', metadata,\n    Column('id', Integer, primary_key=True),\n    Column('name', String(100), nullable=False),\n    Column('email', Text),\n    PrimaryKeyConstraint('id', name='users_pkey')\n)\n"
