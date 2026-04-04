@@ -5,9 +5,10 @@ use crate::codegen::relationships::{
     has_unique_constraint, render_relationship,
 };
 use crate::codegen::{
-    escape_python_string, format_fk_options, format_python_string_literal,
-    format_server_default, has_primary_key, is_primary_key_column, is_serial_default,
-    is_unique_constraint_index, quote_constraint_columns, topo_sort_tables, Generator,
+    enum_class_name, escape_python_string, find_enum_for_column, format_fk_options,
+    format_python_string_literal, format_server_default, generate_enum_class, has_primary_key,
+    is_primary_key_column, is_serial_default, is_unique_constraint_index,
+    quote_constraint_columns, topo_sort_tables, Generator,
 };
 use crate::dialect::Dialect;
 use crate::naming::{column_to_attr_name, table_to_class_name, table_to_variable_name};
@@ -43,8 +44,20 @@ impl Generator for DeclarativeGenerator {
 
         let metadata_ref = if has_any_pk { "Base.metadata" } else { "metadata" };
 
+        // Track which enums are used
+        let mut used_enums: Vec<&crate::schema::EnumInfo> = Vec::new();
+
         let sorted_tables = topo_sort_tables(&schema.tables);
         for table in sorted_tables {
+            // Track enum usage
+            for col_info in &table.columns {
+                if let Some(ei) = find_enum_for_column(&col_info.udt_name, &schema.enums) {
+                    if !used_enums.iter().any(|e| e.schema == ei.schema && e.name == ei.name) {
+                        used_enums.push(ei);
+                    }
+                }
+            }
+
             if has_primary_key(&table.constraints) {
                 let (block, meta) = generate_class(table, &mut imports, options, schema.dialect, schema);
                 if meta.needs_optional {
@@ -67,6 +80,11 @@ impl Generator for DeclarativeGenerator {
             }
         }
 
+        if !used_enums.is_empty() {
+            imports.add_bare("enum");
+            imports.add("sqlalchemy", "Enum");
+        }
+
         if needs_optional {
             imports.add("typing", "Optional");
         }
@@ -81,6 +99,12 @@ impl Generator for DeclarativeGenerator {
         }
 
         let mut output = imports.render();
+
+        // Enum class definitions
+        for ei in &used_enums {
+            output.push_str("\n\n");
+            output.push_str(&generate_enum_class(ei));
+        }
 
         if has_any_pk {
             output.push_str("\n\nclass Base(DeclarativeBase):\n    pass");
@@ -165,27 +189,44 @@ fn generate_class(
 
     for (idx, col) in table.columns.iter().enumerate() {
         let attr_name = &attr_names[idx];
-        let mapped = map_column_type(col, dialect);
-        imports.add(&mapped.import_module, &mapped.import_name);
-        if let Some((ref elem_mod, ref elem_name)) = mapped.element_import {
-            imports.add(elem_mod, elem_name);
-        }
 
-        // Track stdlib import needs
-        if mapped.python_type.starts_with("datetime.") {
-            meta.needs_datetime = true;
-        }
-        if mapped.python_type.starts_with("decimal.") {
-            meta.needs_decimal = true;
-        }
-        if mapped.python_type.starts_with("uuid.") {
-            meta.needs_uuid = true;
-        }
+        // Resolve column type: check for enum first, then regular type mapping
+        let enum_info = find_enum_for_column(&col.udt_name, &schema.enums);
+        let (sa_type_str, python_type) = if let Some(ei) = enum_info {
+            let cls = enum_class_name(&ei.name);
+            let mut enum_parts = vec![
+                cls.clone(),
+                "values_callable=lambda cls: [member.value for member in cls]".to_string(),
+                format!("name={}", format_python_string_literal(&ei.name)),
+            ];
+            if let Some(ref sch) = ei.schema {
+                if !sch.is_empty() {
+                    enum_parts.push(format!("schema={}", format_python_string_literal(sch)));
+                }
+            }
+            let sa = format!("Enum({})", enum_parts.join(", "));
+            (sa, cls)
+        } else {
+            let mapped = map_column_type(col, dialect);
+            imports.add(&mapped.import_module, &mapped.import_name);
+            if let Some((ref elem_mod, ref elem_name)) = mapped.element_import {
+                imports.add(elem_mod, elem_name);
+            }
+            if mapped.python_type.starts_with("datetime.") {
+                meta.needs_datetime = true;
+            }
+            if mapped.python_type.starts_with("decimal.") {
+                meta.needs_decimal = true;
+            }
+            if mapped.python_type.starts_with("uuid.") {
+                meta.needs_uuid = true;
+            }
+            (mapped.sa_type.clone(), mapped.python_type.clone())
+        };
 
         let is_pk = is_primary_key_column(&col.name, &table.constraints);
 
         // Python type annotation
-        let python_type = &mapped.python_type;
         let type_annotation = if col.is_nullable {
             meta.needs_optional = true;
             format!("Optional[{python_type}]")
@@ -219,7 +260,7 @@ fn generate_class(
             }
         } else {
             // No inline FK — use SA type
-            mc_args.push(mapped.sa_type.clone());
+            mc_args.push(sa_type_str.clone());
         }
 
         // Identity — dialect-aware output
@@ -1251,5 +1292,46 @@ mod tests {
         assert!(output.contains("oglkrogk: Mapped[list['Oglkrogk']] = relationship('Oglkrogk', back_populates='fehwiuhfiw')"));
         // Child-side relationship: fehwiuhfiwID stripped to fehwiuhfiw
         assert!(output.contains("fehwiuhfiw: Mapped[Optional['Fehwiuhfiw']] = relationship('Fehwiuhfiw', back_populates='oglkrogk')"));
+    }
+
+    // --- Tier 4: Enum tests ---
+
+    /// Adapted from sqlacodegen test_enum_shared_values (declarative).
+    #[test]
+    fn test_declarative_enum_shared_values() {
+        use crate::schema::EnumInfo;
+        let schema = schema_pg_with_enums(
+            vec![
+                table("accounts")
+                    .column(col("id").build())
+                    .column(col("status").udt("status_enum").build())
+                    .pk("accounts_pkey", &["id"])
+                    .build(),
+                table("users")
+                    .column(col("id").build())
+                    .column(col("status").udt("status_enum").build())
+                    .pk("users_pkey", &["id"])
+                    .build(),
+            ],
+            vec![EnumInfo {
+                name: "status_enum".to_string(),
+                schema: None,
+                values: vec![
+                    "active".to_string(),
+                    "inactive".to_string(),
+                    "pending".to_string(),
+                ],
+            }],
+        );
+        let gen = DeclarativeGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        // Enum class generated before Base
+        assert!(output.contains("class StatusEnum(str, enum.Enum):"));
+        assert!(output.contains("ACTIVE = 'active'"));
+        // Enum used in column type annotation
+        assert!(output.contains("status: Mapped[StatusEnum] = mapped_column(Enum(StatusEnum, values_callable=lambda cls: [member.value for member in cls], name='status_enum'), nullable=False)"));
+        // import enum
+        assert!(output.contains("import enum"));
+        assert!(output.contains("Enum"));
     }
 }

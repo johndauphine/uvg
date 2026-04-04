@@ -5,6 +5,16 @@ use crate::dialect::Dialect;
 pub struct IntrospectedSchema {
     pub dialect: Dialect,
     pub tables: Vec<TableInfo>,
+    /// Named enum types defined in the database.
+    pub enums: Vec<EnumInfo>,
+}
+
+/// A named enum type in the database.
+#[derive(Debug, Clone)]
+pub struct EnumInfo {
+    pub name: String,
+    pub schema: Option<String>,
+    pub values: Vec<String>,
 }
 
 /// Metadata for a single table or view.

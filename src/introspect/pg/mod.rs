@@ -42,5 +42,6 @@ pub async fn introspect(
     Ok(IntrospectedSchema {
         dialect: Dialect::Postgres,
         tables: all_tables,
+        enums: vec![],
     })
 }

@@ -244,6 +244,7 @@ pub fn schema_pg(tables: Vec<TableInfo>) -> IntrospectedSchema {
     IntrospectedSchema {
         dialect: Dialect::Postgres,
         tables,
+        enums: vec![],
     }
 }
 
@@ -252,6 +253,19 @@ pub fn schema_mssql(tables: Vec<TableInfo>) -> IntrospectedSchema {
     IntrospectedSchema {
         dialect: Dialect::Mssql,
         tables,
+        enums: vec![],
+    }
+}
+
+/// Create an IntrospectedSchema with Postgres dialect and enum definitions.
+pub fn schema_pg_with_enums(
+    tables: Vec<TableInfo>,
+    enums: Vec<EnumInfo>,
+) -> IntrospectedSchema {
+    IntrospectedSchema {
+        dialect: Dialect::Postgres,
+        tables,
+        enums,
     }
 }
 

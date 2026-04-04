@@ -146,6 +146,46 @@ pub fn format_python_string_literal(s: &str) -> String {
     }
 }
 
+/// Generate a Python enum class from an EnumInfo.
+/// Returns the class definition string (e.g. "class StatusEnum(str, enum.Enum):\n    ...").
+pub fn generate_enum_class(enum_info: &crate::schema::EnumInfo) -> String {
+    use heck::ToUpperCamelCase;
+
+    let class_name = enum_info.name.to_upper_camel_case();
+    let mut lines = Vec::new();
+    lines.push(format!("class {class_name}(str, enum.Enum):"));
+    for value in &enum_info.values {
+        // Sanitize member name: uppercase, replace non-identifier chars, prefix if starts with digit
+        let mut member_name: String = value
+            .to_uppercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        if member_name.starts_with(|c: char| c.is_ascii_digit()) {
+            member_name = format!("_{member_name}");
+        }
+        if member_name.is_empty() {
+            member_name = "_".to_string();
+        }
+        lines.push(format!("    {member_name} = {}", format_python_string_literal(value)));
+    }
+    lines.join("\n")
+}
+
+/// Get the Python class name for an enum.
+pub fn enum_class_name(enum_name: &str) -> String {
+    use heck::ToUpperCamelCase;
+    enum_name.to_upper_camel_case()
+}
+
+/// Find the enum info for a column's udt_name in the schema.
+pub fn find_enum_for_column<'a>(
+    udt_name: &str,
+    enums: &'a [crate::schema::EnumInfo],
+) -> Option<&'a crate::schema::EnumInfo> {
+    enums.iter().find(|e| e.name == udt_name)
+}
+
 /// Sort tables in topological order by FK dependencies (Kahn's algorithm).
 /// Referenced tables come before referencing tables. Alphabetical tiebreak.
 pub fn topo_sort_tables(tables: &[crate::schema::TableInfo]) -> Vec<&crate::schema::TableInfo> {
