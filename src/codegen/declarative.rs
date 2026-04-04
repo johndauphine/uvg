@@ -193,7 +193,7 @@ fn generate_class(
 
         // Explicit column name when attribute name differs
         if *attr_name != col.name {
-            mc_args.push(format!("'{}'", col.name));
+            mc_args.push(format_python_string_literal(&col.name));
         }
 
         // Type argument
@@ -339,15 +339,14 @@ fn build_table_args(
             if constraint.constraint_type == ConstraintType::Check {
                 if let Some(ref expr) = constraint.check_expression {
                     imports.add("sqlalchemy", "CheckConstraint");
+                    let expr_literal = format_python_string_literal(expr);
                     if constraint.name.is_empty() {
                         positional_args.push(format!(
-                            "CheckConstraint('{}')",
-                            escape_python_string(expr)
+                            "CheckConstraint({expr_literal})"
                         ));
                     } else {
                         positional_args.push(format!(
-                            "CheckConstraint('{}', name='{}')",
-                            escape_python_string(expr),
+                            "CheckConstraint({expr_literal}, name='{}')",
                             constraint.name
                         ));
                     }

@@ -149,12 +149,12 @@ fn generate_table(
             if constraint.constraint_type == ConstraintType::Check {
                 if let Some(ref expr) = constraint.check_expression {
                     imports.add("sqlalchemy", "CheckConstraint");
+                    let expr_literal = format_python_string_literal(expr);
                     if constraint.name.is_empty() {
-                        body_items.push(format!("CheckConstraint('{}')", escape_python_string(expr)));
+                        body_items.push(format!("CheckConstraint({expr_literal})"));
                     } else {
                         body_items.push(format!(
-                            "CheckConstraint('{}', name='{}')",
-                            escape_python_string(expr),
+                            "CheckConstraint({expr_literal}, name='{}')",
                             constraint.name
                         ));
                     }

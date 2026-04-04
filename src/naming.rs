@@ -38,6 +38,11 @@ pub fn column_to_attr_name(col_name: &str) -> String {
         .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
         .collect();
 
+    // Fallback for empty/whitespace-only names
+    if sanitized.is_empty() {
+        return "_".to_string();
+    }
+
     // Prefix leading digits with underscore
     if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
         sanitized = format!("_{sanitized}");

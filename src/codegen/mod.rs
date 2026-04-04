@@ -12,19 +12,15 @@ pub trait Generator {
 }
 
 /// Format a server_default expression. Wraps raw SQL in text('...').
-/// Uses double quotes when the default contains single quotes, escapes newlines.
+/// Delegates escaping to format_python_string_literal for proper handling of
+/// backslashes, newlines, and quote characters.
 pub fn format_server_default(default: &str, dialect: Dialect) -> String {
     let cleaned = match dialect {
         Dialect::Postgres => strip_pg_typecast(default),
         Dialect::Mssql => strip_mssql_parens(default),
     };
 
-    let escaped = cleaned.replace('\n', "\\n");
-    if escaped.contains('\'') {
-        format!("text(\"{escaped}\")")
-    } else {
-        format!("text('{escaped}')")
-    }
+    format!("text({})", format_python_string_literal(cleaned))
 }
 
 /// Strip PostgreSQL type casts from a default expression.
