@@ -74,5 +74,6 @@ pub async fn introspect(
     Ok(IntrospectedSchema {
         dialect: Dialect::Mssql,
         tables: all_tables,
+        enums: vec![],
     })
 }

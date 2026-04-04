@@ -1,9 +1,10 @@
 use crate::cli::GeneratorOptions;
 use crate::codegen::imports::ImportCollector;
 use crate::codegen::{
-    escape_python_string, format_fk_options, format_python_string_literal,
-    format_server_default, is_primary_key_column, is_serial_default,
-    is_unique_constraint_index, quote_constraint_columns, topo_sort_tables, Generator,
+    enum_class_name, escape_python_string, find_enum_for_column, format_fk_options,
+    format_python_string_literal, format_server_default, generate_enum_class,
+    is_primary_key_column, is_serial_default, is_unique_constraint_index,
+    quote_constraint_columns, topo_sort_tables, Generator,
 };
 use crate::dialect::Dialect;
 use crate::naming::table_to_variable_name;
@@ -22,14 +23,37 @@ impl Generator for TablesGenerator {
         imports.add("sqlalchemy", "Table");
         imports.add("sqlalchemy", "Column");
 
+        // Collect which enums are actually used
+        let mut used_enums: Vec<&crate::schema::EnumInfo> = Vec::new();
+
         let sorted_tables = topo_sort_tables(&schema.tables);
         for table in sorted_tables {
-            let block = generate_table(table, &mut imports, options, schema.dialect);
+            // Track which enums are referenced
+            for col in &table.columns {
+                if let Some(ei) = find_enum_for_column(&col.udt_name, &schema.enums) {
+                    if !used_enums.iter().any(|e| e.name == ei.name) {
+                        used_enums.push(ei);
+                    }
+                }
+            }
+            let block = generate_table(table, &mut imports, options, schema.dialect, &schema.enums);
             table_blocks.push(block);
+        }
+
+        // Add enum imports if any enums used
+        if !used_enums.is_empty() {
+            imports.add_bare("enum");
+            imports.add("sqlalchemy", "Enum");
         }
 
         let mut output = imports.render();
         output.push_str("\n\nmetadata = MetaData()\n");
+
+        // Enum class definitions
+        for ei in &used_enums {
+            output.push_str("\n\n");
+            output.push_str(&generate_enum_class(ei));
+        }
 
         for block in table_blocks {
             output.push_str("\n\n");
@@ -46,6 +70,7 @@ fn generate_table(
     imports: &mut ImportCollector,
     options: &GeneratorOptions,
     dialect: Dialect,
+    enums: &[crate::schema::EnumInfo],
 ) -> String {
     let var_name = table_to_variable_name(&table.name);
     let mut lines: Vec<String> = Vec::new();
@@ -58,15 +83,25 @@ fn generate_table(
 
     // Columns
     for col in &table.columns {
-        let mapped = map_column_type(col, dialect);
-        imports.add(&mapped.import_module, &mapped.import_name);
-        if let Some((ref elem_mod, ref elem_name)) = mapped.element_import {
-            imports.add(elem_mod, elem_name);
-        }
-
         let mut col_args: Vec<String> = Vec::new();
         col_args.push(format!("'{}'", col.name));
-        col_args.push(mapped.sa_type.clone());
+
+        // Check if column type is a named enum
+        if let Some(ei) = find_enum_for_column(&col.udt_name, enums) {
+            let cls = enum_class_name(&ei.name);
+            let mut enum_args = format!("{cls}, values_callable=lambda cls: [member.value for member in cls]");
+            if !ei.name.is_empty() {
+                enum_args.push_str(&format!(", name='{}'", ei.name));
+            }
+            col_args.push(format!("Enum({enum_args})"));
+        } else {
+            let mapped = map_column_type(col, dialect);
+            imports.add(&mapped.import_module, &mapped.import_name);
+            if let Some((ref elem_mod, ref elem_name)) = mapped.element_import {
+                imports.add(elem_mod, elem_name);
+            }
+            col_args.push(mapped.sa_type.clone());
+        }
 
         // Identity — dialect-aware output
         if let Some(ref identity) = col.identity {
@@ -639,5 +674,47 @@ mod tests {
         let output = gen.generate(&schema, &GeneratorOptions::default());
         assert!(output.contains("Identity(start=1, increment=2)"));
         assert!(output.contains("primary_key=True"));
+    }
+
+    // --- Tier 4: Enum tests ---
+
+    /// Adapted from sqlacodegen test_enum_shared_values (tables).
+    #[test]
+    fn test_tables_enum_shared_values() {
+        use crate::schema::EnumInfo;
+        let schema = schema_pg_with_enums(
+            vec![
+                table("accounts")
+                    .column(col("id").build())
+                    .column(col("status").udt("status_enum").nullable().build())
+                    .pk("accounts_pkey", &["id"])
+                    .build(),
+                table("users")
+                    .column(col("id").build())
+                    .column(col("status").udt("status_enum").nullable().build())
+                    .pk("users_pkey", &["id"])
+                    .build(),
+            ],
+            vec![EnumInfo {
+                name: "status_enum".to_string(),
+                schema: None,
+                values: vec![
+                    "active".to_string(),
+                    "inactive".to_string(),
+                    "pending".to_string(),
+                ],
+            }],
+        );
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        // Enum class generated
+        assert!(output.contains("class StatusEnum(str, enum.Enum):"));
+        assert!(output.contains("ACTIVE = 'active'"));
+        assert!(output.contains("INACTIVE = 'inactive'"));
+        assert!(output.contains("PENDING = 'pending'"));
+        // Enum used in both tables
+        assert!(output.contains("Enum(StatusEnum, values_callable=lambda cls: [member.value for member in cls], name='status_enum')"));
+        // import enum
+        assert!(output.contains("import enum"));
     }
 }
