@@ -146,6 +146,51 @@ pub fn format_python_string_literal(s: &str) -> String {
     }
 }
 
+/// Try to parse an IN-list from a check constraint expression.
+/// Returns (column_name, values) if the expression matches `[table.]column IN ('a', 'b', 'c')`.
+pub fn parse_check_enum(expression: &str) -> Option<(String, Vec<String>)> {
+    // Match pattern: [optional_table.]column IN ('val1', 'val2', ...)
+    let expr = expression.trim();
+
+    // Find " IN (" (case-insensitive)
+    let in_pos = expr.to_uppercase().find(" IN (")?;
+    let col_part = expr[..in_pos].trim();
+
+    // Extract column name (strip optional table prefix)
+    let col_name = if let Some(dot_pos) = col_part.rfind('.') {
+        col_part[dot_pos + 1..].trim()
+    } else {
+        col_part
+    };
+
+    // Extract the IN list
+    let list_start = in_pos + 4; // skip " IN "
+    let list_str = expr[list_start..].trim();
+    if !list_str.starts_with('(') || !list_str.ends_with(')') {
+        return None;
+    }
+
+    let inner = &list_str[1..list_str.len() - 1];
+
+    // Parse quoted string values
+    let mut values = Vec::new();
+    for item in inner.split(',') {
+        let trimmed = item.trim();
+        if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+            values.push(trimmed[1..trimmed.len() - 1].to_string());
+        } else {
+            // Not a string enum (could be numeric IN list)
+            return None;
+        }
+    }
+
+    if values.is_empty() {
+        return None;
+    }
+
+    Some((col_name.to_string(), values))
+}
+
 /// Generate a Python enum class from an EnumInfo.
 /// Returns the class definition string (e.g. "class StatusEnum(str, enum.Enum):\n    ...").
 pub fn generate_enum_class(enum_info: &crate::schema::EnumInfo) -> String {
