@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-UVg is a Rust reimplementation of Python's [sqlacodegen](https://github.com/agronholm/sqlacodegen). It connects to PostgreSQL or Microsoft SQL Server databases, introspects their schema, and generates SQLAlchemy Python model code. The goal is drop-in CLI compatibility with sqlacodegen — same flags, same output format.
+UVg is a Rust reimplementation of Python's [sqlacodegen](https://github.com/agronholm/sqlacodegen). It connects to PostgreSQL or Microsoft SQL Server databases, introspects their schema, and generates SQLAlchemy Python model code. The goal is drop-in CLI compatibility with sqlacodegen -- same flags, same output format.
 
 ## Build & Test Commands
 
@@ -14,7 +14,6 @@ cargo build --release          # Release build
 cargo install --path .         # Install binary locally
 cargo test                     # Run all unit tests
 cargo test test_name           # Run a single test by name/pattern
-cargo test --test integration -- --ignored  # Integration tests (needs DATABASE_URL)
 cargo test -- --nocapture      # Show println output during tests
 ```
 
@@ -26,30 +25,49 @@ DATABASE_URL=mssql://user:pass@localhost/testdb cargo test --test integration --
 
 Enable debug logging with `RUST_LOG=debug`.
 
+### Snapshot tests
+
+Snapshot tests use the `insta` crate with YAML format. Snapshots live in `src/codegen/snapshots/`. When updating expected output, either use `cargo insta review` (if cargo-insta is installed) or manually move `.snap.new` files to `.snap`.
+
 ## Architecture
 
-The application follows a pipeline: **CLI parsing → Connection → Introspection → Code Generation → Output**.
+The application follows a pipeline: **CLI parsing -> Connection -> Introspection -> Code Generation -> Output**.
 
 ### Key modules (`src/`)
 
-- **`cli.rs`** — Clap-based CLI parsing. Produces `ConnectionConfig` (Postgres URL string or MSSQL connection fields) and `GeneratorOptions`.
-- **`dialect.rs`** — `Dialect` enum (Postgres, Mssql) for runtime dispatch based on URL scheme.
-- **`schema.rs`** — Data structures representing introspected schema: `IntrospectedSchema`, `TableInfo`, `ColumnInfo`, `ConstraintInfo`, `IndexInfo`.
-- **`introspect/pg/`** — PostgreSQL introspection via sqlx. Queries `information_schema` and `pg_catalog` across submodules: `tables.rs`, `columns.rs`, `constraints.rs`, `indexes.rs`.
-- **`introspect/mssql/`** — MSSQL introspection via Tiberius. Same submodule structure as PG.
-- **`typemap/pg.rs`**, **`typemap/mssql.rs`** — Map database column types to SQLAlchemy type expressions, Python type annotations, and import requirements. Returns `MappedType`.
-- **`codegen/`** — `Generator` trait with two implementations:
-  - `declarative.rs` — Generates modern SQLAlchemy ORM classes with `Mapped[]` type annotations.
-  - `tables.rs` — Generates `Table()` metadata objects.
-  - `imports.rs` — `ImportCollector` that accumulates, deduplicates, and renders import statements in a specific group order (typing → stdlib → sqlalchemy core → dialects → orm).
-- **`naming.rs`** — Table/column name transformations (e.g., snake_case to UpperCamelCase via `heck`).
-- **`error.rs`** — `UvgError` enum using `thiserror`.
+- **`cli.rs`** -- Clap-based CLI parsing. Produces `ConnectionConfig` (Postgres URL string or MSSQL connection fields) and `GeneratorOptions` (`noindexes`, `noconstraints`, `nocomments`).
+- **`dialect.rs`** -- `Dialect` enum (Postgres, Mssql) with `default_schema()` returning `"public"` or `"dbo"`.
+- **`schema.rs`** -- Data structures representing introspected schema: `IntrospectedSchema`, `TableInfo`, `ColumnInfo`, `ConstraintInfo` (PrimaryKey/ForeignKey/Unique), `IndexInfo`.
+- **`introspect/pg/`** -- PostgreSQL introspection via sqlx. Queries `information_schema` and `pg_catalog` across submodules: `tables.rs`, `columns.rs`, `constraints.rs`, `indexes.rs`.
+- **`introspect/mssql/`** -- MSSQL introspection via Tiberius. Same submodule structure as PG.
+- **`typemap/pg.rs`**, **`typemap/mssql.rs`** -- Map database column types (via `udt_name`) to SQLAlchemy type expressions, Python type annotations, and import requirements. Returns `MappedType`.
+- **`codegen/`** -- `Generator` trait with two implementations:
+  - `declarative.rs` -- Generates modern SQLAlchemy ORM classes with `Mapped[]` type annotations. Tables without primary keys fall back to `Table()` syntax within the same output.
+  - `tables.rs` -- Generates `Table()` metadata objects for all tables.
+  - `imports.rs` -- `ImportCollector` that accumulates, deduplicates, and renders import statements in a specific group order.
+  - `mod.rs` -- Shared helpers: `has_primary_key()`, `is_primary_key_column()`, `topo_sort_tables()` (Kahn's algorithm with alphabetical tiebreak), `format_server_default()`, `escape_python_string()`.
+- **`naming.rs`** -- Table/column name transformations: `table_to_class_name()` (UpperCamelCase via `heck`), `table_to_variable_name()` (sanitized `t_` prefix).
+- **`error.rs`** -- `UvgError` enum using `thiserror`.
+
+### Output fidelity
+
+The generated Python code must match sqlacodegen's output exactly. Key ordering rules to preserve:
+
+- **Constraints in `Table()`**: ForeignKeyConstraint -> PrimaryKeyConstraint -> UniqueConstraint -> Index
+- **Declarative `__table_args__`**: ForeignKeyConstraint -> UniqueConstraint -> Index, then kwargs dict (comment, schema). PrimaryKeyConstraint is NOT emitted here (expressed via `primary_key=True` on `mapped_column` instead).
+- **`__table_args__` format**: Dict-only `{'schema': '...'}` when only kwargs exist; tuple `(Index(...), {'schema': '...'})` when both positional args and kwargs exist.
+- **Import groups** separated by blank lines: `typing` -> stdlib bare imports (datetime, decimal, uuid) -> `sqlalchemy` core -> `sqlalchemy.dialects.*` -> `sqlalchemy.orm`
+- **Comment quoting**: Use double quotes when the comment string contains single quotes.
+
+### No-PK fallback in declarative mode
+
+When the declarative generator encounters tables without primary keys, it falls back to `Table()` syntax for those tables while keeping ORM classes for tables with PKs. The `metadata_ref` parameter switches between `Base.metadata` (when any class exists) and standalone `metadata = MetaData()` (when all tables lack PKs).
 
 ### Testing patterns
 
 - Unit tests are inline (`#[cfg(test)] mod tests`) within source files.
-- Snapshot tests use the `insta` crate with YAML format (`assert_snapshot!`).
-- `src/testutil.rs` provides builder helpers for constructing test schema data.
+- `src/testutil.rs` provides builder helpers for constructing test data: `col(name)` -> `ColumnInfoBuilder`, `table(name)` -> `TableInfoBuilder`, `schema_pg(tables)` -> `IntrospectedSchema`. Builders auto-increment `ordinal_position` and default to non-nullable int4 columns.
+- Many codegen tests use `assert_eq!(output, expected)` with `indoc!` for exact string matching against sqlacodegen's expected output. Some older tests use `insta::assert_yaml_snapshot!()`.
 - Integration tests in `tests/integration.rs` are marked `#[ignore]` and require a live database.
 
 ### Adding a new database dialect
