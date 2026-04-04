@@ -133,6 +133,7 @@ impl TableInfoBuilder {
             constraint_type: ConstraintType::PrimaryKey,
             columns: cols.iter().map(|s| s.to_string()).collect(),
             foreign_key: None,
+            check_expression: None,
         });
         self
     }
@@ -143,6 +144,7 @@ impl TableInfoBuilder {
             constraint_type: ConstraintType::Unique,
             columns: cols.iter().map(|s| s.to_string()).collect(),
             foreign_key: None,
+            check_expression: None,
         });
         self
     }
@@ -165,6 +167,7 @@ impl TableInfoBuilder {
                 update_rule: "NO ACTION".to_string(),
                 delete_rule: "NO ACTION".to_string(),
             }),
+            check_expression: None,
         });
         self
     }
@@ -190,6 +193,18 @@ impl TableInfoBuilder {
                 update_rule: update_rule.to_string(),
                 delete_rule: delete_rule.to_string(),
             }),
+            check_expression: None,
+        });
+        self
+    }
+
+    pub fn check(mut self, name: &str, expression: &str) -> Self {
+        self.inner.constraints.push(ConstraintInfo {
+            name: name.to_string(),
+            constraint_type: ConstraintType::Check,
+            columns: vec![],
+            foreign_key: None,
+            check_expression: Some(expression.to_string()),
         });
         self
     }

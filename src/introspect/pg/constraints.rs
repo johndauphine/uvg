@@ -43,6 +43,7 @@ pub async fn query_constraints(
             constraint_type: ConstraintType::PrimaryKey,
             columns,
             foreign_key: None,
+            check_expression: None,
         });
     }
 
@@ -105,6 +106,7 @@ pub async fn query_constraints(
                 update_rule: acc.update_rule,
                 delete_rule: acc.delete_rule,
             }),
+            check_expression: None,
         });
     }
 
@@ -138,6 +140,7 @@ pub async fn query_constraints(
             constraint_type: ConstraintType::Unique,
             columns,
             foreign_key: None,
+            check_expression: None,
         });
     }
 

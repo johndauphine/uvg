@@ -46,6 +46,7 @@ impl ImportCollector {
         let mut typing_imports: Vec<(String, Vec<String>)> = Vec::new();
         let mut sqlalchemy_imports: Vec<(String, Vec<String>)> = Vec::new();
         let mut sqlalchemy_dialect_imports: Vec<(String, Vec<String>)> = Vec::new();
+        let mut sqlalchemy_other_imports: Vec<(String, Vec<String>)> = Vec::new();
         let mut sqlalchemy_orm_imports: Vec<(String, Vec<String>)> = Vec::new();
 
         for (module, names) in &self.imports {
@@ -63,6 +64,9 @@ impl ImportCollector {
             } else if module.starts_with("sqlalchemy.orm") {
                 let sorted_names: Vec<String> = names.iter().cloned().collect();
                 sqlalchemy_orm_imports.push((module.clone(), sorted_names));
+            } else if module.starts_with("sqlalchemy.") {
+                let sorted_names: Vec<String> = names.iter().cloned().collect();
+                sqlalchemy_other_imports.push((module.clone(), sorted_names));
             }
         }
 
@@ -80,18 +84,24 @@ impl ImportCollector {
         // 3. Blank line separator before sqlalchemy imports
         if (!typing_imports.is_empty() || !bare_imports.is_empty())
             && (!sqlalchemy_imports.is_empty()
+                || !sqlalchemy_other_imports.is_empty()
                 || !sqlalchemy_dialect_imports.is_empty()
                 || !sqlalchemy_orm_imports.is_empty())
         {
             lines.push(String::new());
         }
 
-        // 4. sqlalchemy imports
+        // 4. sqlalchemy core imports
         for (module, names) in &sqlalchemy_imports {
             lines.push(format!("from {} import {}", module, names.join(", ")));
         }
 
-        // 5. sqlalchemy dialect imports
+        // 5. sqlalchemy other submodule imports (e.g. sqlalchemy.sql.sqltypes)
+        for (module, names) in &sqlalchemy_other_imports {
+            lines.push(format!("from {} import {}", module, names.join(", ")));
+        }
+
+        // 6. sqlalchemy dialect imports
         for (module, names) in &sqlalchemy_dialect_imports {
             lines.push(format!("from {} import {}", module, names.join(", ")));
         }

@@ -1,12 +1,12 @@
 use crate::cli::GeneratorOptions;
 use crate::codegen::imports::ImportCollector;
 use crate::codegen::{
-    escape_python_string, format_python_string_literal, format_server_default, has_primary_key,
-    is_primary_key_column, is_serial_default, is_unique_constraint_index,
-    quote_constraint_columns, topo_sort_tables, Generator,
+    escape_python_string, format_fk_options, format_python_string_literal,
+    format_server_default, has_primary_key, is_primary_key_column, is_serial_default,
+    is_unique_constraint_index, quote_constraint_columns, topo_sort_tables, Generator,
 };
 use crate::dialect::Dialect;
-use crate::naming::{table_to_class_name, table_to_variable_name};
+use crate::naming::{column_to_attr_name, table_to_class_name, table_to_variable_name};
 use crate::schema::{ConstraintType, IntrospectedSchema, TableInfo};
 use crate::typemap::map_column_type;
 
@@ -164,15 +164,23 @@ fn generate_class(
 
         // Python type annotation
         let python_type = &mapped.python_type;
-        let type_annotation = if col.is_nullable && !is_pk {
+        let type_annotation = if col.is_nullable {
             meta.needs_optional = true;
             format!("Optional[{python_type}]")
         } else {
             python_type.clone()
         };
 
+        // Sanitize column name to valid Python attribute name
+        let attr_name = column_to_attr_name(&col.name);
+
         // mapped_column arguments
         let mut mc_args: Vec<String> = Vec::new();
+
+        // Explicit column name when attribute name differs
+        if attr_name != col.name {
+            mc_args.push(format!("'{}'", col.name));
+        }
 
         // Type argument
         mc_args.push(mapped.sa_type.clone());
@@ -204,6 +212,10 @@ fn generate_class(
         // Primary key
         if is_pk {
             mc_args.push("primary_key=True".to_string());
+            // Explicitly emit nullable=True for nullable PK columns (composite PKs)
+            if col.is_nullable {
+                mc_args.push("nullable=True".to_string());
+            }
         }
 
         // Server default
@@ -224,8 +236,7 @@ fn generate_class(
 
         let mc_str = mc_args.join(", ");
         let line = format!(
-            "    {}: Mapped[{type_annotation}] = mapped_column({mc_str})",
-            col.name
+            "    {attr_name}: Mapped[{type_annotation}] = mapped_column({mc_str})"
         );
         col_lines.push(ColLine {
             is_pk,
@@ -274,12 +285,37 @@ fn build_table_args(
                         .iter()
                         .map(|c| format!("'{}.{c}'", fk.ref_table))
                         .collect();
+                    let fk_opts = format_fk_options(fk);
                     positional_args.push(format!(
-                        "ForeignKeyConstraint([{}], [{}], name='{}')",
+                        "ForeignKeyConstraint([{}], [{}], name='{}'{})",
                         local_cols.join(", "),
                         ref_cols.join(", "),
-                        constraint.name
+                        constraint.name,
+                        fk_opts
                     ));
+                }
+            }
+        }
+    }
+
+    // Check constraints
+    if !options.noconstraints {
+        for constraint in &table.constraints {
+            if constraint.constraint_type == ConstraintType::Check {
+                if let Some(ref expr) = constraint.check_expression {
+                    imports.add("sqlalchemy", "CheckConstraint");
+                    if constraint.name.is_empty() {
+                        positional_args.push(format!(
+                            "CheckConstraint('{}')",
+                            escape_python_string(expr)
+                        ));
+                    } else {
+                        positional_args.push(format!(
+                            "CheckConstraint('{}', name='{}')",
+                            escape_python_string(expr),
+                            constraint.name
+                        ));
+                    }
                 }
             }
         }
@@ -449,11 +485,13 @@ fn generate_table_fallback(
                         .iter()
                         .map(|c| format!("'{}.{c}'", fk.ref_table))
                         .collect();
+                    let fk_opts = format_fk_options(fk);
                     body_items.push(format!(
-                        "ForeignKeyConstraint([{}], [{}], name='{}')",
+                        "ForeignKeyConstraint([{}], [{}], name='{}'{})",
                         local_cols.join(", "),
                         ref_cols.join(", "),
-                        constraint.name
+                        constraint.name,
+                        fk_opts
                     ));
                 }
             }
@@ -832,5 +870,115 @@ mod tests {
         let output = gen.generate(&schema, &GeneratorOptions::default());
         // heck's UpperCamelCase handling of double underscores
         assert!(output.contains("__tablename__ = 'customer_API__Preference'"));
+    }
+
+    // --- Tier 2: Tests adapted from sqlacodegen test_generator_declarative.py ---
+
+    /// Adapted from sqlacodegen test_invalid_attribute_names.
+    #[test]
+    fn test_declarative_invalid_attribute_names() {
+        let schema = schema_pg(vec![
+            table("simple-items")
+                .column(col("id-test").build())
+                .column(col("4test").nullable().build())
+                .column(col("def").nullable().build())
+                .pk("simple_items_pkey", &["id-test"])
+                .build(),
+        ]);
+        let gen = DeclarativeGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        // Hyphens replaced with underscores, explicit column name
+        assert!(output.contains("id_test: Mapped[int] = mapped_column('id-test', Integer, primary_key=True)"));
+        // Leading digit gets underscore prefix
+        assert!(output.contains("_4test: Mapped[Optional[int]] = mapped_column('4test', Integer)"));
+        // Python keyword gets trailing underscore
+        assert!(output.contains("def_: Mapped[Optional[int]] = mapped_column('def', Integer)"));
+    }
+
+    /// Adapted from sqlacodegen test_metadata_column.
+    #[test]
+    fn test_declarative_metadata_column() {
+        let schema = schema_pg(vec![
+            table("simple")
+                .column(col("id").build())
+                .column(col("metadata").udt("varchar").nullable().build())
+                .pk("simple_pkey", &["id"])
+                .build(),
+        ]);
+        let gen = DeclarativeGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        // "metadata" is reserved by SQLAlchemy
+        assert!(output.contains("metadata_: Mapped[Optional[str]] = mapped_column('metadata', String)"));
+    }
+
+    /// Adapted from sqlacodegen test_invalid_variable_name_from_column.
+    #[test]
+    fn test_declarative_invalid_variable_name_from_column() {
+        let schema = schema_pg(vec![
+            table("simple")
+                .column(col(" id ").build())
+                .pk("simple_pkey", &[" id "])
+                .build(),
+        ]);
+        let gen = DeclarativeGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        // Spaces trimmed and mapped, explicit column name preserved
+        assert!(output.contains("id: Mapped[int] = mapped_column(' id ', Integer, primary_key=True)"));
+    }
+
+    /// Adapted from sqlacodegen test_constraints (declarative).
+    #[test]
+    fn test_declarative_constraints() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("id").build())
+                .column(col("number").nullable().build())
+                .pk("simple_items_pkey", &["id"])
+                .check("", "number > 0")
+                .unique("uq_id_number", &["id", "number"])
+                .build(),
+        ]);
+        let gen = DeclarativeGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("CheckConstraint('number > 0')"));
+        assert!(output.contains("UniqueConstraint('id', 'number', name='uq_id_number')"));
+        assert!(output.contains("from sqlalchemy import CheckConstraint"));
+    }
+
+    // TODO: test_declarative_colname_import_conflict requires detecting import-level
+    // name conflicts at generation time (e.g. column "text" conflicts with imported
+    // sqlalchemy.text when server_default is used). Deferred to a future pass.
+
+    /// Adapted from sqlacodegen test_composite_nullable_pk.
+    #[test]
+    fn test_declarative_composite_nullable_pk() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("id1").build())
+                .column(col("id2").nullable().build())
+                .pk("simple_items_pkey", &["id1", "id2"])
+                .build(),
+        ]);
+        let gen = DeclarativeGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("id1: Mapped[int] = mapped_column(Integer, primary_key=True)"));
+        // Nullable PK column should show Optional and nullable=True
+        assert!(output.contains("id2: Mapped[Optional[int]] = mapped_column(Integer, primary_key=True, nullable=True)"));
+    }
+
+    /// Adapted from sqlacodegen test_pascal_underscore.
+    #[test]
+    fn test_declarative_pascal_underscore() {
+        // Note: sqlacodegen preserves "CustomerAPIPreference" for "customer_API_Preference".
+        // heck normalizes it to "CustomerApiPreference". Known difference.
+        let schema = schema_pg(vec![
+            table("customer_API_Preference")
+                .column(col("id").build())
+                .pk("customer_api_preference_pkey", &["id"])
+                .build(),
+        ]);
+        let gen = DeclarativeGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("__tablename__ = 'customer_API_Preference'"));
     }
 }

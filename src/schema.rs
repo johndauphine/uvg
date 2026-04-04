@@ -67,6 +67,8 @@ pub struct ConstraintInfo {
     pub columns: Vec<String>,
     /// For foreign keys: the referenced schema, table, and columns.
     pub foreign_key: Option<ForeignKeyInfo>,
+    /// For check constraints: the SQL expression.
+    pub check_expression: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,7 @@ pub enum ConstraintType {
     PrimaryKey,
     ForeignKey,
     Unique,
+    Check,
 }
 
 #[derive(Debug, Clone)]
