@@ -1,9 +1,9 @@
 use crate::cli::GeneratorOptions;
 use crate::codegen::imports::ImportCollector;
 use crate::codegen::{
-    escape_python_string, format_python_string_literal, format_server_default,
-    is_primary_key_column, is_serial_default, is_unique_constraint_index,
-    quote_constraint_columns, topo_sort_tables, Generator,
+    escape_python_string, format_fk_options, format_python_string_literal,
+    format_server_default, is_primary_key_column, is_serial_default,
+    is_unique_constraint_index, quote_constraint_columns, topo_sort_tables, Generator,
 };
 use crate::dialect::Dialect;
 use crate::naming::table_to_variable_name;
@@ -130,12 +130,34 @@ fn generate_table(
                         .iter()
                         .map(|c| format!("'{}.{c}'", fk.ref_table))
                         .collect();
+                    let fk_opts = format_fk_options(fk);
                     body_items.push(format!(
-                        "ForeignKeyConstraint([{}], [{}], name='{}')",
+                        "ForeignKeyConstraint([{}], [{}], name='{}'{})",
                         local_cols.join(", "),
                         ref_cols.join(", "),
-                        constraint.name
+                        constraint.name,
+                        fk_opts
                     ));
+                }
+            }
+        }
+    }
+
+    // Check constraints
+    if !options.noconstraints {
+        for constraint in &table.constraints {
+            if constraint.constraint_type == ConstraintType::Check {
+                if let Some(ref expr) = constraint.check_expression {
+                    imports.add("sqlalchemy", "CheckConstraint");
+                    let expr_literal = format_python_string_literal(expr);
+                    if constraint.name.is_empty() {
+                        body_items.push(format!("CheckConstraint({expr_literal})"));
+                    } else {
+                        body_items.push(format!(
+                            "CheckConstraint({expr_literal}, name='{}')",
+                            constraint.name
+                        ));
+                    }
                 }
             }
         }
@@ -487,6 +509,135 @@ mod tests {
         assert!(output.contains("Identity("));
         assert!(output.contains("start=1"));
         assert!(output.contains("increment=2"));
+        assert!(output.contains("primary_key=True"));
+    }
+
+    // --- Tier 2: Tests adapted from sqlacodegen test_generator_tables.py ---
+
+    /// Adapted from sqlacodegen test_multiline_column_comment.
+    #[test]
+    fn test_tables_multiline_column_comment() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("id").nullable().comment("This\nis a multi-line\ncomment").build())
+                .build(),
+        ]);
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("comment='This\\nis a multi-line\\ncomment'"));
+    }
+
+    /// Adapted from sqlacodegen test_multiline_table_comment.
+    #[test]
+    fn test_tables_multiline_table_comment() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("id").nullable().build())
+                .comment("This\nis a multi-line\ncomment")
+                .build(),
+        ]);
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("comment='This\\nis a multi-line\\ncomment'"));
+    }
+
+    /// Adapted from sqlacodegen test_server_default_multiline.
+    #[test]
+    fn test_tables_server_default_multiline() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(
+                    col("id")
+                        .default_val("/*Comment*/\n/*Next line*/\nsomething()")
+                        .build(),
+                )
+                .pk("simple_items_pkey", &["id"])
+                .build(),
+        ]);
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains(
+            "server_default=text('/*Comment*/\\n/*Next line*/\\nsomething()')"
+        ));
+    }
+
+    /// Adapted from sqlacodegen test_server_default_colon.
+    #[test]
+    fn test_tables_server_default_colon() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("problem").udt("varchar").nullable().default_val("':001'").build())
+                .build(),
+        ]);
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("server_default=text(\"':001'\")"));
+    }
+
+    /// Adapted from sqlacodegen test_null_type.
+    #[test]
+    fn test_tables_null_type() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("problem").udt("").nullable().build())
+                .build(),
+        ]);
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("Column('problem', NullType)"));
+        assert!(output.contains("from sqlalchemy.sql.sqltypes import NullType"));
+    }
+
+    /// Adapted from sqlacodegen test_foreign_key_options.
+    #[test]
+    fn test_tables_foreign_key_options() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("name").udt("varchar").nullable().build())
+                .fk_full(
+                    "simple_items_name_fkey",
+                    &["name"],
+                    "public",
+                    "simple_items",
+                    &["name"],
+                    "CASCADE",
+                    "CASCADE",
+                )
+                .build(),
+        ]);
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("ondelete='CASCADE'"));
+        assert!(output.contains("onupdate='CASCADE'"));
+    }
+
+    /// Adapted from sqlacodegen test_identity_column_decimal_values.
+    /// MSSQL reflects Identity parameters as Decimal; uvg stores them as i64.
+    /// The output should be identical to test_identity_column.
+    #[test]
+    fn test_tables_identity_column_decimal_values() {
+        use crate::schema::IdentityInfo;
+        let schema = schema_mssql(vec![
+            table("simple_items")
+                .schema("dbo")
+                .column(
+                    col("id")
+                        .identity_info(IdentityInfo {
+                            start: 1,
+                            increment: 2,
+                            min_value: 1,
+                            max_value: 2147483647,
+                            cycle: false,
+                            cache: 1,
+                        })
+                        .build(),
+                )
+                .pk("simple_items_pkey", &["id"])
+                .build(),
+        ]);
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        assert!(output.contains("Identity(start=1, increment=2)"));
         assert!(output.contains("primary_key=True"));
     }
 }

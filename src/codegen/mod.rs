@@ -12,13 +12,15 @@ pub trait Generator {
 }
 
 /// Format a server_default expression. Wraps raw SQL in text('...').
+/// Delegates escaping to format_python_string_literal for proper handling of
+/// backslashes, newlines, and quote characters.
 pub fn format_server_default(default: &str, dialect: Dialect) -> String {
     let cleaned = match dialect {
         Dialect::Postgres => strip_pg_typecast(default),
         Dialect::Mssql => strip_mssql_parens(default),
     };
 
-    format!("text('{cleaned}')")
+    format!("text({})", format_python_string_literal(cleaned))
 }
 
 /// Strip PostgreSQL type casts from a default expression.
@@ -112,6 +114,23 @@ pub fn quote_constraint_columns(cols: &[String]) -> Vec<String> {
 /// Escape single quotes in a string for Python string literals.
 pub fn escape_python_string(s: &str) -> String {
     s.replace('\'', "\\'")
+}
+
+/// Format FK option kwargs (ondelete, onupdate) for ForeignKeyConstraint.
+/// Returns empty string if both rules are NO ACTION (the default).
+pub fn format_fk_options(fk: &crate::schema::ForeignKeyInfo) -> String {
+    let mut opts = Vec::new();
+    if fk.delete_rule != "NO ACTION" {
+        opts.push(format!("ondelete='{}'", fk.delete_rule));
+    }
+    if fk.update_rule != "NO ACTION" {
+        opts.push(format!("onupdate='{}'", fk.update_rule));
+    }
+    if opts.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", opts.join(", "))
+    }
 }
 
 /// Format a string as a Python string literal, choosing quote style and escaping properly.
@@ -239,7 +258,7 @@ mod tests {
         );
         assert_eq!(
             format_server_default("(N'hello')", Dialect::Mssql),
-            "text(''hello'')"
+            "text(\"'hello'\")"
         );
         assert_eq!(
             format_server_default("(getdate())", Dialect::Mssql),

@@ -15,6 +15,53 @@ pub fn table_to_variable_name(table_name: &str) -> String {
     format!("t_{sanitized}")
 }
 
+/// Python keywords and builtins that conflict with SQLAlchemy attribute names.
+const PYTHON_RESERVED: &[&str] = &[
+    // Python keywords
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+    "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+    "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
+    "try", "while", "with", "yield",
+    // SQLAlchemy reserved attribute names
+    "metadata", "registry",
+];
+
+/// Sanitize a column name into a valid Python attribute name.
+/// Returns the sanitized name. If it differs from the input, the caller should
+/// emit the original column name as an explicit first argument to mapped_column().
+pub fn column_to_attr_name(col_name: &str) -> String {
+    let trimmed = col_name.trim();
+
+    // Replace non-identifier chars with underscores
+    let mut sanitized: String = trimmed
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+
+    // Fallback for empty/whitespace-only names
+    if sanitized.is_empty() {
+        return "_".to_string();
+    }
+
+    // Prefix leading digits with underscore
+    if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+        sanitized = format!("_{sanitized}");
+    }
+
+    // Append underscore for Python reserved words and SQLAlchemy conflicts
+    if PYTHON_RESERVED.contains(&sanitized.as_str()) {
+        sanitized.push('_');
+    }
+
+    sanitized
+}
+
+/// Check if an attribute name conflicts with a set of imported names.
+/// Used at generation time when we know what names are actually imported.
+pub fn has_import_conflict(attr_name: &str, imported_names: &[&str]) -> bool {
+    imported_names.contains(&attr_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

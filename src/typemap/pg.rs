@@ -6,6 +6,17 @@ use super::{simple, MappedType};
 pub fn map_column_type(col: &ColumnInfo) -> MappedType {
     let udt = col.udt_name.as_str();
 
+    // Handle null/unknown types
+    if udt.is_empty() {
+        return MappedType {
+            sa_type: "NullType".to_string(),
+            python_type: "str".to_string(),
+            import_module: "sqlalchemy.sql.sqltypes".to_string(),
+            import_name: "NullType".to_string(),
+            element_import: None,
+        };
+    }
+
     // Handle array types (udt_name starts with underscore)
     if let Some(element_udt) = udt.strip_prefix('_') {
         let element = map_udt_scalar(element_udt, col);
