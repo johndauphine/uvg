@@ -1,4 +1,5 @@
 pub mod ddl;
+pub mod ddl_diff;
 pub mod declarative;
 pub mod imports;
 pub mod relationships;
