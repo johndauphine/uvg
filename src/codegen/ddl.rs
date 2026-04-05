@@ -288,11 +288,15 @@ fn generate_column_def(
 
     let is_pk = is_primary_key_column(&col.name, constraints);
 
+    // Compute canonical type once (used for type mapping and boolean default detection)
+    let canonical = crate::ddl_typemap::to_canonical(col, source_dialect);
+    let is_boolean = matches!(canonical, crate::ddl_typemap::CanonicalType::Boolean);
+
     // Type
     let type_str = if is_auto {
         format_autoincrement_type(col, source_dialect, target_dialect, is_pk)
     } else {
-        ddl_typemap::map_ddl_type(col, source_dialect, target_dialect).sql_type
+        ddl_typemap::from_canonical(&canonical, target_dialect).sql_type
     };
 
     let mut parts = vec![format!("    {qname} {type_str}")];
@@ -306,7 +310,7 @@ fn generate_column_def(
     if !is_auto {
         if let Some(ref default) = col.column_default {
             let ddl_default =
-                format_ddl_default(default, source_dialect, target_dialect);
+                format_ddl_default_typed(default, source_dialect, target_dialect, is_boolean);
             parts.push(format!("DEFAULT {ddl_default}"));
         }
     }
@@ -378,7 +382,14 @@ fn format_autoincrement_suffix(
 }
 
 /// Format a default value expression for the target dialect.
-fn format_ddl_default(default: &str, source_dialect: Dialect, target_dialect: Dialect) -> String {
+/// Format a default value expression for the target dialect.
+/// When `is_boolean` is true, translates 0/1 ↔ true/false across dialects.
+fn format_ddl_default_typed(
+    default: &str,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+    is_boolean: bool,
+) -> String {
     // Step 1: Strip source-specific syntax
     let cleaned = match source_dialect {
         Dialect::Postgres => super::strip_pg_typecast(default),
@@ -386,7 +397,32 @@ fn format_ddl_default(default: &str, source_dialect: Dialect, target_dialect: Di
         Dialect::Mysql | Dialect::Sqlite => default.trim(),
     };
 
-    // Step 2: Translate common function names
+    // Step 2: Boolean literal translation (only when column is boolean)
+    if is_boolean {
+        let lower = cleaned.trim().to_lowercase();
+        if (lower == "1" || lower == "true")
+            && (target_dialect == Dialect::Postgres || target_dialect == Dialect::Sqlite)
+        {
+            return "true".to_string();
+        }
+        if (lower == "0" || lower == "false")
+            && (target_dialect == Dialect::Postgres || target_dialect == Dialect::Sqlite)
+        {
+            return "false".to_string();
+        }
+        if (lower == "true" || lower == "1")
+            && (target_dialect == Dialect::Mysql || target_dialect == Dialect::Mssql)
+        {
+            return "1".to_string();
+        }
+        if (lower == "false" || lower == "0")
+            && (target_dialect == Dialect::Mysql || target_dialect == Dialect::Mssql)
+        {
+            return "0".to_string();
+        }
+    }
+
+    // Step 3: Translate common function names
     translate_default_function(cleaned, target_dialect)
 }
 
@@ -418,6 +454,8 @@ fn translate_default_function(expr: &str, target: Dialect) -> String {
     }
 
     // Pass through as-is (string literals, numbers, etc.)
+    // Note: boolean 0/1 ↔ true/false translation is handled in format_ddl_default_typed()
+    // with is_boolean flag to avoid converting integer defaults.
     expr.to_string()
 }
 
@@ -738,14 +776,17 @@ fn diff_column(
     let nullable_changed = source.is_nullable != target.is_nullable;
 
     // Compare defaults (strip dialect-specific syntax before comparing)
+    // Use typed comparison so boolean 1/true and 0/false are treated as equivalent
+    let canonical = crate::ddl_typemap::to_canonical(source, source_dialect);
+    let is_boolean = matches!(canonical, crate::ddl_typemap::CanonicalType::Boolean);
     let source_default = source
         .column_default
         .as_deref()
-        .map(|d| format_ddl_default(d, source_dialect, target_dialect));
+        .map(|d| format_ddl_default_typed(d, source_dialect, target_dialect, is_boolean));
     let target_default = target
         .column_default
         .as_deref()
-        .map(|d| format_ddl_default(d, target_dialect, target_dialect));
+        .map(|d| format_ddl_default_typed(d, target_dialect, target_dialect, is_boolean));
     let default_changed = source_default != target_default;
 
     if !type_changed && !nullable_changed && !default_changed {
@@ -1091,5 +1132,56 @@ mod tests {
 
         let ddl = diff_schemas(&schema, &schema, &options);
         assert!(ddl.contains("No schema changes detected"));
+    }
+
+    #[test]
+    fn test_boolean_default_mssql_to_pg() {
+        // MSSQL BIT DEFAULT 1 → PG BOOLEAN DEFAULT true
+        assert_eq!(
+            format_ddl_default_typed("((1))", Dialect::Mssql, Dialect::Postgres, true),
+            "true"
+        );
+        assert_eq!(
+            format_ddl_default_typed("((0))", Dialect::Mssql, Dialect::Postgres, true),
+            "false"
+        );
+    }
+
+    #[test]
+    fn test_integer_default_not_converted_to_boolean() {
+        // INT DEFAULT 0 must stay 0, not become false
+        assert_eq!(
+            format_ddl_default_typed("((0))", Dialect::Mssql, Dialect::Postgres, false),
+            "0"
+        );
+        assert_eq!(
+            format_ddl_default_typed("((1))", Dialect::Mssql, Dialect::Postgres, false),
+            "1"
+        );
+    }
+
+    #[test]
+    fn test_boolean_default_pg_to_mysql() {
+        // PG BOOLEAN DEFAULT true → MySQL TINYINT(1) DEFAULT 1
+        assert_eq!(
+            format_ddl_default_typed("true", Dialect::Postgres, Dialect::Mysql, true),
+            "1"
+        );
+        assert_eq!(
+            format_ddl_default_typed("false", Dialect::Postgres, Dialect::Mysql, true),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_boolean_default_pg_to_mssql() {
+        assert_eq!(
+            format_ddl_default_typed("true", Dialect::Postgres, Dialect::Mssql, true),
+            "1"
+        );
+        assert_eq!(
+            format_ddl_default_typed("false", Dialect::Postgres, Dialect::Mssql, true),
+            "0"
+        );
     }
 }
