@@ -240,4 +240,71 @@ Identity column rendering is dialect-specific:
 
 ## Topological Sort
 
-Tables are sorted using Kahn's algorithm so that referenced tables appear before referencing tables in the output. FK constraints define the dependency edges. A `BTreeSet` queue provides alphabetical tiebreaking for deterministic output. If cycles exist (mutual FK references), remaining tables are appended alphabetically.
+Tables are sorted using Kahn's algorithm so that referenced tables appear before referencing tables in the output. FK constraints define the dependency edges. A `BTreeSet` queue provides alphabetical tiebreaking for deterministic output. If cycles exist (mutual FK references), remaining tables are appended alphabetically. The DDL generator detects cycles and emits a warning header.
+
+## DDL Generator
+
+The `--generator ddl` mode generates raw SQL DDL for cross-database schema migration.
+
+### Cross-dialect type translation
+
+Uses a canonical type system (`CanonicalType` enum in `ddl_typemap/`):
+
+```
+ColumnInfo (source) → to_canonical() → CanonicalType → from_canonical() → DDL type string
+```
+
+Key translations:
+
+| Source | → PG | → MySQL | → MSSQL | → SQLite |
+|--------|------|---------|---------|----------|
+| PG `uuid` | UUID | CHAR(36) | UNIQUEIDENTIFIER | TEXT |
+| PG `jsonb` | JSONB | JSON* | NVARCHAR(MAX)* | TEXT |
+| PG `timestamptz` | TIMESTAMPTZ | DATETIME | DATETIMEOFFSET | DATETIME |
+| PG `text[]` | TEXT[] | JSON* | NVARCHAR(MAX)* | TEXT* |
+| MySQL `tinyint(1)` | BOOLEAN | TINYINT(1) | BIT | BOOLEAN |
+| MSSQL `money` | NUMERIC(19,4) | DECIMAL(19,4) | MONEY | REAL |
+
+\* = lossy/approximate
+
+### Identifier quoting
+
+| Dialect | Style | Example |
+|---------|-------|---------|
+| PostgreSQL | Double quotes | `"users"` |
+| MySQL | Backticks | `` `users` `` |
+| MSSQL | Brackets | `[users]` |
+| SQLite | Double quotes | `"users"` |
+
+### Auto-increment translation
+
+| Target | DDL syntax |
+|--------|-----------|
+| PostgreSQL | `SERIAL` / `BIGSERIAL` |
+| MySQL | `AUTO_INCREMENT` |
+| MSSQL | `IDENTITY(1, 1)` |
+| SQLite | `INTEGER PRIMARY KEY AUTOINCREMENT` |
+
+### Default value translation
+
+Source defaults are stripped of dialect-specific syntax, then translated:
+- `now()` ↔ `CURRENT_TIMESTAMP` ↔ `GETDATE()`
+- `gen_random_uuid()` ↔ `(UUID())` ↔ `NEWID()`
+- Boolean: `1`/`0` ↔ `true`/`false` (only for boolean-typed columns)
+- Bare string defaults (MySQL stores without quotes) are auto-quoted
+
+### Schema diff
+
+Compares source and target `IntrospectedSchema` and emits ALTER statements:
+
+1. **New tables**: full `CREATE TABLE`
+2. **New columns**: `ALTER TABLE ADD COLUMN`
+3. **Modified columns**: `ALTER TABLE ALTER/MODIFY COLUMN` (type, nullable, default)
+4. **Dropped columns**: `ALTER TABLE DROP COLUMN` (with warning)
+5. **Dropped tables**: `DROP TABLE IF EXISTS` (with warning)
+
+Default schemas (`public`, `dbo`, `main`, MySQL database names) are normalized for cross-dialect matching.
+
+### Split-tables output
+
+`--split-tables` produces one file per table. For DDL: `{table}.sql` + `_order.txt`. For Python: `base.py` + `{model}.py` + `__init__.py`.

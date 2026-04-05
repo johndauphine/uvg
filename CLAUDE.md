@@ -46,10 +46,12 @@ The application follows a pipeline: **CLI parsing -> Connection -> Introspection
 - **`introspect/sqlite/`** -- SQLite introspection via sqlx. Uses PRAGMA commands (`pragma_table_info`, `pragma_foreign_key_list`, `pragma_index_list`) and parses CREATE TABLE SQL for AUTOINCREMENT and CHECK constraints.
 - **`typemap/pg.rs`**, **`typemap/mssql.rs`**, **`typemap/mysql.rs`**, **`typemap/sqlite.rs`** -- Map database column types (via `udt_name`) to SQLAlchemy type expressions, Python type annotations, and import requirements. Returns `MappedType`.
 - **`codegen/`** -- `Generator` trait with three implementations:
-  - `declarative.rs` -- Generates modern SQLAlchemy ORM classes with `Mapped[]` type annotations. Tables without primary keys fall back to `Table()` syntax within the same output.
-  - `tables.rs` -- Generates `Table()` metadata objects for all tables.
-  - `ddl.rs` -- Generates raw SQL DDL (CREATE TABLE, ALTER TABLE, CREATE INDEX) for cross-dialect schema migration. Supports schema diff with ALTER statement generation.
+  - `declarative.rs` -- Generates modern SQLAlchemy ORM classes with `Mapped[]` type annotations. Tables without primary keys fall back to `Table()` syntax within the same output. Tests in `declarative_tests/` (basic, relationships, enums_and_types).
+  - `tables.rs` -- Generates `Table()` metadata objects for all tables. Tests in `tables_tests.rs`.
+  - `ddl.rs` -- Generates raw SQL DDL (CREATE TABLE, CREATE INDEX, COMMENT ON, enum types) for cross-dialect schema migration. Functions are `pub(super)` for use by `ddl_diff.rs`.
+  - `ddl_diff.rs` -- Schema diff engine: compares source and target schemas, emits ALTER TABLE statements for new/dropped/modified tables and columns. Cross-dialect schema normalization for default schemas.
   - `imports.rs` -- `ImportCollector` that accumulates, deduplicates, and renders import statements in a specific group order.
+  - `relationships.rs` -- FK-based relationship inference for declarative mode.
   - `mod.rs` -- Shared helpers: `has_primary_key()`, `is_primary_key_column()`, `topo_sort_tables()`, `format_server_default()`, `split_python_output()` (for `--split-tables`).
 - **`ddl_typemap/`** -- Cross-dialect type translation via `CanonicalType` intermediate representation. Maps source DB types to target DDL types (e.g., PG `jsonb` → MySQL `JSON`, PG `uuid` → MSSQL `UNIQUEIDENTIFIER`).
 - **`naming.rs`** -- Table/column name transformations: `table_to_class_name()` (UpperCamelCase via `heck`), `table_to_variable_name()` (sanitized `t_` prefix).
@@ -71,10 +73,11 @@ When the declarative generator encounters tables without primary keys, it falls 
 
 ### Testing patterns
 
-- Unit tests are inline (`#[cfg(test)] mod tests`) within source files.
+- Tests are separated from code for large files. `declarative.rs` tests live in `declarative_tests/` (basic.rs, relationships.rs, enums_and_types.rs). `tables.rs` tests live in `tables_tests.rs`. Smaller files keep tests inline.
 - `src/testutil.rs` provides builder helpers for constructing test data: `col(name)` -> `ColumnInfoBuilder`, `table(name)` -> `TableInfoBuilder`, `schema_pg(tables)` / `schema_mssql(tables)` / `schema_mysql(tables)` / `schema_sqlite(tables)` -> `IntrospectedSchema`. Builders auto-increment `ordinal_position` and default to non-nullable int4 columns.
 - Many codegen tests use `assert_eq!(output, expected)` with `indoc!` for exact string matching against sqlacodegen's expected output. Some older tests use `insta::assert_yaml_snapshot!()`.
-- Integration tests in `tests/integration.rs` are marked `#[ignore]` and require a live database.
+- Integration tests in `tests/integration.rs` are marked `#[ignore]` and require a live database (except SQLite which runs in-memory).
+- DDL cross-dialect tests verified via Docker E2E: all 16 source×target permutations pass DDL generation; same-dialect migrations achieve perfect convergence (diff after apply shows zero changes).
 
 ### Adding a new database dialect
 

@@ -39,11 +39,23 @@ src/
     mysql.rs           MySQL DATA_TYPE/COLUMN_TYPE -> MappedType (with ENUM/SET parsing)
     sqlite.rs          SQLite declared type -> MappedType (with affinity fallback)
 
+  ddl_typemap/
+    mod.rs             CanonicalType enum, cross-dialect type translation dispatch
+    pg.rs              PostgreSQL ↔ canonical type mapping
+    mysql.rs           MySQL ↔ canonical type mapping
+    mssql.rs           MSSQL ↔ canonical type mapping
+    sqlite.rs          SQLite ↔ canonical type mapping (affinity rules)
+
   codegen/
-    mod.rs             Generator trait, topo_sort, shared helpers
+    mod.rs             Generator trait, topo_sort, split_python_output, shared helpers
     imports.rs         ImportCollector: accumulates and renders Python imports
     declarative.rs     DeclarativeGenerator: Mapped[] ORM classes
     tables.rs          TablesGenerator: Table() metadata objects
+    ddl.rs             DdlGenerator: raw SQL DDL (CREATE TABLE, indexes, comments, enums)
+    ddl_diff.rs        Schema diff engine: ALTER TABLE generation (Alembic-inspired)
+    relationships.rs   FK-based relationship inference for declarative mode
+    declarative_tests/ Tests for declarative generator (basic, relationships, enums_and_types)
+    tables_tests.rs    Tests for tables generator
     snapshots/         insta snapshot files for codegen tests
 
   testutil.rs          Test builders: col(), table(), schema_pg/mssql/mysql/sqlite()
@@ -58,7 +70,7 @@ tests/
 
 The `IntrospectedSchema` struct is the only interface between introspection and code generation. The introspection modules know nothing about Python or SQLAlchemy. The code generators know nothing about SQL queries or database catalogs. This makes it possible to add a new database dialect by implementing only the introspection side, and to add a new output format by implementing only the generator side.
 
-### Generator trait with two implementations
+### Generator trait with three implementations
 
 ```rust
 pub trait Generator {
@@ -112,6 +124,24 @@ Python string quoting follows a simple rule: if the string contains single quote
 ### Default schema suppression
 
 Each dialect has a default schema (`public` for PostgreSQL, `dbo` for MSSQL, the database name for MySQL, `main` for SQLite). When a table's schema matches the default, the `schema=` parameter is omitted from the output. This keeps generated code clean for the common case while correctly qualifying tables in non-default schemas.
+
+### DDL generator: canonical type translation
+
+The DDL generator uses a two-phase type translation to handle cross-dialect migration. Source column types are first normalized to a `CanonicalType` enum (Integer, Boolean, Varchar, Timestamp, Uuid, Json, etc.), then emitted as DDL for the target dialect. This avoids N×N mapping functions — each dialect only implements `to_canonical()` and `from_canonical()`.
+
+Lossy translations (e.g. PG `JSONB` → MySQL `JSON`, PG `UUID` → MySQL `CHAR(36)`) are flagged with `is_approximate` and an optional warning string.
+
+When source and target are the same dialect, the canonical translation is still used but produces identical output (identity mapping).
+
+### DDL generator: schema diff
+
+The diff engine compares two `IntrospectedSchema` instances and emits ALTER statements. Tables are matched by name after normalizing default schemas (`public`, `dbo`, `main`, MySQL database names) to a common key. This allows cross-dialect diffs (PG `public.users` matches MSSQL `dbo.users`).
+
+Column comparison detects type changes, nullability changes, and default changes. Boolean defaults are normalized (0/1 ↔ true/false) before comparison to avoid false positives across dialects.
+
+### DDL generator: default schema mapping
+
+Cross-dialect DDL suppresses schema qualification when the source schema is a default for any dialect. MSSQL cannot create a `[public]` schema (reserved role name), so PG's `public` tables emit as unqualified names targeting MSSQL's `dbo`. MySQL's database-as-schema names are always suppressed since DDL targets the connected database.
 
 ## What's Not Implemented Yet
 
