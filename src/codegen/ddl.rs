@@ -513,46 +513,51 @@ fn generate_enum_types(schema: &IntrospectedSchema, target_dialect: Dialect) -> 
 }
 
 /// Detect circular FK dependencies among tables.
+/// Keys by (schema, name) to handle multi-schema introspection correctly.
 fn detect_fk_cycles(tables: &[TableInfo]) -> bool {
     use std::collections::HashSet;
 
-    let table_names: HashSet<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-    let mut visited: HashSet<&str> = HashSet::new();
-    let mut in_stack: HashSet<&str> = HashSet::new();
+    type Key<'a> = (&'a str, &'a str);
+
+    let table_keys: HashSet<Key> = tables
+        .iter()
+        .map(|t| (t.schema.as_str(), t.name.as_str()))
+        .collect();
+    let mut visited: HashSet<Key> = HashSet::new();
+    let mut in_stack: HashSet<Key> = HashSet::new();
 
     fn dfs<'a>(
-        node: &'a str,
-        adj: &HashMap<&'a str, Vec<&'a str>>,
-        visited: &mut HashSet<&'a str>,
-        in_stack: &mut HashSet<&'a str>,
+        node: Key<'a>,
+        adj: &HashMap<Key<'a>, Vec<Key<'a>>>,
+        visited: &mut HashSet<Key<'a>>,
+        in_stack: &mut HashSet<Key<'a>>,
     ) -> bool {
         visited.insert(node);
         in_stack.insert(node);
-        if let Some(neighbors) = adj.get(node) {
+        if let Some(neighbors) = adj.get(&node) {
             for &neighbor in neighbors {
-                if !visited.contains(neighbor) {
+                if !visited.contains(&neighbor) {
                     if dfs(neighbor, adj, visited, in_stack) {
                         return true;
                     }
-                } else if in_stack.contains(neighbor) {
-                    return true; // cycle found
+                } else if in_stack.contains(&neighbor) {
+                    return true;
                 }
             }
         }
-        in_stack.remove(node);
+        in_stack.remove(&node);
         false
     }
 
-    // Build adjacency: table -> tables it references via FK
-    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut adj: HashMap<Key, Vec<Key>> = HashMap::new();
     for table in tables {
+        let src = (table.schema.as_str(), table.name.as_str());
         for c in &table.constraints {
             if c.constraint_type == ConstraintType::ForeignKey {
                 if let Some(ref fk) = c.foreign_key {
-                    if table_names.contains(fk.ref_table.as_str()) && fk.ref_table != table.name {
-                        adj.entry(table.name.as_str())
-                            .or_default()
-                            .push(fk.ref_table.as_str());
+                    let dst = (fk.ref_schema.as_str(), fk.ref_table.as_str());
+                    if table_keys.contains(&dst) && dst != src {
+                        adj.entry(src).or_default().push(dst);
                     }
                 }
             }
@@ -560,8 +565,9 @@ fn detect_fk_cycles(tables: &[TableInfo]) -> bool {
     }
 
     for table in tables {
-        if !visited.contains(table.name.as_str()) {
-            if dfs(table.name.as_str(), &adj, &mut visited, &mut in_stack) {
+        let key = (table.schema.as_str(), table.name.as_str());
+        if !visited.contains(&key) {
+            if dfs(key, &adj, &mut visited, &mut in_stack) {
                 return true;
             }
         }
@@ -799,7 +805,8 @@ fn diff_column(
             if default_changed {
                 // MSSQL defaults are named constraints; drop existing then add new
                 stmts.push(format!(
-                    "-- NOTE: MSSQL requires dropping the named default constraint first.\n-- Run: SELECT name FROM sys.default_constraints WHERE parent_object_id = OBJECT_ID('{table_name}') AND col_name(parent_object_id, parent_column_id) = '{col_name}'\n-- Then: ALTER TABLE {tname} DROP CONSTRAINT <name>;",
+                    "-- NOTE: MSSQL requires dropping the named default constraint first.\n-- Run: SELECT name FROM sys.default_constraints WHERE parent_object_id = OBJECT_ID('{tname_raw}') AND col_name(parent_object_id, parent_column_id) = '{col_name}'\n-- Then: ALTER TABLE {tname} DROP CONSTRAINT <name>;",
+                    tname_raw = table_name,
                     col_name = source.name
                 ));
                 if let Some(ref d) = source_default {
