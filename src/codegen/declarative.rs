@@ -2317,7 +2317,10 @@ mod tests {
     }
 
     /// Adapted from sqlacodegen test_enum_nonativeenums_option.
-    /// With nonativeenums, native PG enums should not be rendered.
+    /// With nonativeenums, native PG enums should not be rendered as Enum classes.
+    /// NOTE: nonativeenums is not yet fully wired — this test documents the intended
+    /// behavior and verifies the option is accepted without error. When implemented,
+    /// update assertions to verify enums are suppressed.
     #[test]
     fn test_declarative_enum_nonativeenums() {
         use crate::schema::EnumInfo;
@@ -2335,14 +2338,16 @@ mod tests {
                 values: vec!["active".to_string(), "inactive".to_string()],
             }],
         );
-        // nonativeenums is parsed but not yet wired — test that the option exists
         let opts = GeneratorOptions {
             nonativeenums: true,
             ..GeneratorOptions::default()
         };
         let gen = DeclarativeGenerator;
-        let _output = gen.generate(&schema, &opts);
-        // For now just verify it doesn't panic with the option set
+        let output = gen.generate(&schema, &opts);
+        // TODO: When nonativeenums is wired, assert enum class is NOT generated
+        // and column uses String type instead of Enum().
+        // For now, verify the option is accepted and output is valid.
+        assert!(output.contains("class Users(Base):"));
     }
 
     /// Adapted from sqlacodegen test_array_enum_named.
@@ -2628,10 +2633,13 @@ mod tests {
         assert!(output.contains("role: Mapped[RoleEnum]"));
     }
 
-    /// Adapted from sqlacodegen test_use_inflect (placeholder — needs inflections crate).
+    /// Adapted from sqlacodegen test_use_inflect.
+    /// NOTE: use_inflect requires an inflections crate and is not yet implemented.
+    /// This test documents the intended behavior: with use_inflect, collection
+    /// relationship names would be pluralized and scalar names singularized.
+    /// When implemented, update assertions to verify inflected names.
     #[test]
     fn test_declarative_use_inflect_placeholder() {
-        // use_inflect not yet implemented; verify it doesn't crash
         let schema = schema_pg(vec![
             table("simple_containers")
                 .column(col("id").build())
@@ -2646,7 +2654,9 @@ mod tests {
         ]);
         let gen = DeclarativeGenerator;
         let output = gen.generate(&schema, &GeneratorOptions::default());
-        // Relationships render (inflect would change names but not implemented yet)
-        assert!(output.contains("relationship("));
+        // Without inflect: collection uses table name "simple_items"
+        assert!(output.contains("simple_items: Mapped[list['SimpleItems']]"));
+        // TODO: With use_inflect, parent side would use singularized/pluralized names
+        // e.g. "simple_item: Mapped[list['SimpleItems']]" → pluralized collection
     }
 }
