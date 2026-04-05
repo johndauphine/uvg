@@ -59,19 +59,19 @@ impl Generator for DeclarativeGenerator {
                 if constraint.constraint_type == ConstraintType::Check {
                     if let Some(ref expr) = constraint.check_expression {
                         if let Some((col_name, values)) = parse_check_enum(expr) {
-                            use heck::ToUpperCamelCase;
-                            let enum_name =
-                                format!("{}_{}", table_ref.name, col_name).to_upper_camel_case();
-                            let ei = EnumInfo {
-                                name: enum_name.clone(),
-                                schema: None,
-                                values,
-                            };
-                            all_enums.push(ei);
-                            synthetic_enum_cols.insert(
-                                (table_ref.name.clone(), col_name),
-                                enum_name,
-                            );
+                            let key = (table_ref.name.clone(), col_name.clone());
+                            if !synthetic_enum_cols.contains_key(&key) {
+                                use heck::ToUpperCamelCase;
+                                let enum_name =
+                                    format!("{}_{}", table_ref.name, col_name).to_upper_camel_case();
+                                let ei = EnumInfo {
+                                    name: enum_name.clone(),
+                                    schema: None,
+                                    values,
+                                };
+                                all_enums.push(ei);
+                                synthetic_enum_cols.insert(key, enum_name);
+                            }
                         }
                     }
                 }
@@ -83,14 +83,18 @@ impl Generator for DeclarativeGenerator {
             std::collections::HashSet::new();
 
         for table in &sorted_tables {
-            // Track enum usage
-            for col_info in &table.columns {
-                if find_enum_for_column(&col_info.udt_name, &all_enums).is_some() {
-                    used_enum_names.insert(col_info.udt_name.clone());
-                }
-                let key = (table.name.clone(), col_info.name.clone());
-                if let Some(class_name) = synthetic_enum_cols.get(&key) {
-                    used_enum_names.insert(class_name.clone());
+            // Only track enum usage for tables that will render Enum() types
+            // (classes with PK, not fallback Table() or association tables)
+            let renders_enums = has_primary_key(&table.constraints) && !is_association_table(table);
+            if renders_enums {
+                for col_info in &table.columns {
+                    if find_enum_for_column(&col_info.udt_name, &all_enums).is_some() {
+                        used_enum_names.insert(col_info.udt_name.clone());
+                    }
+                    let key = (table.name.clone(), col_info.name.clone());
+                    if let Some(class_name) = synthetic_enum_cols.get(&key) {
+                        used_enum_names.insert(class_name.clone());
+                    }
                 }
             }
 
