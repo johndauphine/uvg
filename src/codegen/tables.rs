@@ -210,7 +210,7 @@ fn generate_table(
                 if let Some(seq_name) = parse_sequence_name(default) {
                     if !is_standard_sequence_name(&seq_name, &table.name, &col.name) {
                         imports.add("sqlalchemy", "Sequence");
-                        col_args.push(format!("Sequence('{seq_name}')"));
+                        col_args.push(format!("Sequence({})", format_python_string_literal(&seq_name)));
                     }
                 }
             } else {
