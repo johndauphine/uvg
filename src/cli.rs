@@ -108,7 +108,7 @@ fn ensure_mysql_charset(url: &str) -> String {
         parsed.query_pairs_mut().append_pair("charset", "utf8mb4");
     }
 
-    parsed.into_string()
+    parsed.into()
 }
 
 impl Cli {
