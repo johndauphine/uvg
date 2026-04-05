@@ -30,8 +30,9 @@ impl Generator for TablesGenerator {
         let mut synthetic_enum_cols: std::collections::HashMap<(String, String), String> =
             std::collections::HashMap::new();
 
-        // Extract synthetic enums from check constraints
+        // Extract synthetic enums from check constraints (unless nosyntheticenums)
         let sorted_tables = topo_sort_tables(&schema.tables);
+        if !options.nosyntheticenums {
         for table in &sorted_tables {
             for constraint in &table.constraints {
                 if constraint.constraint_type == ConstraintType::Check {
@@ -56,6 +57,7 @@ impl Generator for TablesGenerator {
                 }
             }
         }
+        } // end nosyntheticenums guard
 
         // Track which enums are actually used
         let mut used_enum_names: std::collections::HashSet<String> =
@@ -982,5 +984,55 @@ mod tests {
         assert!(output.contains("CheckConstraint("));
         // Synthetic enum is also generated
         assert!(output.contains("class SimpleItemsStatus(str, enum.Enum):"));
+    }
+
+    /// Adapted from sqlacodegen test_synthetic_enum_nosyntheticenums_option.
+    #[test]
+    fn test_tables_synthetic_enum_nosyntheticenums() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("id").build())
+                .column(col("status").udt("varchar").nullable().build())
+                .pk("simple_items_pkey", &["id"])
+                .check("", "simple_items.status IN ('active', 'inactive')")
+                .build(),
+        ]);
+        let opts = GeneratorOptions {
+            nosyntheticenums: true,
+            ..GeneratorOptions::default()
+        };
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &opts);
+        // No enum class generated
+        assert!(!output.contains("class SimpleItemsStatus"));
+        assert!(!output.contains("import enum"));
+        // Check constraint still preserved
+        assert!(output.contains("CheckConstraint("));
+        // Column uses regular type
+        assert!(output.contains("Column('status', String)"));
+    }
+
+    /// Adapted from sqlacodegen test_synthetic_enum_shared_values.
+    #[test]
+    fn test_tables_synthetic_enum_shared_values() {
+        let schema = schema_pg(vec![
+            table("table1")
+                .column(col("id").build())
+                .column(col("status").udt("varchar").nullable().build())
+                .pk("table1_pkey", &["id"])
+                .check("", "table1.status IN ('active', 'inactive')")
+                .build(),
+            table("table2")
+                .column(col("id").build())
+                .column(col("status").udt("varchar").nullable().build())
+                .pk("table2_pkey", &["id"])
+                .check("", "table2.status IN ('active', 'inactive')")
+                .build(),
+        ]);
+        let gen = TablesGenerator;
+        let output = gen.generate(&schema, &GeneratorOptions::default());
+        // Each table gets its own enum class
+        assert!(output.contains("class Table1Status(str, enum.Enum):"));
+        assert!(output.contains("class Table2Status(str, enum.Enum):"));
     }
 }

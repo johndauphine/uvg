@@ -48,6 +48,8 @@ pub struct GeneratorOptions {
     pub nobidi: bool,
     pub nofknames: bool,
     pub noidsuffix: bool,
+    pub nosyntheticenums: bool,
+    pub nonativeenums: bool,
 }
 
 /// Parsed connection configuration.
@@ -100,6 +102,8 @@ impl Cli {
                     "nobidi" => opts.nobidi = true,
                     "nofknames" => opts.nofknames = true,
                     "noidsuffix" => opts.noidsuffix = true,
+                    "nosyntheticenums" => opts.nosyntheticenums = true,
+                    "nonativeenums" => opts.nonativeenums = true,
                     _ => tracing::warn!("Unknown generator option: {}", opt),
                 }
             }

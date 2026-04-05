@@ -53,7 +53,8 @@ impl Generator for DeclarativeGenerator {
 
         let sorted_tables = topo_sort_tables(&schema.tables);
 
-        // Extract synthetic enums from check constraints
+        // Extract synthetic enums from check constraints (unless nosyntheticenums)
+        if !options.nosyntheticenums {
         for table_ref in &sorted_tables {
             for constraint in &table_ref.constraints {
                 if constraint.constraint_type == ConstraintType::Check {
@@ -77,6 +78,7 @@ impl Generator for DeclarativeGenerator {
                 }
             }
         }
+        } // end nosyntheticenums guard
 
         // Track which enums are used
         let mut used_enum_names: std::collections::HashSet<String> =
