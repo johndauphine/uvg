@@ -14,7 +14,7 @@ All introspected metadata flows through these structs defined in `src/schema.rs`
 
 ```
 IntrospectedSchema
-  dialect: Dialect (Postgres | Mssql)
+  dialect: Dialect (Postgres | Mssql | Mysql | Sqlite)
   tables: Vec<TableInfo>
 
 TableInfo
@@ -53,7 +53,7 @@ The `typemap` module maps database-specific column types to three things:
 2. **Python type annotation** (`python_type`): e.g. `"int"`, `"str"`, `"datetime.datetime"`
 3. **Import requirements** (`import_module`, `import_name`): e.g. `("sqlalchemy", "Integer")`
 
-The mapping key is `ColumnInfo.udt_name` -- the PostgreSQL user-defined type name or MSSQL equivalent. This is more reliable than `data_type` because it distinguishes types that `information_schema` conflates (e.g. `int4` vs `int8` both have `data_type = "integer"` in some contexts).
+The mapping key is `ColumnInfo.udt_name` -- the PostgreSQL user-defined type name, MSSQL equivalent, MySQL `DATA_TYPE`, or SQLite declared type. For MySQL, the full `COLUMN_TYPE` (e.g. `"enum('a','b')"`, `"int unsigned"`) is stored in `data_type` for cases where `udt_name` alone is insufficient (ENUM/SET value extraction, unsigned detection).
 
 ### PostgreSQL type mapping
 
@@ -109,6 +109,73 @@ PostgreSQL arrays (udt_name starting with `_`) are mapped to `ARRAY(element_type
 
 Unknown types fall back to the uppercase type name (e.g. `mytype` -> `MYTYPE`).
 
+### MySQL type mapping
+
+| udt_name | sa_type | python_type |
+|----------|---------|-------------|
+| tinyint (display_width=1) | Boolean | bool |
+| tinyint | TINYINT | int |
+| smallint | SmallInteger | int |
+| mediumint | MEDIUMINT | int |
+| int | Integer | int |
+| bigint | BigInteger | int |
+| float | Float | float |
+| double | Double | float |
+| decimal, numeric | Numeric(P,S) | decimal.Decimal |
+| varchar | String(N) | str |
+| char | String(N) | str |
+| text | Text | str |
+| tinytext | TINYTEXT | str |
+| mediumtext | MEDIUMTEXT | str |
+| longtext | LONGTEXT | str |
+| binary, varbinary | LargeBinary(N) | bytes |
+| blob | LargeBinary | bytes |
+| tinyblob | TINYBLOB | bytes |
+| mediumblob | MEDIUMBLOB | bytes |
+| longblob | LONGBLOB | bytes |
+| date | Date | datetime.date |
+| time | Time | datetime.time |
+| datetime | DateTime | datetime.datetime |
+| timestamp | TIMESTAMP | datetime.datetime |
+| year | YEAR | int |
+| json | JSON | dict |
+| enum | Enum('val1', 'val2') | str |
+| set | SET('val1', 'val2') | str |
+| bit | BIT | int |
+| boolean | Boolean | bool |
+
+Unsigned integer variants (e.g. `int unsigned`) map to the same generic SA type. In dialect mode (`keep_dialect_types`), they render as `INTEGER(unsigned=True)` etc. from `sqlalchemy.dialects.mysql`.
+
+MySQL ENUM and SET values are parsed from the `COLUMN_TYPE` string (e.g. `enum('active','inactive')`).
+
+Dialect-specific types (`TINYINT`, `MEDIUMINT`, `TINYTEXT`, `MEDIUMTEXT`, `LONGTEXT`, `TINYBLOB`, `MEDIUMBLOB`, `LONGBLOB`, `YEAR`, `SET`, `BIT`, `TIMESTAMP`) are imported from `sqlalchemy.dialects.mysql`.
+
+### SQLite type mapping
+
+| udt_name | sa_type | python_type |
+|----------|---------|-------------|
+| integer, int | Integer | int |
+| smallint | SmallInteger | int |
+| bigint | BigInteger | int |
+| real, float, double | Float | float |
+| numeric, decimal | Numeric(P,S) | decimal.Decimal |
+| text, clob | Text | str |
+| varchar, char | String(N) | str |
+| blob | LargeBinary | bytes |
+| date | Date | datetime.date |
+| datetime, timestamp | DateTime | datetime.datetime |
+| time | Time | datetime.time |
+| boolean, bool | Boolean | bool |
+| json | JSON | dict |
+| (empty) | NullType | str |
+
+Unknown declared types are mapped using SQLite type affinity rules:
+- Contains "INT" -> Integer
+- Contains "CHAR", "CLOB", or "TEXT" -> Text
+- Contains "BLOB" or empty -> LargeBinary
+- Contains "REAL", "FLOA", or "DOUB" -> Float
+- Otherwise -> Numeric
+
 ## Import Ordering
 
 The `ImportCollector` emits imports in this fixed order, with a blank line between groups 2 and 3:
@@ -116,7 +183,7 @@ The `ImportCollector` emits imports in this fixed order, with a blank line betwe
 1. `from typing import Optional`
 2. `import datetime` / `import decimal` / `import uuid` (bare stdlib imports)
 3. `from sqlalchemy import Column, Integer, MetaData, ...`
-4. `from sqlalchemy.dialects.postgresql import JSONB, UUID, ...`
+4. `from sqlalchemy.dialects.<dialect> import ...` (postgresql, mysql, mssql, etc.)
 5. `from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column`
 
 Within each `from X import` line, names are sorted alphabetically. Modules are sorted alphabetically within each group.
@@ -150,7 +217,9 @@ Raw SQL default expressions from the database are processed before emission:
 
 - **PostgreSQL**: Type casts are stripped (`'hello'::character varying` -> `'hello'`). The `::` stripping handles nested expressions and respects quoted strings.
 - **MSSQL**: Wrapping parentheses are stripped (`((0))` -> `0`). Leading `N` on string literals is stripped (`N'hello'` -> `'hello'`).
-- **Serial detection**: Defaults matching `nextval('...'::regclass)` patterns are suppressed entirely (SQLAlchemy handles auto-increment).
+- **MySQL**: Defaults are trimmed but otherwise used as-is (MySQL defaults are clean expressions).
+- **SQLite**: Defaults are trimmed but otherwise used as-is (SQLite defaults are literal values or function calls).
+- **Serial detection**: PostgreSQL defaults matching `nextval('...'::regclass)` patterns are suppressed entirely (SQLAlchemy handles auto-increment). MySQL/SQLite auto-increment columns have `NULL` defaults, so serial detection returns `false`.
 - All remaining defaults are wrapped in `text('...')` for SQLAlchemy's `server_default` parameter.
 
 ## Identity Columns
@@ -159,6 +228,8 @@ Identity column rendering is dialect-specific:
 
 - **PostgreSQL**: `Identity(start=1, increment=1, minvalue=1, maxvalue=2147483647, cycle=False, cache=1)`
 - **MSSQL**: `Identity(start=1, increment=1)` (only start and increment)
+- **MySQL**: Auto-increment columns are detected via `EXTRA` in `information_schema.COLUMNS`. Identity info is not populated (MySQL has no sequences). Auto-increment is expressed via `autoincrement=True` for composite PKs.
+- **SQLite**: AUTOINCREMENT is detected by parsing the CREATE TABLE SQL from `sqlite_master`. Same rendering as MSSQL if identity info were populated.
 
 ## Naming Transforms
 

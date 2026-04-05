@@ -23,9 +23,9 @@ UVg accepts the same flags and URL formats as sqlacodegen. A user should be able
 
 ## Dialect abstraction without over-abstraction
 
-The codebase supports PostgreSQL and MSSQL. Rather than building an elaborate dialect plugin system, UVg uses a simple `Dialect` enum that flows through the pipeline. Each point of dialect-specific behavior (type mapping, default formatting, identity columns, schema naming) dispatches on this enum directly.
+The codebase supports PostgreSQL, MySQL, SQLite, and MSSQL. Rather than building an elaborate dialect plugin system, UVg uses a simple `Dialect` enum that flows through the pipeline. Each point of dialect-specific behavior (type mapping, default formatting, identity columns, schema naming) dispatches on this enum directly.
 
-This is intentional. Two dialects don't justify a trait-based plugin architecture. If a third dialect is added, the enum approach still works. If five are added, it may be time to reconsider -- but not before.
+This is intentional. Four dialects are well-served by exhaustive `match` on an enum -- the Rust compiler ensures every branch is covered when a new variant is added. The enum approach keeps dialect-specific logic visible and local rather than hidden behind trait indirection.
 
 ## Deterministic output
 

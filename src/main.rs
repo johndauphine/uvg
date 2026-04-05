@@ -31,7 +31,12 @@ async fn main() -> Result<()> {
 
     let config = cli.parse_connection()?;
     let dialect = config.dialect();
-    let schemas = cli.schema_list_or(dialect.default_schema());
+    // MySQL default schema = database name from URL; others use static defaults.
+    let schemas = if let Some(db) = config.database_name() {
+        cli.schema_list_or(&db)
+    } else {
+        cli.schema_list_or(dialect.default_schema())
+    };
     let table_filter = cli.table_list();
     let options = cli.generator_options();
 
@@ -75,6 +80,39 @@ async fn main() -> Result<()> {
                 &options,
             )
             .await?
+        }
+        ConnectionConfig::Mysql(url) => {
+            let pool = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await?;
+            tracing::debug!("Introspecting schema...");
+            let s = introspect::mysql::introspect(
+                &pool,
+                &schemas,
+                &table_filter,
+                cli.noviews,
+                &options,
+            )
+            .await;
+            pool.close().await;
+            s?
+        }
+        ConnectionConfig::Sqlite(url) => {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await?;
+            tracing::debug!("Introspecting schema...");
+            let s = introspect::sqlite::introspect(
+                &pool,
+                &table_filter,
+                cli.noviews,
+                &options,
+            )
+            .await;
+            pool.close().await;
+            s?
         }
     };
 

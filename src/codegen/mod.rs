@@ -19,6 +19,7 @@ pub fn format_server_default(default: &str, dialect: Dialect) -> String {
     let cleaned = match dialect {
         Dialect::Postgres => strip_pg_typecast(default),
         Dialect::Mssql => strip_mssql_parens(default),
+        Dialect::Mysql | Dialect::Sqlite => default.trim(),
     };
 
     format!("text({})", format_python_string_literal(cleaned))
@@ -370,7 +371,7 @@ pub fn topo_sort_tables(tables: &[crate::schema::TableInfo]) -> Vec<&crate::sche
 pub fn is_serial_default(default: &str, dialect: Dialect) -> bool {
     match dialect {
         Dialect::Postgres => default.starts_with("nextval("),
-        Dialect::Mssql => false,
+        Dialect::Mssql | Dialect::Mysql | Dialect::Sqlite => false,
     }
 }
 
