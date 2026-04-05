@@ -20,6 +20,8 @@ tiberius = { version = "0.12", default-features = false, features = ["rustls", "
 tokio-util = { version = "0.7", features = ["compat"] }
 percent-encoding = "2"
 url = "2"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 insta = { version = "1", features = ["yaml"] }

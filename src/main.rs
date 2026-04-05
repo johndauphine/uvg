@@ -1,5 +1,6 @@
 mod cli;
 mod codegen;
+mod db;
 mod ddl_typemap;
 mod dialect;
 mod error;
@@ -8,6 +9,7 @@ mod naming;
 mod schema;
 #[cfg(test)]
 mod testutil;
+mod tui;
 mod typemap;
 
 use std::fs;
@@ -29,6 +31,10 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if cli.interactive {
+        return tui::run(cli).await;
+    }
 
     let config = cli.parse_connection()?;
     let dialect = config.dialect();
@@ -151,7 +157,7 @@ async fn main() -> Result<()> {
                     cli.schema_list_or(target_dialect.default_schema())
                 };
                 Some(
-                    introspect_with_config(
+                    db::introspect_with_config(
                         target_config,
                         &target_schemas,
                         &table_filter,
@@ -232,67 +238,4 @@ fn write_output(output: &str, outfile: &Option<String>) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Introspect a database given a ConnectionConfig (used for target DB in DDL diff).
-async fn introspect_with_config(
-    config: cli::ConnectionConfig,
-    schemas: &[String],
-    table_filter: &[String],
-    noviews: bool,
-    options: &cli::GeneratorOptions,
-) -> anyhow::Result<schema::IntrospectedSchema> {
-    match config {
-        cli::ConnectionConfig::Postgres(url) => {
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .connect(&url)
-                .await?;
-            let s = introspect::pg::introspect(&pool, schemas, table_filter, noviews, options)
-                .await;
-            pool.close().await;
-            Ok(s?)
-        }
-        cli::ConnectionConfig::Mssql {
-            host,
-            port,
-            database,
-            user,
-            password,
-            trust_cert,
-        } => {
-            let mut client =
-                introspect::mssql::connect(&host, port, &database, &user, &password, trust_cert)
-                    .await?;
-            Ok(
-                introspect::mssql::introspect(
-                    &mut client,
-                    schemas,
-                    table_filter,
-                    noviews,
-                    options,
-                )
-                .await?,
-            )
-        }
-        cli::ConnectionConfig::Mysql(url) => {
-            let pool = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .connect(&url)
-                .await?;
-            let s =
-                introspect::mysql::introspect(&pool, schemas, table_filter, noviews, options).await;
-            pool.close().await;
-            Ok(s?)
-        }
-        cli::ConnectionConfig::Sqlite(url) => {
-            let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect(&url)
-                .await?;
-            let s = introspect::sqlite::introspect(&pool, table_filter, noviews, options).await;
-            pool.close().await;
-            Ok(s?)
-        }
-    }
 }
