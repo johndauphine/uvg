@@ -30,35 +30,39 @@ pub fn map_column_type_dialect(col: &ColumnInfo) -> MappedType {
         }
         "money" => simple("MONEY", "decimal.Decimal", ms),
         "smallmoney" => simple("SMALLMONEY", "decimal.Decimal", ms),
-        "varchar" | "char" => {
+        "varchar" => {
             let sa_type = match col.character_maximum_length {
                 Some(n) => format!("VARCHAR({n})"),
                 None => "VARCHAR".to_string(),
             };
-            MappedType {
-                sa_type,
-                python_type: "str".to_string(),
-                import_module: ms.to_string(),
-                import_name: "VARCHAR".to_string(),
-                element_import: None,
-            }
+            MappedType { sa_type, python_type: "str".to_string(), import_module: ms.to_string(), import_name: "VARCHAR".to_string(), element_import: None }
         }
-        "nvarchar" | "nchar" => {
+        "char" => {
+            let sa_type = match col.character_maximum_length {
+                Some(n) => format!("CHAR({n})"),
+                None => "CHAR".to_string(),
+            };
+            MappedType { sa_type, python_type: "str".to_string(), import_module: ms.to_string(), import_name: "CHAR".to_string(), element_import: None }
+        }
+        "nvarchar" => {
             let sa_type = match col.character_maximum_length {
                 Some(n) => format!("NVARCHAR({n})"),
                 None => "NVARCHAR".to_string(),
             };
-            MappedType {
-                sa_type,
-                python_type: "str".to_string(),
-                import_module: ms.to_string(),
-                import_name: "NVARCHAR".to_string(),
-                element_import: None,
-            }
+            MappedType { sa_type, python_type: "str".to_string(), import_module: ms.to_string(), import_name: "NVARCHAR".to_string(), element_import: None }
+        }
+        "nchar" => {
+            let sa_type = match col.character_maximum_length {
+                Some(n) => format!("NCHAR({n})"),
+                None => "NCHAR".to_string(),
+            };
+            MappedType { sa_type, python_type: "str".to_string(), import_module: ms.to_string(), import_name: "NCHAR".to_string(), element_import: None }
         }
         "text" => simple("TEXT", "str", ms),
         "ntext" => simple("NTEXT", "str", ms),
-        "binary" | "varbinary" | "image" => simple("VARBINARY", "bytes", ms),
+        "binary" => simple("BINARY", "bytes", ms),
+        "varbinary" => simple("VARBINARY", "bytes", ms),
+        "image" => simple("IMAGE", "bytes", ms),
         "datetime" => simple("DATETIME", "datetime.datetime", ms),
         "datetime2" => simple("DATETIME2", "datetime.datetime", ms),
         "smalldatetime" => simple("SMALLDATETIME", "datetime.datetime", ms),

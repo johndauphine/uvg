@@ -208,7 +208,11 @@ fn generate_table(
                     udt_name: di.base_type.clone(),
                     ..col.clone()
                 };
-                let base_mapped = map_column_type(&base_col, dialect);
+                let base_mapped = if options.keep_dialect_types {
+                    map_column_type_dialect(&base_col, dialect)
+                } else {
+                    map_column_type(&base_col, dialect)
+                };
                 imports.add(&base_mapped.import_module, &base_mapped.import_name);
 
                 let mut domain_args = vec![

@@ -107,10 +107,11 @@ fn map_udt_scalar_dialect(udt: &str, col: &ColumnInfo) -> MappedType {
         "jsonb" => simple("JSONB", "dict", pg),
         "inet" => simple("INET", "str", pg),
         "cidr" => simple("CIDR", "str", pg),
+        // Fallback: use sqlalchemy (not dialect module) to avoid invalid imports
         other => MappedType {
             sa_type: other.to_uppercase(),
             python_type: "str".to_string(),
-            import_module: pg.to_string(),
+            import_module: "sqlalchemy".to_string(),
             import_name: other.to_uppercase(),
             element_import: None,
         },

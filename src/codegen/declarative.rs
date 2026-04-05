@@ -2671,4 +2671,28 @@ mod tests {
         // TODO: With use_inflect, parent side would use singularized/pluralized names
         // e.g. "simple_item: Mapped[list['SimpleItems']]" → pluralized collection
     }
+
+    /// Test keep_dialect_types in declarative mode for PostgreSQL.
+    #[test]
+    fn test_declarative_keep_dialect_types_pg() {
+        let schema = schema_pg(vec![
+            table("simple_items")
+                .column(col("id").udt("int8").build())
+                .column(col("name").udt("varchar").max_length(100).nullable().build())
+                .column(col("score").udt("float8").nullable().build())
+                .pk("si_pkey", &["id"])
+                .build(),
+        ]);
+        let opts = GeneratorOptions {
+            keep_dialect_types: true,
+            ..GeneratorOptions::default()
+        };
+        let gen = DeclarativeGenerator;
+        let output = gen.generate(&schema, &opts);
+        // PG dialect types preserved in declarative
+        assert!(output.contains("BIGINT"));
+        assert!(output.contains("VARCHAR(100)"));
+        assert!(output.contains("DOUBLE_PRECISION"));
+        assert!(output.contains("from sqlalchemy.dialects.postgresql import"));
+    }
 }
