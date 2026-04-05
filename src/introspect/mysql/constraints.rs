@@ -116,8 +116,8 @@ pub async fn query_constraints(
         });
     }
 
-    // Check constraints (MySQL 8.0+)
-    let check_rows = sqlx::query_as::<_, CheckRow>(
+    // Check constraints (MySQL 8.0+; older versions lack CHECK_CONSTRAINTS table)
+    let check_rows = match sqlx::query_as::<_, CheckRow>(
         r#"
         SELECT cc.CONSTRAINT_NAME, cc.CHECK_CLAUSE
         FROM information_schema.CHECK_CONSTRAINTS cc
@@ -134,7 +134,19 @@ pub async fn query_constraints(
     .bind(table_name)
     .fetch_all(pool)
     .await
-    .unwrap_or_default(); // Gracefully handle older MySQL without check constraint support
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            // MySQL < 8.0.16 does not have CHECK_CONSTRAINTS; log and skip
+            tracing::debug!(
+                "Skipping CHECK constraints for {}.{}: {}",
+                schema,
+                table_name,
+                e
+            );
+            vec![]
+        }
+    };
 
     for row in check_rows {
         constraints.push(ConstraintInfo {

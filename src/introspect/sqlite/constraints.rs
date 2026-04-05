@@ -149,6 +149,8 @@ async fn query_unique_constraints(
 }
 
 /// Parse CHECK constraints from CREATE TABLE SQL.
+/// Handles both table-level (`CHECK(...)`) and column-level
+/// (`col TYPE CHECK(...)`) constraints.
 fn parse_check_constraints(create_sql: &str) -> Vec<ConstraintInfo> {
     if create_sql.is_empty() {
         return vec![];
@@ -166,37 +168,44 @@ fn parse_check_constraints(create_sql: &str) -> Vec<ConstraintInfo> {
 
     for fragment in fragments {
         let trimmed = fragment.trim();
-        let upper = trimmed.to_uppercase();
 
-        // Match "CHECK (...)" or "CONSTRAINT name CHECK (...)"
-        if let Some(check_pos) = upper.find("CHECK") {
-            // Only match if CHECK is a standalone keyword (table-level constraint)
-            let before_check = &upper[..check_pos];
-            let is_table_level = before_check.is_empty()
-                || before_check.trim().starts_with("CONSTRAINT")
-                || before_check.trim().is_empty();
-
-            if is_table_level {
-                let after_check = &trimmed[check_pos + 5..].trim_start();
-                if after_check.starts_with('(') {
-                    // Extract the expression inside the parentheses
-                    if let Some(expr) = extract_check_expression(after_check) {
-                        let name = format!("ck_{idx}");
-                        checks.push(ConstraintInfo {
-                            name,
-                            constraint_type: ConstraintType::Check,
-                            columns: vec![],
-                            foreign_key: None,
-                            check_expression: Some(expr),
-                        });
-                        idx += 1;
-                    }
+        // Case-insensitive search for "CHECK" on the original string using
+        // byte-level ASCII comparison to avoid UTF-8 index mismatch.
+        if let Some(check_pos) = find_keyword_ascii(trimmed, "CHECK") {
+            let after_check = trimmed[check_pos + 5..].trim_start();
+            if after_check.starts_with('(') {
+                if let Some(expr) = extract_check_expression(after_check) {
+                    let name = format!("ck_{idx}");
+                    checks.push(ConstraintInfo {
+                        name,
+                        constraint_type: ConstraintType::Check,
+                        columns: vec![],
+                        foreign_key: None,
+                        check_expression: Some(expr),
+                    });
+                    idx += 1;
                 }
             }
         }
     }
 
     checks
+}
+
+/// Case-insensitive ASCII search for a keyword in a string.
+/// Returns the byte offset in the original string, safe for slicing
+/// as long as the keyword is pure ASCII.
+fn find_keyword_ascii(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_bytes = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle_bytes.len())
+        .position(|window| {
+            window
+                .iter()
+                .zip(needle_bytes.iter())
+                .all(|(h, n)| h.to_ascii_uppercase() == n.to_ascii_uppercase())
+        })
 }
 
 /// Extract the expression from "(...)" respecting nested parentheses.
@@ -302,6 +311,25 @@ mod tests {
         let sql = "CREATE TABLE t (id INTEGER, name TEXT)";
         let checks = parse_check_constraints(sql);
         assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_check_column_level() {
+        let sql =
+            "CREATE TABLE t (id INTEGER, status TEXT CHECK(status IN ('active', 'inactive')))";
+        let checks = parse_check_constraints(sql);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].check_expression.as_deref(),
+            Some("status IN ('active', 'inactive')")
+        );
+    }
+
+    #[test]
+    fn test_parse_check_mixed_levels() {
+        let sql = "CREATE TABLE t (id INTEGER, val INTEGER CHECK(val > 0), CHECK(id > 0))";
+        let checks = parse_check_constraints(sql);
+        assert_eq!(checks.len(), 2);
     }
 
     #[test]

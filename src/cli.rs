@@ -80,11 +80,17 @@ impl ConnectionConfig {
     }
 
     /// Extract the database name from a MySQL connection URL.
+    /// Returns `None` if the URL has no database path or it is empty.
     pub fn database_name(&self) -> Option<String> {
         match self {
-            ConnectionConfig::Mysql(url) => url::Url::parse(url)
-                .ok()
-                .map(|u| u.path().trim_start_matches('/').to_string()),
+            ConnectionConfig::Mysql(url) => url::Url::parse(url).ok().and_then(|u| {
+                let database = u.path().trim_start_matches('/').to_string();
+                if database.is_empty() {
+                    None
+                } else {
+                    Some(database)
+                }
+            }),
             _ => None,
         }
     }
@@ -337,6 +343,13 @@ mod tests {
     #[test]
     fn test_non_mysql_database_name() {
         let cli = cli_with_url("postgresql://user:pass@localhost/testdb");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.database_name(), None);
+    }
+
+    #[test]
+    fn test_mysql_empty_database_name() {
+        let cli = cli_with_url("mysql://user:pass@host/");
         let config = cli.parse_connection().unwrap();
         assert_eq!(config.database_name(), None);
     }

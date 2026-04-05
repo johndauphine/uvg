@@ -34,19 +34,33 @@ fn parse_enum_set_values(column_type: &str) -> Vec<String> {
     let mut values = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
+    let bytes = inner.as_bytes();
+    let mut i = 0;
 
-    for ch in inner.chars() {
-        if ch == '\'' && !in_quote {
-            in_quote = true;
-        } else if ch == '\'' && in_quote {
-            // Check for escaped quote ''
-            in_quote = false;
-            values.push(current.clone());
-            current.clear();
-        } else if in_quote {
-            current.push(ch);
+    while i < bytes.len() {
+        if !in_quote {
+            if bytes[i] == b'\'' {
+                in_quote = true;
+            }
+            i += 1;
+            continue;
         }
-        // Skip commas and spaces between values
+
+        if bytes[i] == b'\'' {
+            // Lookahead for escaped quote ''
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                current.push('\'');
+                i += 2;
+            } else {
+                in_quote = false;
+                values.push(current.clone());
+                current.clear();
+                i += 1;
+            }
+        } else {
+            current.push(bytes[i] as char);
+            i += 1;
+        }
     }
 
     values
@@ -496,4 +510,12 @@ mod tests {
         assert_eq!(m.sa_type, "TINYINT(display_width=1)");
         assert_eq!(m.import_module, MY);
     }
+
+    #[test]
+    fn test_enum_escaped_quotes() {
+        let c = mysql_col("enum", "enum('can''t','won''t','ok')");
+        let m = map_column_type(&c);
+        assert_eq!(m.sa_type, "Enum('can't', 'won't', 'ok')");
+    }
+
 }
