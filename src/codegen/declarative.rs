@@ -885,5 +885,5 @@ fn generate_table_fallback(
 }
 
 #[cfg(test)]
-#[path = "declarative_tests.rs"]
+#[path = "declarative_tests/mod.rs"]
 mod tests;
