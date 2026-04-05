@@ -1,6 +1,6 @@
 # UVg
 
-A Rust reimplementation of [sqlacodegen](https://github.com/agronholm/sqlacodegen) — connects to a PostgreSQL or Microsoft SQL Server database, introspects its schema, and generates SQLAlchemy Python model code.
+A Rust reimplementation of [sqlacodegen](https://github.com/agronholm/sqlacodegen) — connects to a PostgreSQL, MySQL, SQLite, or Microsoft SQL Server database, introspects its schema, and generates SQLAlchemy Python model code.
 
 Single binary, drop-in compatible CLI, same output.
 
@@ -22,6 +22,12 @@ Accepts SQLAlchemy-style URLs:
 # PostgreSQL
 uvg postgresql://user:pass@localhost/mydb
 
+# MySQL / MariaDB
+uvg mysql://user:pass@localhost/mydb
+
+# SQLite
+uvg sqlite:///path/to/database.db
+
 # Microsoft SQL Server
 uvg mssql://user:pass@localhost/mydb
 
@@ -29,10 +35,10 @@ uvg mssql://user:pass@localhost/mydb
 uvg --generator tables postgresql://user:pass@localhost/mydb
 
 # Filter specific tables
-uvg --tables users,posts postgresql://user:pass@localhost/mydb
+uvg --tables users,posts mysql://user:pass@localhost/mydb
 
 # Write to file
-uvg --outfile models.py postgresql://user:pass@localhost/mydb
+uvg --outfile models.py sqlite:///myapp.db
 ```
 
 ### Options
@@ -41,7 +47,7 @@ uvg --outfile models.py postgresql://user:pass@localhost/mydb
 |---|---|
 | `--generator <TYPE>` | `declarative` (default) or `tables` |
 | `--tables <LIST>` | Comma-delimited table names to include |
-| `--schemas <LIST>` | Schemas to introspect (default: `public` for PG, `dbo` for MSSQL) |
+| `--schemas <LIST>` | Schemas to introspect (default: `public` for PG, `dbo` for MSSQL, database name for MySQL) |
 | `--noviews` | Skip views |
 | `--options <LIST>` | `noindexes`, `noconstraints`, `nocomments`, `use_inflect`, `nojoined`, `nobidi` |
 | `--outfile <PATH>` | Output file (default: stdout) |
@@ -115,6 +121,32 @@ Dialect types: `uniqueidentifier`
 
 URL schemes: `mssql://`, `mssql+pytds://`, `mssql+pyodbc://`, `mssql+pymssql://`
 
+### MySQL / MariaDB
+
+Scalars: `tinyint`, `smallint`, `mediumint`, `int`, `bigint` (with unsigned variants), `float`, `double`, `decimal`
+
+Strings: `char`, `varchar`, `text`, `tinytext`, `mediumtext`, `longtext`
+
+Date/time: `date`, `time`, `datetime`, `timestamp`, `year`
+
+Binary: `binary`, `varbinary`, `blob`, `tinyblob`, `mediumblob`, `longblob`
+
+Special: `json`, `enum`, `set`, `bit`, `boolean`
+
+Note: `tinyint(1)` is automatically mapped to `Boolean`.
+
+URL schemes: `mysql://`, `mysql+pymysql://`, `mysql+mysqldb://`, `mysql+aiomysql://`, `mysql+asyncmy://`, `mariadb://`, `mariadb+pymysql://`
+
+### SQLite
+
+SQLite uses type affinity. Recognized types: `integer`, `smallint`, `bigint`, `real`, `float`, `double`, `numeric`, `decimal`, `text`, `varchar`, `char`, `blob`, `date`, `datetime`, `timestamp`, `time`, `boolean`, `json`
+
+Unknown types are mapped using SQLite affinity rules (contains "INT" -> Integer, contains "TEXT"/"CHAR" -> Text, etc.).
+
+AUTOINCREMENT is detected from the CREATE TABLE SQL. CHECK constraints are parsed for synthetic enum generation.
+
+URL schemes: `sqlite:///relative/path`, `sqlite:////absolute/path`, `sqlite:///:memory:`
+
 ## Performance
 
 Benchmarked against sqlacodegen 3.2.0 on the StackOverflow 2010 database (9 tables) using [hyperfine](https://github.com/sharkdp/hyperfine):
@@ -142,12 +174,18 @@ cargo build --release
 cargo test
 ```
 
-Integration tests require a live database:
+Integration tests require a live database (except SQLite which runs in-memory):
 
 ```bash
 # PostgreSQL
 DATABASE_URL=postgresql://user:pass@localhost/testdb cargo test --test integration -- --ignored
 
+# MySQL
+MYSQL_URL=mysql://user:pass@localhost/testdb cargo test --test integration -- --ignored
+
 # Microsoft SQL Server
 DATABASE_URL=mssql://user:pass@localhost/testdb cargo test --test integration -- --ignored
+
+# SQLite (runs automatically, no server needed)
+cargo test --test integration test_introspect_sqlite_in_memory
 ```

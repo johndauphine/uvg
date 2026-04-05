@@ -6,7 +6,7 @@
 src/
   main.rs              Entry point: wires CLI -> connection -> introspection -> codegen
   cli.rs               Clap argument parsing, URL normalization, option extraction
-  dialect.rs           Dialect enum (Postgres, Mssql) with default_schema()
+  dialect.rs           Dialect enum (Postgres, Mssql, Mysql, Sqlite) with default_schema()
   error.rs             UvgError enum (thiserror)
   schema.rs            Dialect-neutral schema representation structs
   naming.rs            Table name -> class name / variable name transforms
@@ -19,11 +19,25 @@ src/
       constraints.rs   pg_constraint + information_schema joins
       indexes.rs       pg_indexes query
     mssql/             MSSQL introspection via tiberius (same submodule structure)
+    mysql/             MySQL introspection via sqlx (information_schema queries)
+      mod.rs           Orchestrates queries; schemas = database names
+      tables.rs        information_schema.TABLES with TABLE_COMMENT
+      columns.rs       information_schema.COLUMNS with COLUMN_TYPE, EXTRA, COLUMN_COMMENT
+      constraints.rs   PK/Unique/FK via information_schema + CHECK (MySQL 8.0+)
+      indexes.rs       information_schema.STATISTICS
+    sqlite/            SQLite introspection via sqlx (PRAGMA commands)
+      mod.rs           Orchestrates queries; no schema concept
+      tables.rs        sqlite_master + query_create_sql() helper
+      columns.rs       pragma_table_info + AUTOINCREMENT detection from CREATE TABLE SQL
+      constraints.rs   PK/FK/Unique via PRAGMA + CHECK parsed from CREATE TABLE SQL
+      indexes.rs       pragma_index_list + pragma_index_info
 
   typemap/
-    mod.rs             Dispatch: calls pg or mssql mapper based on Dialect
+    mod.rs             Dispatch: calls dialect-specific mapper based on Dialect
     pg.rs              PostgreSQL udt_name -> MappedType
     mssql.rs           MSSQL udt_name -> MappedType
+    mysql.rs           MySQL DATA_TYPE/COLUMN_TYPE -> MappedType (with ENUM/SET parsing)
+    sqlite.rs          SQLite declared type -> MappedType (with affinity fallback)
 
   codegen/
     mod.rs             Generator trait, topo_sort, shared helpers
@@ -32,10 +46,10 @@ src/
     tables.rs          TablesGenerator: Table() metadata objects
     snapshots/         insta snapshot files for codegen tests
 
-  testutil.rs          Test builders: col(), table(), schema_pg()
+  testutil.rs          Test builders: col(), table(), schema_pg/mssql/mysql/sqlite()
 
 tests/
-  integration.rs       Live database integration test (#[ignore])
+  integration.rs       Live database integration tests (#[ignore] for PG/MySQL/MSSQL; SQLite runs in-memory)
 ```
 
 ## Key Design Decisions
@@ -68,10 +82,12 @@ Cycles (mutual FK references) are handled by exhausting the queue and appending 
 
 ### Dialect-specific Identity formatting
 
-PostgreSQL and MSSQL expose different identity column metadata. Rather than normalizing to a lowest common denominator, UVg preserves the full dialect-specific parameters:
+Each dialect exposes different identity column metadata. Rather than normalizing to a lowest common denominator, UVg preserves the full dialect-specific parameters:
 
 - PostgreSQL includes `minvalue`, `maxvalue`, `cycle`, `cache` because sqlacodegen emits them.
-- MSSQL includes only `start` and `increment` because that's what MSSQL reflects and sqlacodegen emits.
+- MSSQL, MySQL, and SQLite include only `start` and `increment`.
+- MySQL uses AUTO_INCREMENT (detected via `EXTRA` column in `information_schema.COLUMNS`).
+- SQLite uses AUTOINCREMENT (detected by parsing the CREATE TABLE SQL from `sqlite_master`).
 
 The `IdentityInfo` struct stores the superset. The codegen layer dispatches on `Dialect` to decide which fields to emit.
 
@@ -95,16 +111,11 @@ Python string quoting follows a simple rule: if the string contains single quote
 
 ### Default schema suppression
 
-Each dialect has a default schema (`public` for PostgreSQL, `dbo` for MSSQL). When a table's schema matches the default, the `schema=` parameter is omitted from the output. This keeps generated code clean for the common case while correctly qualifying tables in non-default schemas.
+Each dialect has a default schema (`public` for PostgreSQL, `dbo` for MSSQL, the database name for MySQL, `main` for SQLite). When a table's schema matches the default, the `schema=` parameter is omitted from the output. This keeps generated code clean for the common case while correctly qualifying tables in non-default schemas.
 
 ## What's Not Implemented Yet
 
-Features present in sqlacodegen but not yet in UVg (tracked for future tiers):
+Features present in sqlacodegen but not yet in UVg (tracked for future work):
 
-- **Relationships**: `relationship()` calls inferred from foreign keys, including one-to-many, many-to-many, self-referential, and bidirectional (`back_populates`).
-- **Enum types**: Native PostgreSQL enums, synthetic enums from check constraints, array-of-enum.
-- **Check constraints**: `ConstraintType::Check` and `CheckConstraint()` emission.
 - **Computed columns**: `Computed()` column support.
-- **Domain types**: PostgreSQL domain type resolution.
-- **Additional generator options**: `use_inflect`, `nobidi`, `nofknames`, `noidsuffix`, `nonativeenums`, `nosyntheticenums`, `keep_dialect_types`, `include_dialect_options`.
 - **Index promotion**: Promoting single-column indexes to `index=True` on the Column instead of a separate `Index()` object.

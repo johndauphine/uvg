@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-UVg is a Rust reimplementation of Python's [sqlacodegen](https://github.com/agronholm/sqlacodegen). It connects to PostgreSQL or Microsoft SQL Server databases, introspects their schema, and generates SQLAlchemy Python model code. The goal is drop-in CLI compatibility with sqlacodegen -- same flags, same output format.
+UVg is a Rust reimplementation of Python's [sqlacodegen](https://github.com/agronholm/sqlacodegen). It connects to PostgreSQL, MySQL, SQLite, or Microsoft SQL Server databases, introspects their schema, and generates SQLAlchemy Python model code. The goal is drop-in CLI compatibility with sqlacodegen -- same flags, same output format.
 
 ## Build & Test Commands
 
@@ -17,10 +17,12 @@ cargo test test_name           # Run a single test by name/pattern
 cargo test -- --nocapture      # Show println output during tests
 ```
 
-Integration tests require a live database via `DATABASE_URL`:
+Integration tests require a live database via `DATABASE_URL` (except SQLite which runs in-memory):
 ```bash
 DATABASE_URL=postgresql://user:pass@localhost/testdb cargo test --test integration -- --ignored
+MYSQL_URL=mysql://user:pass@localhost/testdb cargo test --test integration -- --ignored
 DATABASE_URL=mssql://user:pass@localhost/testdb cargo test --test integration -- --ignored
+cargo test --test integration test_introspect_sqlite_in_memory  # No server needed
 ```
 
 Enable debug logging with `RUST_LOG=debug`.
@@ -35,12 +37,14 @@ The application follows a pipeline: **CLI parsing -> Connection -> Introspection
 
 ### Key modules (`src/`)
 
-- **`cli.rs`** -- Clap-based CLI parsing. Produces `ConnectionConfig` (Postgres URL string or MSSQL connection fields) and `GeneratorOptions` (`noindexes`, `noconstraints`, `nocomments`).
-- **`dialect.rs`** -- `Dialect` enum (Postgres, Mssql) with `default_schema()` returning `"public"` or `"dbo"`.
-- **`schema.rs`** -- Data structures representing introspected schema: `IntrospectedSchema`, `TableInfo`, `ColumnInfo`, `ConstraintInfo` (PrimaryKey/ForeignKey/Unique), `IndexInfo`.
+- **`cli.rs`** -- Clap-based CLI parsing. Produces `ConnectionConfig` (Postgres/MySQL URL string, SQLite path, or MSSQL connection fields) and `GeneratorOptions` (`noindexes`, `noconstraints`, `nocomments`).
+- **`dialect.rs`** -- `Dialect` enum (Postgres, Mssql, Mysql, Sqlite) with `default_schema()` returning `"public"`, `"dbo"`, `""` (MySQL uses database name), or `"main"`.
+- **`schema.rs`** -- Data structures representing introspected schema: `IntrospectedSchema`, `TableInfo`, `ColumnInfo`, `ConstraintInfo` (PrimaryKey/ForeignKey/Unique/Check), `IndexInfo`.
 - **`introspect/pg/`** -- PostgreSQL introspection via sqlx. Queries `information_schema` and `pg_catalog` across submodules: `tables.rs`, `columns.rs`, `constraints.rs`, `indexes.rs`.
 - **`introspect/mssql/`** -- MSSQL introspection via Tiberius. Same submodule structure as PG.
-- **`typemap/pg.rs`**, **`typemap/mssql.rs`** -- Map database column types (via `udt_name`) to SQLAlchemy type expressions, Python type annotations, and import requirements. Returns `MappedType`.
+- **`introspect/mysql/`** -- MySQL introspection via sqlx. Queries `information_schema` tables. Same submodule structure as PG.
+- **`introspect/sqlite/`** -- SQLite introspection via sqlx. Uses PRAGMA commands (`pragma_table_info`, `pragma_foreign_key_list`, `pragma_index_list`) and parses CREATE TABLE SQL for AUTOINCREMENT and CHECK constraints.
+- **`typemap/pg.rs`**, **`typemap/mssql.rs`**, **`typemap/mysql.rs`**, **`typemap/sqlite.rs`** -- Map database column types (via `udt_name`) to SQLAlchemy type expressions, Python type annotations, and import requirements. Returns `MappedType`.
 - **`codegen/`** -- `Generator` trait with two implementations:
   - `declarative.rs` -- Generates modern SQLAlchemy ORM classes with `Mapped[]` type annotations. Tables without primary keys fall back to `Table()` syntax within the same output.
   - `tables.rs` -- Generates `Table()` metadata objects for all tables.
@@ -66,7 +70,7 @@ When the declarative generator encounters tables without primary keys, it falls 
 ### Testing patterns
 
 - Unit tests are inline (`#[cfg(test)] mod tests`) within source files.
-- `src/testutil.rs` provides builder helpers for constructing test data: `col(name)` -> `ColumnInfoBuilder`, `table(name)` -> `TableInfoBuilder`, `schema_pg(tables)` -> `IntrospectedSchema`. Builders auto-increment `ordinal_position` and default to non-nullable int4 columns.
+- `src/testutil.rs` provides builder helpers for constructing test data: `col(name)` -> `ColumnInfoBuilder`, `table(name)` -> `TableInfoBuilder`, `schema_pg(tables)` / `schema_mssql(tables)` / `schema_mysql(tables)` / `schema_sqlite(tables)` -> `IntrospectedSchema`. Builders auto-increment `ordinal_position` and default to non-nullable int4 columns.
 - Many codegen tests use `assert_eq!(output, expected)` with `indoc!` for exact string matching against sqlacodegen's expected output. Some older tests use `insta::assert_yaml_snapshot!()`.
 - Integration tests in `tests/integration.rs` are marked `#[ignore]` and require a live database.
 

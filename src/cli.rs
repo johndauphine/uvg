@@ -8,7 +8,7 @@ use crate::dialect::Dialect;
 #[derive(Parser, Debug)]
 #[command(name = "uvg", version, about)]
 pub struct Cli {
-    /// SQLAlchemy-style database URL (e.g. postgresql://user:pass@localhost/mydb)
+    /// SQLAlchemy-style database URL (e.g. postgresql://, mysql://, sqlite:///path, mssql://)
     pub url: String,
 
     /// Code generator to use
