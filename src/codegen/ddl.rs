@@ -27,7 +27,7 @@ impl DdlGenerator {
     ) -> DdlOutput {
         match target_schema {
             Some(target) => {
-                let ddl = diff_schemas(schema, target, options);
+                let ddl = super::ddl_diff::diff_schemas(schema, target, options);
                 DdlOutput::Single(ddl)
             }
             None => self.generate_full(schema, options),
@@ -127,7 +127,7 @@ impl DdlGenerator {
 }
 
 /// Quote an identifier for the target dialect.
-pub fn quote_identifier(name: &str, dialect: Dialect) -> String {
+pub(super) fn quote_identifier(name: &str, dialect: Dialect) -> String {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
         Dialect::Mysql => format!("`{}`", name.replace('`', "``")),
@@ -136,7 +136,7 @@ pub fn quote_identifier(name: &str, dialect: Dialect) -> String {
 }
 
 /// Generate a CREATE TABLE statement.
-fn generate_create_table(
+pub(super) fn generate_create_table(
     table: &TableInfo,
     source_dialect: Dialect,
     target_dialect: Dialect,
@@ -269,7 +269,7 @@ fn generate_create_table(
 }
 
 /// Generate a column definition line.
-fn generate_column_def(
+pub(super) fn generate_column_def(
     col: &ColumnInfo,
     constraints: &[ConstraintInfo],
     source_dialect: Dialect,
@@ -384,7 +384,7 @@ fn format_autoincrement_suffix(
 /// Format a default value expression for the target dialect.
 /// Format a default value expression for the target dialect.
 /// When `is_boolean` is true, translates 0/1 ↔ true/false across dialects.
-fn format_ddl_default_typed(
+pub(super) fn format_ddl_default_typed(
     default: &str,
     source_dialect: Dialect,
     target_dialect: Dialect,
@@ -512,7 +512,7 @@ fn translate_default_function(expr: &str, target: Dialect) -> String {
 
 /// Generate a qualified table name with schema prefix if non-default.
 /// Maps source default schemas to target default schemas (e.g. PG "public" → MSSQL "dbo").
-fn qualified_table_name(schema: &str, table: &str, dialect: Dialect) -> String {
+pub(super) fn qualified_table_name(schema: &str, table: &str, dialect: Dialect) -> String {
     let default_schema = dialect.default_schema();
 
     // Suppress schema if it matches the target's default
@@ -542,7 +542,7 @@ fn qualified_table_name(schema: &str, table: &str, dialect: Dialect) -> String {
 }
 
 /// Generate CREATE INDEX statements for a table.
-fn generate_indexes(table: &TableInfo, target_dialect: Dialect) -> Vec<String> {
+pub(super) fn generate_indexes(table: &TableInfo, target_dialect: Dialect) -> Vec<String> {
     let mut stmts = Vec::new();
     let tname = qualified_table_name(&table.schema, &table.name, target_dialect);
 
@@ -619,7 +619,6 @@ fn generate_enum_types(schema: &IntrospectedSchema, target_dialect: Dialect) -> 
 }
 
 /// Detect circular FK dependencies among tables.
-/// Keys by (schema, name) to handle multi-schema introspection correctly.
 fn detect_fk_cycles(tables: &[TableInfo]) -> bool {
     use std::collections::HashSet;
 
@@ -681,299 +680,6 @@ fn detect_fk_cycles(tables: &[TableInfo]) -> bool {
     false
 }
 
-/// Normalize default schemas to empty string for cross-dialect comparison.
-/// PG "public", MSSQL "dbo", SQLite "main" are well-known defaults.
-/// For MySQL, `mysql_default_schemas` contains the database names from each side
-/// (e.g. "sourcedb", "targetdb") which should also be treated as defaults.
-/// Non-default schemas are preserved to keep multi-schema diffing correct.
-fn normalize_diff_schema<'a>(
-    schema: &'a str,
-    mysql_defaults: &std::collections::HashSet<String>,
-) -> &'a str {
-    // Well-known defaults
-    if matches!(schema, "public" | "dbo" | "main" | "") {
-        return "";
-    }
-    // MySQL database names that were the default for their respective connections
-    if mysql_defaults.contains(schema) {
-        return "";
-    }
-    schema
-}
-
-/// Diff two schemas and emit ALTER statements.
-/// Phase 1: tables and columns only.
-fn diff_schemas(
-    source: &IntrospectedSchema,
-    target: &IntrospectedSchema,
-    options: &DdlOptions,
-) -> String {
-    let source_dialect = source.dialect;
-    let target_dialect = options.target_dialect;
-
-    // For MySQL, the schema is the database name. When each side has exactly
-    // one schema (the common case), treat those as defaults so sourcedb.users
-    // matches targetdb.users. Non-default schemas are preserved for multi-schema diffs.
-    let mut mysql_defaults = std::collections::HashSet::new();
-    if source_dialect == Dialect::Mysql {
-        let schemas: std::collections::HashSet<&str> =
-            source.tables.iter().map(|t| t.schema.as_str()).collect();
-        if schemas.len() == 1 {
-            mysql_defaults.insert(schemas.into_iter().next().unwrap().to_string());
-        }
-    }
-    if target_dialect == Dialect::Mysql {
-        let schemas: std::collections::HashSet<&str> =
-            target.tables.iter().map(|t| t.schema.as_str()).collect();
-        if schemas.len() == 1 {
-            mysql_defaults.insert(schemas.into_iter().next().unwrap().to_string());
-        }
-    }
-
-    let source_map: HashMap<(&str, &str), &TableInfo> = source
-        .tables
-        .iter()
-        .map(|t| ((normalize_diff_schema(&t.schema, &mysql_defaults), t.name.as_str()), t))
-        .collect();
-    let target_map: HashMap<(&str, &str), &TableInfo> = target
-        .tables
-        .iter()
-        .map(|t| ((normalize_diff_schema(&t.schema, &mysql_defaults), t.name.as_str()), t))
-        .collect();
-
-    let mut stmts: Vec<String> = Vec::new();
-
-    // New tables (in source, not in target)
-    let sorted_source = topo_sort_tables(&source.tables);
-    for table in &sorted_source {
-        if table.table_type != TableType::Table {
-            continue;
-        }
-        let key = (normalize_diff_schema(&table.schema, &mysql_defaults), table.name.as_str());
-        if !target_map.contains_key(&key) {
-            stmts.push(generate_create_table(
-                table,
-                source_dialect,
-                target_dialect,
-                options,
-            ));
-            if !options.noindexes {
-                stmts.extend(generate_indexes(table, target_dialect));
-            }
-        }
-    }
-
-    // Modified tables (in both): compare columns
-    for table in &sorted_source {
-        if table.table_type != TableType::Table {
-            continue;
-        }
-        let key = (normalize_diff_schema(&table.schema, &mysql_defaults), table.name.as_str());
-        if let Some(target_table) = target_map.get(&key) {
-            let alters = diff_table_columns(
-                table,
-                target_table,
-                source_dialect,
-                target_dialect,
-            );
-            stmts.extend(alters);
-        }
-    }
-
-    // Dropped tables (in target, not in source)
-    let mut dropped: Vec<(&str, &str)> = target_map
-        .keys()
-        .filter(|key| !source_map.contains_key(*key))
-        .copied()
-        .collect();
-    dropped.sort();
-    for (schema, name) in dropped {
-        let qname = qualified_table_name(schema, name, target_dialect);
-        stmts.push(format!("-- WARNING: destructive operation\nDROP TABLE IF EXISTS {qname};"));
-    }
-
-    if stmts.is_empty() {
-        "-- No schema changes detected.\n".to_string()
-    } else {
-        let header = format!(
-            "-- Generated by uvg (diff)\n-- Source: {source_dialect}, Target: {target_dialect}\n\n"
-        );
-        format!("{header}{}\n", stmts.join("\n\n"))
-    }
-}
-
-/// Compare columns between source and target tables, emit ALTER statements.
-fn diff_table_columns(
-    source: &TableInfo,
-    target: &TableInfo,
-    source_dialect: Dialect,
-    target_dialect: Dialect,
-) -> Vec<String> {
-    let mut stmts = Vec::new();
-    let tname = qualified_table_name(&source.schema, &source.name, target_dialect);
-
-    let source_cols: HashMap<&str, &ColumnInfo> =
-        source.columns.iter().map(|c| (c.name.as_str(), c)).collect();
-    let target_cols: HashMap<&str, &ColumnInfo> =
-        target.columns.iter().map(|c| (c.name.as_str(), c)).collect();
-
-    // New columns (in source, not in target)
-    for col in &source.columns {
-        if !target_cols.contains_key(col.name.as_str()) {
-            let col_def = generate_column_def(
-                col,
-                &source.constraints,
-                source_dialect,
-                target_dialect,
-            );
-            // Strip leading whitespace from column def
-            let col_def = col_def.trim();
-            let add_clause = match target_dialect {
-                Dialect::Mssql => "ADD",
-                _ => "ADD COLUMN",
-            };
-            stmts.push(format!("ALTER TABLE {tname} {add_clause} {col_def};"));
-        }
-    }
-
-    // Modified columns (in both): check type, nullable, default
-    for col in &source.columns {
-        if let Some(target_col) = target_cols.get(col.name.as_str()) {
-            let alters = diff_column(col, target_col, &source.schema, &source.name, source_dialect, target_dialect);
-            stmts.extend(alters);
-        }
-    }
-
-    // Dropped columns (in target, not in source)
-    let mut dropped: Vec<&str> = target_cols
-        .keys()
-        .filter(|name| !source_cols.contains_key(*name))
-        .copied()
-        .collect();
-    dropped.sort();
-    for name in dropped {
-        let qcol = quote_identifier(name, target_dialect);
-        stmts.push(format!(
-            "-- WARNING: destructive operation\nALTER TABLE {tname} DROP COLUMN {qcol};"
-        ));
-    }
-
-    stmts
-}
-
-/// Compare a single column and emit ALTER statements if different.
-/// Compares type, nullability, and default values.
-fn diff_column(
-    source: &ColumnInfo,
-    target: &ColumnInfo,
-    table_schema: &str,
-    table_name: &str,
-    source_dialect: Dialect,
-    target_dialect: Dialect,
-) -> Vec<String> {
-    let mut stmts = Vec::new();
-    let tname = qualified_table_name(table_schema, table_name, target_dialect);
-    let cname = quote_identifier(&source.name, target_dialect);
-
-    let source_type = ddl_typemap::map_ddl_type(source, source_dialect, target_dialect);
-    let target_type = ddl_typemap::map_ddl_type(target, target_dialect, target_dialect);
-
-    let type_changed = source_type.sql_type != target_type.sql_type;
-    let nullable_changed = source.is_nullable != target.is_nullable;
-
-    // Compare defaults (strip dialect-specific syntax before comparing)
-    // Use typed comparison so boolean 1/true and 0/false are treated as equivalent
-    let canonical = crate::ddl_typemap::to_canonical(source, source_dialect);
-    let is_boolean = matches!(canonical, crate::ddl_typemap::CanonicalType::Boolean);
-    let source_default = source
-        .column_default
-        .as_deref()
-        .map(|d| format_ddl_default_typed(d, source_dialect, target_dialect, is_boolean));
-    let target_default = target
-        .column_default
-        .as_deref()
-        .map(|d| format_ddl_default_typed(d, target_dialect, target_dialect, is_boolean));
-    let default_changed = source_default != target_default;
-
-    if !type_changed && !nullable_changed && !default_changed {
-        return stmts;
-    }
-
-    match target_dialect {
-        Dialect::Postgres => {
-            if type_changed {
-                stmts.push(format!(
-                    "ALTER TABLE {tname} ALTER COLUMN {cname} TYPE {};",
-                    source_type.sql_type
-                ));
-            }
-            if nullable_changed {
-                if source.is_nullable {
-                    stmts.push(format!(
-                        "ALTER TABLE {tname} ALTER COLUMN {cname} DROP NOT NULL;"
-                    ));
-                } else {
-                    stmts.push(format!(
-                        "ALTER TABLE {tname} ALTER COLUMN {cname} SET NOT NULL;"
-                    ));
-                }
-            }
-            if default_changed {
-                match &source_default {
-                    Some(d) => stmts.push(format!(
-                        "ALTER TABLE {tname} ALTER COLUMN {cname} SET DEFAULT {d};"
-                    )),
-                    None => stmts.push(format!(
-                        "ALTER TABLE {tname} ALTER COLUMN {cname} DROP DEFAULT;"
-                    )),
-                }
-            }
-        }
-        Dialect::Mysql => {
-            // MySQL requires full column redefinition with MODIFY
-            let not_null = if !source.is_nullable { " NOT NULL" } else { "" };
-            let default_clause = match &source_default {
-                Some(d) => format!(" DEFAULT {d}"),
-                None => String::new(),
-            };
-            stmts.push(format!(
-                "ALTER TABLE {tname} MODIFY COLUMN {cname} {}{not_null}{default_clause};",
-                source_type.sql_type
-            ));
-        }
-        Dialect::Mssql => {
-            if type_changed || nullable_changed {
-                let not_null = if !source.is_nullable { " NOT NULL" } else { " NULL" };
-                stmts.push(format!(
-                    "ALTER TABLE {tname} ALTER COLUMN {cname} {}{not_null};",
-                    source_type.sql_type
-                ));
-            }
-            if default_changed {
-                // MSSQL defaults are named constraints; drop existing then add new
-                stmts.push(format!(
-                    "-- NOTE: MSSQL requires dropping the named default constraint first.\n-- Run: SELECT name FROM sys.default_constraints WHERE parent_object_id = OBJECT_ID('{tname_raw}') AND col_name(parent_object_id, parent_column_id) = '{col_name}'\n-- Then: ALTER TABLE {tname} DROP CONSTRAINT <name>;",
-                    tname_raw = table_name,
-                    col_name = source.name
-                ));
-                if let Some(ref d) = source_default {
-                    stmts.push(format!(
-                        "ALTER TABLE {tname} ADD DEFAULT {d} FOR {cname};"
-                    ));
-                }
-            }
-        }
-        Dialect::Sqlite => {
-            stmts.push(format!(
-                "-- WARNING: SQLite does not support ALTER COLUMN. Table recreation required.\n-- ALTER TABLE {tname} ALTER COLUMN {cname} TYPE {};",
-                source_type.sql_type
-            ));
-        }
-    }
-
-    stmts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,10 +688,7 @@ mod tests {
     #[test]
     fn test_quote_identifier_pg() {
         assert_eq!(quote_identifier("users", Dialect::Postgres), "\"users\"");
-        assert_eq!(
-            quote_identifier("my\"table", Dialect::Postgres),
-            "\"my\"\"table\""
-        );
+        assert_eq!(quote_identifier("my\"table", Dialect::Postgres), "\"my\"\"table\"");
     }
 
     #[test]
@@ -1000,51 +703,30 @@ mod tests {
 
     #[test]
     fn test_translate_default_now() {
-        assert_eq!(
-            translate_default_function("now()", Dialect::Mysql),
-            "CURRENT_TIMESTAMP"
-        );
-        assert_eq!(
-            translate_default_function("GETDATE()", Dialect::Postgres),
-            "now()"
-        );
-        assert_eq!(
-            translate_default_function("CURRENT_TIMESTAMP", Dialect::Mssql),
-            "GETDATE()"
-        );
+        assert_eq!(translate_default_function("now()", Dialect::Mysql), "CURRENT_TIMESTAMP");
+        assert_eq!(translate_default_function("GETDATE()", Dialect::Postgres), "now()");
+        assert_eq!(translate_default_function("CURRENT_TIMESTAMP", Dialect::Mssql), "GETDATE()");
     }
 
     #[test]
     fn test_translate_default_uuid() {
-        assert_eq!(
-            translate_default_function("gen_random_uuid()", Dialect::Mysql),
-            "(UUID())"
-        );
-        assert_eq!(
-            translate_default_function("NEWID()", Dialect::Postgres),
-            "gen_random_uuid()"
-        );
+        assert_eq!(translate_default_function("gen_random_uuid()", Dialect::Mysql), "(UUID())");
+        assert_eq!(translate_default_function("NEWID()", Dialect::Postgres), "gen_random_uuid()");
     }
 
     #[test]
     fn test_generate_create_table_pg_to_mysql() {
         let t = table("users")
-            .schema("") // no schema to avoid qualification
+            .schema("")
             .column(col("id").build())
             .column(col("name").udt("varchar").max_length(100).build())
             .column(col("bio").udt("text").nullable().build())
             .pk("pk_users", &["id"])
             .build();
-
         let options = DdlOptions {
-            target_dialect: Dialect::Mysql,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
+            target_dialect: Dialect::Mysql, split_tables: false, apply: false,
+            noindexes: false, noconstraints: false, nocomments: false,
         };
-
         let ddl = generate_create_table(&t, Dialect::Postgres, Dialect::Mysql, &options);
         assert!(ddl.contains("CREATE TABLE `users`"), "DDL was: {ddl}");
         assert!(ddl.contains("`id` INT NOT NULL"), "DDL was: {ddl}");
@@ -1060,16 +742,10 @@ mod tests {
             .column(col("price").udt("numeric").precision(10, 2).build())
             .pk("pk_items", &["id"])
             .build();
-
         let options = DdlOptions {
-            target_dialect: Dialect::Postgres,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
+            target_dialect: Dialect::Postgres, split_tables: false, apply: false,
+            noindexes: false, noconstraints: false, nocomments: false,
         };
-
         let ddl = generate_create_table(&t, Dialect::Postgres, Dialect::Postgres, &options);
         assert!(ddl.contains("\"id\" INTEGER NOT NULL"));
         assert!(ddl.contains("\"price\" NUMERIC(10, 2) NOT NULL"));
@@ -1078,26 +754,16 @@ mod tests {
     #[test]
     fn test_full_generate_single() {
         let schema = schema_pg(vec![
-            table("users")
-                .schema("")
-                .column(col("id").build())
+            table("users").schema("").column(col("id").build())
                 .column(col("name").udt("varchar").max_length(100).build())
-                .pk("pk_users", &["id"])
-                .build(),
+                .pk("pk_users", &["id"]).build(),
         ]);
-
         let options = DdlOptions {
-            target_dialect: Dialect::Mysql,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
+            target_dialect: Dialect::Mysql, split_tables: false, apply: false,
+            noindexes: false, noconstraints: false, nocomments: false,
         };
-
         let gen = DdlGenerator;
-        let output = gen.generate(&schema, None, &options);
-        match output {
+        match gen.generate(&schema, None, &options) {
             DdlOutput::Single(ddl) => {
                 assert!(ddl.contains("CREATE TABLE `users`"));
                 assert!(ddl.contains("Source: postgres, Target: mysql"));
@@ -1109,28 +775,14 @@ mod tests {
     #[test]
     fn test_full_generate_split() {
         let schema = schema_pg(vec![
-            table("users")
-                .column(col("id").build())
-                .pk("pk_users", &["id"])
-                .build(),
-            table("posts")
-                .column(col("id").build())
-                .pk("pk_posts", &["id"])
-                .build(),
+            table("users").column(col("id").build()).pk("pk_users", &["id"]).build(),
+            table("posts").column(col("id").build()).pk("pk_posts", &["id"]).build(),
         ]);
-
         let options = DdlOptions {
-            target_dialect: Dialect::Postgres,
-            split_tables: true,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
+            target_dialect: Dialect::Postgres, split_tables: true, apply: false,
+            noindexes: false, noconstraints: false, nocomments: false,
         };
-
-        let gen = DdlGenerator;
-        let output = gen.generate(&schema, None, &options);
-        match output {
+        match DdlGenerator.generate(&schema, None, &options) {
             DdlOutput::Split(files) => {
                 let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
                 assert!(names.contains(&"users.sql"));
@@ -1142,250 +794,41 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_new_table() {
-        let source = schema_pg(vec![
-            table("users")
-                .column(col("id").build())
-                .pk("pk_users", &["id"])
-                .build(),
-        ]);
-
-        let target = schema_pg(vec![]); // empty target
-
-        let options = DdlOptions {
-            target_dialect: Dialect::Postgres,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
-        };
-
-        let ddl = diff_schemas(&source, &target, &options);
-        assert!(ddl.contains("CREATE TABLE \"users\""));
-    }
-
-    #[test]
-    fn test_diff_dropped_table() {
-        let source = schema_pg(vec![]);
-        let target = schema_pg(vec![
-            table("old_table")
-                .column(col("id").build())
-                .pk("pk_old", &["id"])
-                .build(),
-        ]);
-
-        let options = DdlOptions {
-            target_dialect: Dialect::Postgres,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
-        };
-
-        let ddl = diff_schemas(&source, &target, &options);
-        assert!(ddl.contains("DROP TABLE IF EXISTS \"old_table\""));
-        assert!(ddl.contains("WARNING: destructive"));
-    }
-
-    #[test]
-    fn test_diff_new_column() {
-        let source = schema_pg(vec![
-            table("users")
-                .column(col("id").build())
-                .column(col("email").udt("varchar").max_length(255).build())
-                .pk("pk_users", &["id"])
-                .build(),
-        ]);
-        let target = schema_pg(vec![
-            table("users")
-                .column(col("id").build())
-                .pk("pk_users", &["id"])
-                .build(),
-        ]);
-
-        let options = DdlOptions {
-            target_dialect: Dialect::Postgres,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
-        };
-
-        let ddl = diff_schemas(&source, &target, &options);
-        assert!(ddl.contains("ADD COLUMN \"email\" VARCHAR(255) NOT NULL"));
-    }
-
-    #[test]
-    fn test_diff_no_changes() {
-        let schema = schema_pg(vec![
-            table("users")
-                .column(col("id").build())
-                .pk("pk_users", &["id"])
-                .build(),
-        ]);
-
-        let options = DdlOptions {
-            target_dialect: Dialect::Postgres,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
-        };
-
-        let ddl = diff_schemas(&schema, &schema, &options);
-        assert!(ddl.contains("No schema changes detected"));
-    }
-
-    #[test]
     fn test_boolean_default_mssql_to_pg() {
-        // MSSQL BIT DEFAULT 1 → PG BOOLEAN DEFAULT true
-        assert_eq!(
-            format_ddl_default_typed("((1))", Dialect::Mssql, Dialect::Postgres, true),
-            "true"
-        );
-        assert_eq!(
-            format_ddl_default_typed("((0))", Dialect::Mssql, Dialect::Postgres, true),
-            "false"
-        );
+        assert_eq!(format_ddl_default_typed("((1))", Dialect::Mssql, Dialect::Postgres, true), "true");
+        assert_eq!(format_ddl_default_typed("((0))", Dialect::Mssql, Dialect::Postgres, true), "false");
     }
 
     #[test]
     fn test_integer_default_not_converted_to_boolean() {
-        // INT DEFAULT 0 must stay 0, not become false
-        assert_eq!(
-            format_ddl_default_typed("((0))", Dialect::Mssql, Dialect::Postgres, false),
-            "0"
-        );
-        assert_eq!(
-            format_ddl_default_typed("((1))", Dialect::Mssql, Dialect::Postgres, false),
-            "1"
-        );
+        assert_eq!(format_ddl_default_typed("((0))", Dialect::Mssql, Dialect::Postgres, false), "0");
+        assert_eq!(format_ddl_default_typed("((1))", Dialect::Mssql, Dialect::Postgres, false), "1");
     }
 
     #[test]
     fn test_boolean_default_pg_to_mysql() {
-        // PG BOOLEAN DEFAULT true → MySQL TINYINT(1) DEFAULT 1
-        assert_eq!(
-            format_ddl_default_typed("true", Dialect::Postgres, Dialect::Mysql, true),
-            "1"
-        );
-        assert_eq!(
-            format_ddl_default_typed("false", Dialect::Postgres, Dialect::Mysql, true),
-            "0"
-        );
+        assert_eq!(format_ddl_default_typed("true", Dialect::Postgres, Dialect::Mysql, true), "1");
+        assert_eq!(format_ddl_default_typed("false", Dialect::Postgres, Dialect::Mysql, true), "0");
     }
 
     #[test]
     fn test_boolean_default_pg_to_mssql() {
-        assert_eq!(
-            format_ddl_default_typed("true", Dialect::Postgres, Dialect::Mssql, true),
-            "1"
-        );
-        assert_eq!(
-            format_ddl_default_typed("false", Dialect::Postgres, Dialect::Mssql, true),
-            "0"
-        );
-    }
-
-    #[test]
-    #[test]
-    fn test_diff_cross_dialect_default_schemas_match() {
-        // PG "public" and MSSQL "dbo" are both defaults — tables should match by name
-        let source = schema_pg(vec![
-            table("users")
-                .column(col("id").build())
-                .pk("pk_users", &["id"])
-                .build(),
-        ]);
-        // Same table in "dbo" schema (MSSQL default) with same column types
-        let target = schema_pg(vec![
-            table("users")
-                .schema("dbo")
-                .column(col("id").build())
-                .pk("pk_users", &["id"])
-                .build(),
-        ]);
-
-        let options = DdlOptions {
-            target_dialect: Dialect::Postgres,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
-        };
-
-        let ddl = diff_schemas(&source, &target, &options);
-        assert!(
-            ddl.contains("No schema changes detected"),
-            "PG public should match dbo as both are defaults: {ddl}"
-        );
-    }
-
-    #[test]
-    fn test_diff_multi_schema_preserved() {
-        // Tables in different non-default schemas should NOT match
-        let source = schema_pg(vec![
-            table("users")
-                .schema("schema_a")
-                .column(col("id").build())
-                .pk("pk_users", &["id"])
-                .build(),
-        ]);
-        let target = schema_pg(vec![
-            table("users")
-                .schema("schema_b")
-                .column(col("id").build())
-                .pk("pk_users", &["id"])
-                .build(),
-        ]);
-
-        let options = DdlOptions {
-            target_dialect: Dialect::Postgres,
-            split_tables: false,
-            apply: false,
-            noindexes: false,
-            noconstraints: false,
-            nocomments: false,
-        };
-
-        let ddl = diff_schemas(&source, &target, &options);
-        // schema_a.users and schema_b.users are different tables
-        assert!(
-            ddl.contains("CREATE TABLE") && ddl.contains("DROP TABLE"),
-            "Non-default schemas should not match: {ddl}"
-        );
+        assert_eq!(format_ddl_default_typed("true", Dialect::Postgres, Dialect::Mssql, true), "1");
+        assert_eq!(format_ddl_default_typed("false", Dialect::Postgres, Dialect::Mssql, true), "0");
     }
 
     #[test]
     fn test_ensure_default_quoting() {
-        // Bare strings should be quoted
         assert_eq!(ensure_default_quoting("member"), "'member'");
         assert_eq!(ensure_default_quoting("active"), "'active'");
-
-        // Already quoted stays as-is
         assert_eq!(ensure_default_quoting("'member'"), "'member'");
-
-        // Numbers stay as-is
         assert_eq!(ensure_default_quoting("0"), "0");
         assert_eq!(ensure_default_quoting("3.14"), "3.14");
-
-        // NULL stays as-is
         assert_eq!(ensure_default_quoting("NULL"), "NULL");
-
-        // Booleans stay as-is
         assert_eq!(ensure_default_quoting("true"), "true");
         assert_eq!(ensure_default_quoting("false"), "false");
-
-        // Function calls stay as-is
         assert_eq!(ensure_default_quoting("now()"), "now()");
         assert_eq!(ensure_default_quoting("CURRENT_TIMESTAMP"), "CURRENT_TIMESTAMP");
-
-        // String with single quotes gets escaped
         assert_eq!(ensure_default_quoting("it's"), "'it''s'");
     }
 }
