@@ -63,7 +63,7 @@ uvg postgresql://source/db mysql://target/db --generator ddl
 | `--tables <LIST>` | Comma-delimited table names to include |
 | `--schemas <LIST>` | Schemas to introspect (default: `public` for PG, `dbo` for MSSQL, database name for MySQL) |
 | `--noviews` | Skip views |
-| `--options <LIST>` | `noindexes`, `noconstraints`, `nocomments`, `nobidi`, `nofknames`, `noidsuffix` |
+| `--options <LIST>` | `noindexes`, `noconstraints`, `nocomments`, `nobidi`, `nofknames`, `noidsuffix`, `nosyntheticenums`, `nonativeenums`, `keep_dialect_types` |
 | `--outfile <PATH>` | Output file or directory (default: stdout) |
 | `--trust-cert` | Trust the server certificate (MSSQL only) |
 
