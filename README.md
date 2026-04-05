@@ -97,7 +97,7 @@ t_users = Table(
 
 ## Supported Databases
 
-### PostgreSQL
+### PostgreSQL (tested: 16)
 
 Scalars: `bool`, `int2`, `int4`, `int8`, `float4`, `float8`, `numeric`, `text`, `varchar`, `char`, `bytea`, `date`, `time`, `timetz`, `timestamp`, `timestamptz`, `interval`
 
@@ -107,7 +107,7 @@ Arrays: `_int4`, `_text`, and other array types via the `ARRAY()` wrapper
 
 URL schemes: `postgresql://`, `postgresql+psycopg2://`
 
-### Microsoft SQL Server
+### Microsoft SQL Server (tested: 2019, 2022)
 
 Scalars: `bit`, `tinyint`, `smallint`, `int`, `bigint`, `real`, `float`, `decimal`, `numeric`, `money`, `smallmoney`
 
@@ -121,7 +121,7 @@ Dialect types: `uniqueidentifier`
 
 URL schemes: `mssql://`, `mssql+pytds://`, `mssql+pyodbc://`, `mssql+pymssql://`
 
-### MySQL / MariaDB
+### MySQL / MariaDB (tested: 8.0, 9.6)
 
 Scalars: `tinyint`, `smallint`, `mediumint`, `int`, `bigint` (with unsigned variants), `float`, `double`, `decimal`
 

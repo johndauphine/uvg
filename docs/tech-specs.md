@@ -111,6 +111,8 @@ Unknown types fall back to the uppercase type name (e.g. `mytype` -> `MYTYPE`).
 
 ### MySQL type mapping
 
+**Note on `information_schema` encoding**: MySQL 8+ returns `information_schema` string columns as `VARBINARY` rather than `VARCHAR`, causing sqlx decode failures. All MySQL introspection queries use `CAST(... AS CHAR)` to work around this. Additionally, connections default to `charset=utf8mb4` (appended to the URL by `ensure_mysql_charset()` in `cli.rs` unless the user specifies a charset).
+
 | udt_name | sa_type | python_type |
 |----------|---------|-------------|
 | tinyint (display_width=1) | Boolean | bool |

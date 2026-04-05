@@ -42,7 +42,7 @@ The application follows a pipeline: **CLI parsing -> Connection -> Introspection
 - **`schema.rs`** -- Data structures representing introspected schema: `IntrospectedSchema`, `TableInfo`, `ColumnInfo`, `ConstraintInfo` (PrimaryKey/ForeignKey/Unique/Check), `IndexInfo`.
 - **`introspect/pg/`** -- PostgreSQL introspection via sqlx. Queries `information_schema` and `pg_catalog` across submodules: `tables.rs`, `columns.rs`, `constraints.rs`, `indexes.rs`.
 - **`introspect/mssql/`** -- MSSQL introspection via Tiberius. Same submodule structure as PG.
-- **`introspect/mysql/`** -- MySQL introspection via sqlx. Queries `information_schema` tables. Same submodule structure as PG.
+- **`introspect/mysql/`** -- MySQL introspection via sqlx. Queries `information_schema` tables. Same submodule structure as PG. All string columns use `CAST(... AS CHAR)` to avoid MySQL 8+ VARBINARY decoding issues. Connection URLs are automatically appended with `charset=utf8mb4` (via `ensure_mysql_charset()` in `cli.rs`) unless the user specifies a charset.
 - **`introspect/sqlite/`** -- SQLite introspection via sqlx. Uses PRAGMA commands (`pragma_table_info`, `pragma_foreign_key_list`, `pragma_index_list`) and parses CREATE TABLE SQL for AUTOINCREMENT and CHECK constraints.
 - **`typemap/pg.rs`**, **`typemap/mssql.rs`**, **`typemap/mysql.rs`**, **`typemap/sqlite.rs`** -- Map database column types (via `udt_name`) to SQLAlchemy type expressions, Python type annotations, and import requirements. Returns `MappedType`.
 - **`codegen/`** -- `Generator` trait with two implementations:
