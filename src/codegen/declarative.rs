@@ -1632,9 +1632,9 @@ mod tests {
         assert!(output.contains("tags: Mapped[Optional[list]] = mapped_column(ARRAY(Text))"));
     }
 
-    /// Adapted from sqlacodegen test_constraints (declarative) — indexes + unique + check.
+    /// Adapted from sqlacodegen test_constraints (declarative) — check + unique + index together.
     #[test]
-    fn test_declarative_constraints_full() {
+    fn test_declarative_constraints_with_index() {
         let schema = schema_pg(vec![
             table("simple_items")
                 .column(col("id").build())
@@ -1642,12 +1642,15 @@ mod tests {
                 .pk("simple_items_pkey", &["id"])
                 .check("", "number > 0")
                 .unique("uq_id_number", &["id", "number"])
+                .index("idx_number", &["number"], false)
                 .build(),
         ]);
         let gen = DeclarativeGenerator;
         let output = gen.generate(&schema, &GeneratorOptions::default());
         assert!(output.contains("CheckConstraint('number > 0')"));
         assert!(output.contains("UniqueConstraint('id', 'number', name='uq_id_number')"));
+        assert!(output.contains("Index('idx_number', 'number')"));
+        assert!(output.contains("from sqlalchemy import CheckConstraint"));
     }
 
     /// Adapted from sqlacodegen test_onetomany_conflicting_column.
@@ -1669,8 +1672,9 @@ mod tests {
         ]);
         let gen = DeclarativeGenerator;
         let output = gen.generate(&schema, &GeneratorOptions::default());
-        // "relationship" column should be sanitized (it's a SQLAlchemy reserved name)
-        // The relationship import still works
-        assert!(output.contains("relationship("));
+        // "relationship" is not in PYTHON_RESERVED or import conflicts currently,
+        // so it passes through as-is. The relationship() calls still work.
+        assert!(output.contains("relationship: Mapped[Optional[str]]") || output.contains("relationship_: Mapped[Optional[str]]"));
+        assert!(output.contains("relationship('SimpleItems'"));
     }
 }

@@ -917,6 +917,8 @@ mod tests {
         let output = gen.generate(&schema, &GeneratorOptions::default());
         assert!(output.contains("Column('id', BigInteger)"));
         assert!(output.contains("Column('length', Double)"));
+        assert!(output.contains("BigInteger"));
+        assert!(output.contains("Double"));
     }
 
     /// Adapted from sqlacodegen test_jsonb_default.
@@ -946,6 +948,7 @@ mod tests {
         let gen = TablesGenerator;
         let output = gen.generate(&schema, &GeneratorOptions::default());
         assert!(output.contains("Column('json', JSON)"));
+        assert!(output.contains("from sqlalchemy.dialects.postgresql import JSON"));
     }
 
     /// Adapted from sqlacodegen test_arrays (basic).
@@ -960,7 +963,7 @@ mod tests {
         let gen = TablesGenerator;
         let output = gen.generate(&schema, &GeneratorOptions::default());
         assert!(output.contains("Column('int_array', ARRAY(Integer))"));
-        assert!(output.contains("ARRAY"));
+        assert!(output.contains("from sqlalchemy import ARRAY"));
     }
 
     /// Adapted from sqlacodegen test_check_constraint_preserved.
