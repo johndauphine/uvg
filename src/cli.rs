@@ -65,6 +65,8 @@ pub enum ConnectionConfig {
         password: String,
         trust_cert: bool,
     },
+    Mysql(String),
+    Sqlite(String),
 }
 
 impl ConnectionConfig {
@@ -72,6 +74,18 @@ impl ConnectionConfig {
         match self {
             ConnectionConfig::Postgres(_) => Dialect::Postgres,
             ConnectionConfig::Mssql { .. } => Dialect::Mssql,
+            ConnectionConfig::Mysql(_) => Dialect::Mysql,
+            ConnectionConfig::Sqlite(_) => Dialect::Sqlite,
+        }
+    }
+
+    /// Extract the database name from a MySQL connection URL.
+    pub fn database_name(&self) -> Option<String> {
+        match self {
+            ConnectionConfig::Mysql(url) => url::Url::parse(url)
+                .ok()
+                .map(|u| u.path().trim_start_matches('/').to_string()),
+            _ => None,
         }
     }
 }
@@ -138,6 +152,43 @@ impl Cli {
             return self.parse_mssql_url(url);
         }
 
+        // MySQL schemes
+        if let Some(rest) = url
+            .strip_prefix("mysql+pymysql://")
+            .or_else(|| url.strip_prefix("mysql+mysqldb://"))
+            .or_else(|| url.strip_prefix("mysql+aiomysql://"))
+            .or_else(|| url.strip_prefix("mysql+asyncmy://"))
+        {
+            return Ok(ConnectionConfig::Mysql(format!("mysql://{rest}")));
+        }
+        if let Some(rest) = url
+            .strip_prefix("mariadb+pymysql://")
+            .or_else(|| url.strip_prefix("mariadb+mysqldb://"))
+        {
+            return Ok(ConnectionConfig::Mysql(format!("mysql://{rest}")));
+        }
+        if let Some(rest) = url.strip_prefix("mariadb://") {
+            return Ok(ConnectionConfig::Mysql(format!("mysql://{rest}")));
+        }
+        if url.starts_with("mysql://") {
+            return Ok(ConnectionConfig::Mysql(url.clone()));
+        }
+
+        // SQLite schemes
+        if let Some(rest) = url.strip_prefix("sqlite:///") {
+            // sqlacodegen format: sqlite:///relative or sqlite:////absolute
+            // sqlx format: sqlite:relative or sqlite:///absolute
+            if rest.starts_with('/') {
+                // sqlite:////absolute/path -> sqlite:///absolute/path
+                return Ok(ConnectionConfig::Sqlite(format!("sqlite://{rest}")));
+            }
+            if rest == ":memory:" {
+                return Ok(ConnectionConfig::Sqlite("sqlite::memory:".to_string()));
+            }
+            // sqlite:///relative/path -> sqlite:relative/path
+            return Ok(ConnectionConfig::Sqlite(format!("sqlite:{rest}")));
+        }
+
         Err(crate::error::UvgError::UnsupportedScheme(
             url.split("://").next().unwrap_or("unknown").to_string(),
         ))
@@ -186,5 +237,107 @@ impl Cli {
             password,
             trust_cert: self.trust_cert,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli_with_url(url: &str) -> Cli {
+        Cli {
+            url: url.to_string(),
+            generator: "declarative".to_string(),
+            tables: None,
+            schemas: None,
+            noviews: false,
+            options: None,
+            outfile: None,
+            trust_cert: false,
+        }
+    }
+
+    #[test]
+    fn test_mysql_url() {
+        let cli = cli_with_url("mysql://user:pass@localhost/mydb");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.dialect(), Dialect::Mysql);
+        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb"));
+    }
+
+    #[test]
+    fn test_mysql_pymysql_url() {
+        let cli = cli_with_url("mysql+pymysql://user:pass@localhost/mydb");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.dialect(), Dialect::Mysql);
+        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb"));
+    }
+
+    #[test]
+    fn test_mariadb_url() {
+        let cli = cli_with_url("mariadb://user:pass@localhost/mydb");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.dialect(), Dialect::Mysql);
+        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb"));
+    }
+
+    #[test]
+    fn test_mariadb_pymysql_url() {
+        let cli = cli_with_url("mariadb+pymysql://user:pass@localhost/mydb");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.dialect(), Dialect::Mysql);
+        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb"));
+    }
+
+    #[test]
+    fn test_mysql_database_name() {
+        let cli = cli_with_url("mysql://user:pass@localhost/testdb");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.database_name(), Some("testdb".to_string()));
+    }
+
+    #[test]
+    fn test_sqlite_relative_path() {
+        let cli = cli_with_url("sqlite:///test.db");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.dialect(), Dialect::Sqlite);
+        assert!(matches!(config, ConnectionConfig::Sqlite(ref u) if u == "sqlite:test.db"));
+    }
+
+    #[test]
+    fn test_sqlite_absolute_path() {
+        let cli = cli_with_url("sqlite:////tmp/test.db");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.dialect(), Dialect::Sqlite);
+        assert!(matches!(config, ConnectionConfig::Sqlite(ref u) if u == "sqlite:///tmp/test.db"));
+    }
+
+    #[test]
+    fn test_sqlite_memory() {
+        let cli = cli_with_url("sqlite:///:memory:");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.dialect(), Dialect::Sqlite);
+        assert!(matches!(config, ConnectionConfig::Sqlite(ref u) if u == "sqlite::memory:"));
+    }
+
+    #[test]
+    fn test_postgres_url_unchanged() {
+        let cli = cli_with_url("postgresql://user:pass@localhost/mydb");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.dialect(), Dialect::Postgres);
+    }
+
+    #[test]
+    fn test_unsupported_scheme() {
+        let cli = cli_with_url("oracle://user:pass@localhost/mydb");
+        let result = cli.parse_connection();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_mysql_database_name() {
+        let cli = cli_with_url("postgresql://user:pass@localhost/testdb");
+        let config = cli.parse_connection().unwrap();
+        assert_eq!(config.database_name(), None);
     }
 }

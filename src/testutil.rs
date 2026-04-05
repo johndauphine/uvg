@@ -289,6 +289,26 @@ pub fn schema_pg_with_enums(
     }
 }
 
+/// Shorthand for creating an IntrospectedSchema with MySQL dialect.
+pub fn schema_mysql(tables: Vec<TableInfo>) -> IntrospectedSchema {
+    IntrospectedSchema {
+        dialect: Dialect::Mysql,
+        tables,
+        enums: vec![],
+        domains: vec![],
+    }
+}
+
+/// Shorthand for creating an IntrospectedSchema with SQLite dialect.
+pub fn schema_sqlite(tables: Vec<TableInfo>) -> IntrospectedSchema {
+    IntrospectedSchema {
+        dialect: Dialect::Sqlite,
+        tables,
+        enums: vec![],
+        domains: vec![],
+    }
+}
+
 /// Shorthand constructors for column builder.
 pub fn col(name: &str) -> ColumnInfoBuilder {
     ColumnInfoBuilder::new(name)

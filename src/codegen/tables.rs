@@ -252,7 +252,7 @@ fn generate_table(
                         identity.start, identity.increment, identity.min_value, identity.max_value, identity.cache
                     ));
                 }
-                Dialect::Mssql => {
+                Dialect::Mssql | Dialect::Mysql | Dialect::Sqlite => {
                     col_args.push(format!(
                         "Identity(start={}, increment={})",
                         identity.start, identity.increment

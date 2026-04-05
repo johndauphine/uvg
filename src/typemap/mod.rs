@@ -1,5 +1,7 @@
 pub mod mssql;
+pub mod mysql;
 pub mod pg;
+pub mod sqlite;
 
 use crate::dialect::Dialect;
 use crate::schema::ColumnInfo;
@@ -24,6 +26,8 @@ pub fn map_column_type(col: &ColumnInfo, dialect: Dialect) -> MappedType {
     match dialect {
         Dialect::Postgres => pg::map_column_type(col),
         Dialect::Mssql => mssql::map_column_type(col),
+        Dialect::Mysql => mysql::map_column_type(col),
+        Dialect::Sqlite => sqlite::map_column_type(col),
     }
 }
 
@@ -32,6 +36,8 @@ pub fn map_column_type_dialect(col: &ColumnInfo, dialect: Dialect) -> MappedType
     match dialect {
         Dialect::Postgres => pg::map_column_type_dialect(col),
         Dialect::Mssql => mssql::map_column_type_dialect(col),
+        Dialect::Mysql => mysql::map_column_type_dialect(col),
+        Dialect::Sqlite => sqlite::map_column_type_dialect(col),
     }
 }
 
