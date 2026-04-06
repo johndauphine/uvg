@@ -660,15 +660,5 @@ fn make_cli(url: &str, trust_cert: bool) -> Cli {
 }
 
 fn count_statements(ddl: &str) -> usize {
-    ddl.split(';')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .filter(|s| {
-            s.lines()
-                .any(|line| {
-                    let t = line.trim();
-                    !t.is_empty() && !t.starts_with("--")
-                })
-        })
-        .count()
+    db::split_statements(ddl).len()
 }
