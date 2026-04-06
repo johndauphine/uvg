@@ -53,6 +53,10 @@ pub struct Cli {
     /// Trust the server certificate (MSSQL only)
     #[arg(long)]
     pub trust_cert: bool,
+
+    /// Launch interactive TUI for DDL diff and apply
+    #[arg(long, short = 'i')]
+    pub interactive: bool,
 }
 
 #[derive(Debug, Default)]
@@ -198,6 +202,7 @@ impl Cli {
                 options: None,
                 outfile: None,
                 trust_cert: self.trust_cert,
+                interactive: false,
             };
             cli.parse_connection()?.dialect()
         } else {
@@ -233,6 +238,7 @@ impl Cli {
             options: None,
             outfile: None,
             trust_cert: self.trust_cert,
+            interactive: false,
         };
         cli.parse_connection()
     }
@@ -374,6 +380,7 @@ mod tests {
             options: None,
             outfile: None,
             trust_cert: false,
+            interactive: false,
         }
     }
 
