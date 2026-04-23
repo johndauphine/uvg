@@ -1,12 +1,29 @@
 # UVg
 
+[![Crates.io](https://img.shields.io/crates/v/uvg.svg)](https://crates.io/crates/uvg)
+[![License](https://img.shields.io/crates/l/uvg.svg)](#license)
+
 A Rust reimplementation of [sqlacodegen](https://github.com/agronholm/sqlacodegen) — connects to a PostgreSQL, MySQL, SQLite, or Microsoft SQL Server database, introspects its schema, and generates SQLAlchemy Python model code.
 
-Single binary, drop-in compatible CLI, same output.
+Single binary, drop-in compatible CLI, same output. Plus cross-dialect DDL migration and an interactive TUI.
 
 ## Installation
 
+### From crates.io
+
 ```bash
+cargo install uvg
+```
+
+### Prebuilt binaries
+
+Download the archive for your platform from the [latest release](https://github.com/johndauphine/uvg/releases/latest) (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64), extract, and place `uvg` on your `PATH`.
+
+### From source
+
+```bash
+git clone https://github.com/johndauphine/uvg.git
+cd uvg
 cargo install --path .
 ```
 
@@ -179,14 +196,6 @@ Benchmarked against sqlacodegen 3.2.0 on the StackOverflow 2010 database (9 tabl
 
 **10x faster on PostgreSQL, 40x faster on MSSQL.**
 
-## Building from source
-
-```bash
-git clone https://github.com/johndauphine/uvg.git
-cd uvg
-cargo build --release
-```
-
 ## Running tests
 
 ```bash
@@ -208,3 +217,18 @@ DATABASE_URL=mssql://user:pass@localhost/testdb cargo test --test integration --
 # SQLite (runs automatically, no server needed)
 cargo test --test integration test_introspect_sqlite_in_memory
 ```
+
+## Acknowledgments
+
+UVg is a reimplementation of [sqlacodegen](https://github.com/agronholm/sqlacodegen) by Alex Grönholm, licensed under MIT. See [`NOTICE`](NOTICE) for full attribution.
+
+## License
+
+Dual-licensed under either of:
+
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.

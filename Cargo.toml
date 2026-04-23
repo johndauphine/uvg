@@ -2,6 +2,15 @@
 name = "uvg"
 version = "1.4.0"
 edition = "2021"
+rust-version = "1.82"
+authors = ["John Dauphine <jdauphine@gmail.com>"]
+description = "A fast Rust reimplementation of sqlacodegen: introspect PostgreSQL, MySQL, SQLite, or MSSQL schemas and generate SQLAlchemy models or cross-dialect DDL migrations."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/johndauphine/uvg"
+homepage = "https://github.com/johndauphine/uvg"
+readme = "README.md"
+keywords = ["sqlalchemy", "codegen", "postgres", "mysql", "cli"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "uvg"
