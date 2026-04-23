@@ -23,7 +23,7 @@ cargo install uvg
 
 ### Prebuilt binaries
 
-Download the archive for your platform from the [latest release](https://github.com/johndauphine/uvg/releases/latest) (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64), extract, and place `uvg` on your `PATH`.
+Download the archive for your platform from the [latest release](https://github.com/johndauphine/uvg/releases/latest) (Linux x86_64/aarch64, macOS aarch64, Windows x86_64), extract, and place `uvg` on your `PATH`.
 
 ### From source
 
