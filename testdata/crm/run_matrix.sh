@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# CRM 9-pair matrix runner — drives uvg through every (source, target)
+# permutation of {mssql, postgres, mysql} and reports table/FK/CHECK/index
+# counts plus apply success.
+#
+# Run from the repo root or `testdata/crm/`. Expects:
+#   - Three Docker containers reachable from this host:
+#       mssql-test  port 1433
+#       pg-test     port 5432
+#       mysql-test  port 3306
+#     (Override with $MSSQL_CONTAINER / $PG_CONTAINER / $MYSQL_CONTAINER.)
+#   - Source databases pre-loaded (see this directory's README.md).
+#   - A `uvg` binary available at $UVG (default: target/release/uvg
+#     relative to the script's repo root, falling back to `uvg` on PATH).
+#
+# Output: per-pair line + a final summary table written to
+# /tmp/uvg-matrix/results.tsv. Exit 0 if at least one pair succeeded,
+# non-zero only on infrastructure failures.
+
+set -uo pipefail
+
+# Locate the uvg binary. Prefer an explicit override, then a release
+# build inside the repo, then $PATH.
+UVG="${UVG:-}"
+if [[ -z "$UVG" ]]; then
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  if [[ -x "$REPO_ROOT/target/release/uvg" ]]; then
+    UVG="$REPO_ROOT/target/release/uvg"
+  elif command -v uvg >/dev/null 2>&1; then
+    UVG="$(command -v uvg)"
+  else
+    echo "error: uvg binary not found. Build with 'cargo build --release' or set \$UVG." >&2
+    exit 1
+  fi
+fi
+echo "Using uvg at: $UVG"
+
+# Container overrides — defaults match the repo convention.
+MSSQL_CONTAINER="${MSSQL_CONTAINER:-mssql-test}"
+PG_CONTAINER="${PG_CONTAINER:-pg-test}"
+MYSQL_CONTAINER="${MYSQL_CONTAINER:-mysql-test}"
+
+# MSSQL clients on Go-based stacks (e.g. go-sqlcmd) refuse the
+# self-signed certs that ship with azure-sql-edge. Setting GODEBUG to
+# accept negative serials keeps the host-side sqlcmd working — no
+# effect on `uvg` itself, which uses tiberius via tokio-rustls.
+export GODEBUG=x509negativeserial=1
+
+SOURCES=(mssql postgres mysql)
+TARGETS=(mssql postgres mysql)
+
+mkdir -p /tmp/uvg-matrix
+echo -e "src\ttgt\twall\ttables\tFKs\tCHECKs\tindexes\tstatus" > /tmp/uvg-matrix/results.tsv
+
+src_url() {
+  case "$1" in
+    mssql)    echo "mssql://sa:TestPass2024@localhost:1433/CRM_MSSQL" ;;
+    postgres) echo "postgresql://postgres:TestPass2024@localhost:5432/crm_pg" ;;
+    mysql)    echo "mysql://root:TestPass2024@localhost:3306/crm_mysql" ;;
+  esac
+}
+
+src_schema() {
+  case "$1" in
+    mssql)    echo "dbo" ;;
+    postgres) echo "public" ;;
+    mysql)    echo "crm_mysql" ;;
+  esac
+}
+
+create_target_db() {
+  local tgt=$1 tgt_db=$2
+  case "$tgt" in
+    mssql)
+      sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -Q \
+        "IF EXISTS (SELECT 1 FROM sys.databases WHERE name='$tgt_db') DROP DATABASE $tgt_db; CREATE DATABASE $tgt_db;" >/dev/null
+      ;;
+    postgres)
+      PGPASSWORD=TestPass2024 docker exec "$PG_CONTAINER" psql -U postgres \
+        -c "DROP DATABASE IF EXISTS $tgt_db" \
+        -c "CREATE DATABASE $tgt_db" >/dev/null 2>&1
+      ;;
+    mysql)
+      docker exec "$MYSQL_CONTAINER" mysql -uroot -pTestPass2024 \
+        -e "DROP DATABASE IF EXISTS $tgt_db; CREATE DATABASE $tgt_db" 2>/dev/null
+      ;;
+  esac
+}
+
+# Apply the generated DDL file to the target. Returns the pipeline's
+# exit code; the matrix scoring relies on whether any error lines
+# appeared in the tool's stderr.
+apply_ddl() {
+  local tgt=$1 tgt_db=$2 ddl_file=$3
+  case "$tgt" in
+    mssql)
+      sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -d "$tgt_db" -i "$ddl_file" 2>&1 \
+        | grep -E "(Msg [0-9]+|Error)" | head -5
+      return ${PIPESTATUS[0]}
+      ;;
+    postgres)
+      PGPASSWORD=TestPass2024 docker exec -i "$PG_CONTAINER" psql -U postgres -d "$tgt_db" -v ON_ERROR_STOP=0 -q \
+        < "$ddl_file" 2>&1 | grep -E "ERROR" | head -5
+      return ${PIPESTATUS[0]}
+      ;;
+    mysql)
+      docker exec -i "$MYSQL_CONTAINER" mysql -uroot -pTestPass2024 "$tgt_db" \
+        < "$ddl_file" 2>&1 | grep -iE "ERROR" | head -5
+      return ${PIPESTATUS[0]}
+      ;;
+  esac
+}
+
+# Count tables / FKs / CHECKs / indexes on the target. The same shape
+# verify_columns.sh applies — keeps the matrix and harness aligned.
+count_target() {
+  local tgt=$1 tgt_db=$2 schema
+  case "$tgt" in
+    mssql)
+      schema=dbo
+      sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -d "$tgt_db" -h-1 -W -Q \
+        "SET NOCOUNT ON; SELECT
+          (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_SCHEMA='$schema'),
+          (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE CONSTRAINT_TYPE='FOREIGN KEY' AND CONSTRAINT_SCHEMA='$schema'),
+          (SELECT COUNT(*) FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS WHERE CONSTRAINT_SCHEMA='$schema'),
+          (SELECT COUNT(*) FROM sys.indexes i JOIN sys.objects o ON i.object_id=o.object_id WHERE o.type='U' AND i.is_primary_key=0 AND i.type>0)" \
+        2>/dev/null | head -1 | awk '{print $1"\t"$2"\t"$3"\t"$4}'
+      ;;
+    postgres)
+      PGPASSWORD=TestPass2024 docker exec "$PG_CONTAINER" psql -U postgres -d "$tgt_db" -At -F $'\t' -c \
+        "SELECT
+          (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'),
+          (SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema='public' AND constraint_type='FOREIGN KEY'),
+          (SELECT COUNT(*) FROM pg_constraint c JOIN pg_namespace n ON c.connamespace=n.oid WHERE n.nspname='public' AND c.contype='c'),
+          (SELECT COUNT(*) FROM pg_indexes WHERE schemaname='public' AND indexname NOT LIKE '%_pkey')" 2>/dev/null
+      ;;
+    mysql)
+      docker exec "$MYSQL_CONTAINER" mysql -uroot -pTestPass2024 -N -B -e \
+        "SELECT
+          (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$tgt_db' AND table_type='BASE TABLE'),
+          (SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema='$tgt_db' AND constraint_type='FOREIGN KEY'),
+          (SELECT COUNT(*) FROM information_schema.check_constraints WHERE constraint_schema='$tgt_db'),
+          (SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics s WHERE s.table_schema='$tgt_db' AND s.index_name<>'PRIMARY')" \
+        2>/dev/null | head -1
+      ;;
+  esac
+}
+
+ok_count=0
+fail_count=0
+for src in "${SOURCES[@]}"; do
+  for tgt in "${TARGETS[@]}"; do
+    pair="${src}_to_${tgt}"
+    tgt_db="uvg_matrix_${pair}"
+    ddl_file=/tmp/uvg-matrix/${pair}.sql
+    log_file=/tmp/uvg-matrix/${pair}.log
+
+    echo "=== ${src} -> ${tgt} ==="
+    create_target_db "$tgt" "$tgt_db"
+
+    src_args=()
+    [[ "$src" == "mssql" ]] && src_args+=("--trust-cert")
+    src_args+=("$(src_url $src)")
+    src_args+=("--schemas" "$(src_schema $src)")
+    src_args+=("--generator" "ddl" "--target-dialect" "$tgt" "--outfile" "$ddl_file")
+
+    start=$(date +%s)
+    "$UVG" "${src_args[@]}" > "$log_file" 2>&1
+    if [[ $? -ne 0 ]]; then
+      wall=$(( $(date +%s) - start ))
+      echo -e "${src}\t${tgt}\t${wall}s\t-\t-\t-\t-\tGEN_FAIL" >> /tmp/uvg-matrix/results.tsv
+      echo "  GEN_FAIL ${wall}s"
+      ((fail_count++))
+      continue
+    fi
+
+    apply_errors=$(apply_ddl "$tgt" "$tgt_db" "$ddl_file" 2>&1)
+    wall=$(( $(date +%s) - start ))
+
+    counts=$(count_target "$tgt" "$tgt_db")
+    if [[ -z "$apply_errors" ]]; then
+      status="OK"
+      ((ok_count++))
+    else
+      status="APPLY_FAIL"
+      ((fail_count++))
+    fi
+    echo -e "${src}\t${tgt}\t${wall}s\t${counts}\t${status}" >> /tmp/uvg-matrix/results.tsv
+    echo -e "  ${counts}\t${wall}s\t${status}"
+    [[ -n "$apply_errors" ]] && echo "  errors: $apply_errors" | head -3
+  done
+done
+
+echo ""
+echo "=== RESULTS ==="
+column -t -s $'\t' /tmp/uvg-matrix/results.tsv
+echo ""
+echo "Summary: ${ok_count}/9 OK, ${fail_count}/9 failed"
+
+# Exit non-zero if NOTHING worked — useful for CI gating.
+[[ $ok_count -eq 0 ]] && exit 1
+exit 0

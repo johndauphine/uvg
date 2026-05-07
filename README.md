@@ -235,6 +235,19 @@ DATABASE_URL=mssql://user:pass@localhost/testdb cargo test --test integration --
 cargo test --test integration test_introspect_sqlite_in_memory
 ```
 
+### Cross-dialect matrix
+
+`testdata/crm/` ships a 14-table CRM schema in three native dialects
+(MSSQL, PostgreSQL, MySQL) plus a runner that drives uvg through every
+(source, target) permutation. As of v1.5.0 all 9 pairs apply cleanly
+in ~7 seconds total. See [`testdata/crm/README.md`](testdata/crm/README.md)
+for setup and expected counts.
+
+```bash
+cargo build --release
+./testdata/crm/run_matrix.sh
+```
+
 ## Acknowledgments
 
 UVg is a reimplementation of [sqlacodegen](https://github.com/agronholm/sqlacodegen) by Alex Grönholm, licensed under MIT. See [`NOTICE`](NOTICE) for full attribution.
