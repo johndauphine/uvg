@@ -144,7 +144,84 @@ pub async fn query_constraints(
         });
     }
 
+    // CHECK constraints. pg_constraint.contype='c' is the catalog-side filter;
+    // pg_get_constraintdef returns a readable predicate string like
+    // `CHECK ((email ~ '^[^@]+@[^@]+\.[^@]+$'::text))`. Strip the outer
+    // `CHECK (...)` wrapping so the codegen emitter can wrap it the same way
+    // it does for mssql/mysql sources. See #33.
+    let chk_rows = sqlx::query_as::<_, ChkRow>(
+        r#"
+        SELECT c.conname AS constraint_name,
+               pg_get_constraintdef(c.oid) AS predicate
+        FROM pg_constraint c
+        JOIN pg_namespace n ON n.oid = c.connamespace
+        JOIN pg_class cl    ON cl.oid = c.conrelid
+        WHERE c.contype = 'c'
+          AND n.nspname = $1
+          AND cl.relname = $2
+        ORDER BY c.conname
+        "#,
+    )
+    .bind(schema)
+    .bind(table_name)
+    .fetch_all(pool)
+    .await?;
+
+    for row in chk_rows {
+        // pg_get_constraintdef returns "CHECK (...)" — strip the wrapper so
+        // emitter doesn't double-wrap. Also strip any leading "NOT VALID"
+        // suffix which constraint metadata can carry but isn't predicate.
+        let predicate = strip_check_wrapper(&row.predicate);
+        constraints.push(ConstraintInfo {
+            name: row.constraint_name,
+            constraint_type: ConstraintType::Check,
+            columns: vec![],
+            foreign_key: None,
+            check_expression: Some(predicate),
+        });
+    }
+
     Ok(constraints)
+}
+
+/// Strip the outer "CHECK (..)" envelope from a pg_get_constraintdef result.
+/// `CHECK ((x > 0))` → `(x > 0)` (kept inner parens — they're part of the
+/// expression). `CHECK (x > 0)` → `x > 0`. If the input doesn't start with
+/// `CHECK (`, return it unchanged — defensive against future format changes.
+///
+/// Also handles trailing `NOT VALID` and `NO INHERIT` modifiers that PG
+/// emits on constraints created with those clauses. Without this strip,
+/// the wrapper match below would miss (since the input would end with
+/// `... NOT VALID` rather than `)`), and the codegen emitter would
+/// double-wrap the result as `CHECK (CHECK (...) NOT VALID)`.
+fn strip_check_wrapper(def: &str) -> String {
+    let mut trimmed = def.trim().to_string();
+    // Strip optional trailing modifiers in any order. PG can emit
+    // `... NOT VALID NO INHERIT` or `... NO INHERIT NOT VALID` depending
+    // on creation order. Outer loop until no suffix matches; inner check
+    // tries each known modifier per pass.
+    loop {
+        let stripped = trimmed.trim_end().to_string();
+        let mut shrunk = false;
+        for suffix in ["NOT VALID", "NO INHERIT"] {
+            if let Some(prefix) = stripped.strip_suffix(suffix) {
+                trimmed = prefix.trim_end().to_string();
+                shrunk = true;
+                break;
+            }
+        }
+        if !shrunk {
+            trimmed = stripped;
+            break;
+        }
+    }
+    let prefix = "CHECK (";
+    if let Some(stripped) = trimmed.strip_prefix(prefix) {
+        if let Some(stripped) = stripped.strip_suffix(')') {
+            return stripped.trim().to_string();
+        }
+    }
+    trimmed
 }
 
 struct FkAccumulator {
@@ -177,4 +254,46 @@ struct FkRow {
 struct UqRow {
     constraint_name: String,
     column_name: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChkRow {
+    constraint_name: String,
+    predicate: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_check_wrapper;
+
+    #[test]
+    fn strips_check_wrapper() {
+        assert_eq!(strip_check_wrapper("CHECK (x > 0)"), "x > 0");
+        assert_eq!(strip_check_wrapper("CHECK ((x > 0))"), "(x > 0)");
+        assert_eq!(
+            strip_check_wrapper("  CHECK (a IS NOT NULL)  "),
+            "a IS NOT NULL"
+        );
+        // Defensive: unrecognized format returns input unchanged.
+        assert_eq!(strip_check_wrapper("(x > 0)"), "(x > 0)");
+    }
+
+    #[test]
+    fn strips_check_wrapper_with_trailing_modifiers() {
+        // PG's pg_get_constraintdef emits trailing NOT VALID / NO INHERIT
+        // for constraints created with those clauses. Without stripping,
+        // the wrapper match would miss and the emitter would double-wrap
+        // as `CHECK (CHECK (...) NOT VALID)`. Per Copilot review on PR #37.
+        assert_eq!(strip_check_wrapper("CHECK (x > 0) NOT VALID"), "x > 0");
+        assert_eq!(strip_check_wrapper("CHECK ((x > 0)) NO INHERIT"), "(x > 0)");
+        assert_eq!(
+            strip_check_wrapper("CHECK (a IS NOT NULL) NOT VALID NO INHERIT"),
+            "a IS NOT NULL"
+        );
+        // Order independence — NO INHERIT can come before NOT VALID too.
+        assert_eq!(
+            strip_check_wrapper("CHECK (a IS NOT NULL) NO INHERIT NOT VALID"),
+            "a IS NOT NULL"
+        );
+    }
 }
