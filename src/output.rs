@@ -14,7 +14,9 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -259,7 +261,7 @@ pub fn write_split_changes(
                 body.push('\n');
             }
         }
-        fs::write(&path, body)?;
+        write_new(&path, body.as_bytes(), &ctx.run_id)?;
         written.push(format!("{subdir}/{filename}"));
     }
 
@@ -283,9 +285,35 @@ pub fn write_split_changes(
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(io::Error::other)?;
-    fs::write(&manifest_path, manifest_json + "\n")?;
+    write_new(
+        &manifest_path,
+        (manifest_json + "\n").as_bytes(),
+        &ctx.run_id,
+    )?;
 
     Ok(Some(manifest))
+}
+
+/// Atomic "create or fail" file write. Uses `OpenOptions::create_new`
+/// so the OS guarantees we never truncate an existing file — important
+/// because two concurrent uvg processes can both pass the preflight in
+/// `write_split_changes` and race to write the same path. On
+/// `AlreadyExists`, the error is rewritten to the same friendly form
+/// the preflight produces so the user always sees the same recovery
+/// hint regardless of which side caught the collision.
+fn write_new(path: &Path, body: &[u8], run_id: &str) -> io::Result<()> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => f.write_all(body),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "uvg: refusing to overwrite existing migration artifact {} \
+                 (run_id `{run_id}` already used; pick a different --name)",
+                path.display(),
+            ),
+        )),
+        Err(e) => Err(e),
+    }
 }
 
 /// Subdirectories under `out_dir` that uvg reserves for its own
@@ -863,6 +891,37 @@ mod tests {
         // The pre-existing posts file is untouched.
         let body = fs::read(dir.join("posts")).unwrap();
         assert_eq!(body, b"not a directory");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_write_new_is_atomic_create_or_fail() {
+        // Regression: codex round 4 caught that path.exists() + fs::write
+        // is a TOCTOU race — two concurrent processes can both pass the
+        // preflight, then the second fs::write would truncate the first
+        // process's output. write_new() now uses OpenOptions::create_new
+        // so the create-or-fail is enforced by the kernel, not by a
+        // racy two-step check.
+        let dir = tmpdir("write-new");
+        let path = dir.join("artifact.sql");
+
+        write_new(&path, b"first write\n", "run-A").expect("first create_new must succeed");
+        let body_before = fs::read(&path).unwrap();
+        assert_eq!(body_before, b"first write\n");
+
+        // A second write to the same path must fail atomically with the
+        // friendly recovery message — no truncation of the first file.
+        let err = write_new(&path, b"clobber attempt\n", "run-B").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            err.to_string().contains("refusing to overwrite") && err.to_string().contains("run-B"),
+            "error must explain how to recover and include the colliding run_id: {err}"
+        );
+
+        // First file's content is untouched.
+        let body_after = fs::read(&path).unwrap();
+        assert_eq!(body_after, b"first write\n");
+
         fs::remove_dir_all(&dir).ok();
     }
 
