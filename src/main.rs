@@ -39,6 +39,44 @@ async fn main() -> Result<()> {
         return tui::run(cli).await;
     }
 
+    // --apply preflight: validate configuration BEFORE we open any
+    // database connections, so a misconfigured invocation doesn't
+    // first stall on an unreachable source URL.
+    if cli.apply {
+        if cli.generator != "ddl" {
+            return Err(anyhow::anyhow!(
+                "--apply only works with --generator ddl (current: {})",
+                cli.generator,
+            ));
+        }
+        let Some(ref target_url) = cli.target_url else {
+            return Err(anyhow::anyhow!(
+                "--apply requires a target database URL to execute against"
+            ));
+        };
+        if cli.split_tables {
+            return Err(anyhow::anyhow!(
+                "--apply with --split-tables is not supported (use --out-dir for per-table apply)"
+            ));
+        }
+        // Refuse a --target-dialect that disagrees with the target URL's
+        // scheme — applying mysql-flavored DDL to a postgres database
+        // would fail at parse time with a cryptic engine error; better
+        // to surface the mismatch up front. Building the source dialect
+        // from the URL doesn't open a connection.
+        let src_dialect = cli.parse_connection()?.dialect();
+        let target_dialect = cli.ddl_options(src_dialect)?.target_dialect;
+        let url_dialect = cli.parse_target_connection(target_url)?.dialect();
+        if target_dialect != url_dialect {
+            return Err(anyhow::anyhow!(
+                "--apply: --target-dialect ({}) does not match the dialect inferred from the target URL ({}). \
+                 Drop --target-dialect, or change the URL scheme to match.",
+                target_dialect,
+                url_dialect,
+            ));
+        }
+    }
+
     let config = cli.parse_connection()?;
     let dialect = config.dialect();
     // MySQL default schema = database name from URL; others use static defaults.
@@ -128,18 +166,6 @@ async fn main() -> Result<()> {
 
     tracing::debug!("Found {} tables/views", schema.tables.len());
 
-    // --apply is only meaningful for the ddl generator. The Python
-    // generators (`declarative`/`tables`) produce model code, not
-    // executable DDL — silently no-op'ing apply for them would let
-    // a scripted "uvg ... --apply" appear successful while never
-    // touching the target database.
-    if cli.apply && cli.generator != "ddl" {
-        return Err(anyhow::anyhow!(
-            "--apply only works with --generator ddl (current: {})",
-            cli.generator,
-        ));
-    }
-
     match cli.generator.as_str() {
         "tables" => {
             if cli.split_tables {
@@ -162,32 +188,10 @@ async fn main() -> Result<()> {
 
             let ddl_opts = cli.ddl_options(dialect)?;
 
-            // --apply requires a target URL — fail fast before we do any
-            // work introspecting source/target schemas.
-            if cli.apply && cli.target_url.is_none() {
-                return Err(anyhow::anyhow!(
-                    "--apply requires a target database URL to execute against"
-                ));
-            }
-
-            // --apply: refuse if --target-dialect was explicitly set to
-            // something different from the target URL's scheme. The
-            // generated DDL would target the explicit dialect, but the
-            // execution would hit the URL's actual engine — e.g. MySQL
-            // DDL sent to a Postgres target. The engine would error at
-            // parse time, but a validation-time error is clearer.
-            if cli.apply {
-                let target_url = cli.target_url.as_ref().unwrap();
-                let url_dialect = cli.parse_target_connection(target_url)?.dialect();
-                if ddl_opts.target_dialect != url_dialect {
-                    return Err(anyhow::anyhow!(
-                        "--apply: --target-dialect ({}) does not match the dialect inferred from the target URL ({}). \
-                         Drop --target-dialect, or change the URL scheme to match.",
-                        ddl_opts.target_dialect,
-                        url_dialect,
-                    ));
-                }
-            }
+            // --apply preflight (generator, target URL, --split-tables,
+            // dialect-mismatch) already ran at the top of main, before
+            // any database connections. By the time we get here the
+            // configuration is known to be coherent.
 
             // If a target URL is provided, introspect it for diff
             let target_schema = if let Some(ref target_url) = cli.target_url {
@@ -282,15 +286,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 DdlOutput::Split(files) => {
-                    if cli.apply {
-                        // The Split output path is used by --split-tables for
-                        // Python codegen; mixing it with --apply (an executable
-                        // DDL operation) crosses purposes. Per-table apply is
-                        // available via --out-dir.
-                        return Err(anyhow::anyhow!(
-                            "--apply with --split-tables is not supported (use --out-dir for per-table apply)"
-                        ));
-                    }
+                    // --apply + --split-tables is rejected at the top-of-main
+                    // preflight, so this arm only fires under no-target /
+                    // codegen-style usage.
                     match cli.outfile {
                         Some(ref dir) => {
                             let dir_path = std::path::PathBuf::from(dir);
@@ -358,7 +356,29 @@ fn write_output(output: &str, outfile: &Option<String>) -> anyhow::Result<()> {
 /// quoting the offending statement and the database's error message —
 /// the binary then exits non-zero, which is load-bearing for CI/scripted
 /// callers per issue #57's "side benefits" section.
+///
+/// **Comment-only blobs are rejected** (unless they're the explicit
+/// "no schema changes" sentinel). Some diffs — notably SQLite ALTER
+/// COLUMN and MSSQL DROP CONSTRAINT cases — emit warning comments
+/// instead of executable SQL, signaling that the operation needs
+/// manual schema work. Silently reporting "applied 0 statement(s)"
+/// in that case would leave the user thinking the apply succeeded
+/// while the target schema is unchanged.
 async fn apply_blob(target_config: &ConnectionConfig, sql: &str) -> anyhow::Result<usize> {
+    let statements = db::split_statements(sql);
+    if statements.is_empty() {
+        let trimmed = sql.trim();
+        let is_noop_sentinel = trimmed.is_empty()
+            || trimmed.starts_with("-- No schema changes detected");
+        if !is_noop_sentinel {
+            return Err(anyhow::anyhow!(
+                "refusing to apply: the diff produced changes but they're all non-executable text \
+                 (likely SQLite ALTER COLUMN warnings or MSSQL constraint-drop notes — those need \
+                 manual schema work). Inspect the diff with `--outfile` or `--out-dir` and apply \
+                 the actionable parts by hand."
+            ));
+        }
+    }
     let results = db::execute_ddl(target_config, sql).await?;
     let applied = results.iter().filter(|r| r.error.is_none()).count();
     if let Some(failed) = results.iter().find(|r| r.error.is_some()) {

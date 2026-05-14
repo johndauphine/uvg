@@ -497,4 +497,131 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[tokio::test]
+    async fn test_apply_rejects_comment_only_diff() {
+        // Regression: codex round 2 caught that some diffs produce
+        // only warning comments (SQLite ALTER COLUMN, MSSQL constraint
+        // drop) — db::execute_ddl runs zero statements and used to
+        // report "applied 0 statement(s)" as success, leaving the
+        // target unchanged. The guard in apply_blob now distinguishes
+        // these from the legitimate "no schema changes" sentinel.
+        let dir = tmpdir("apply-comment-only");
+        let source = dir.join("source.db");
+        let target = dir.join("target.db");
+        // Same column name, different types — SQLite emits the diff
+        // as an `-- ALTER TABLE ... ALTER COLUMN ... TYPE ...;` warning
+        // comment (SQLite doesn't actually support ALTER COLUMN).
+        exec_sql(&source, "CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT);").await;
+        exec_sql(&target, "CREATE TABLE users(id INTEGER PRIMARY KEY, email INTEGER);").await;
+        let src_url = format!("sqlite:///{}", source.display());
+        let tgt_url = format!("sqlite:///{}", target.display());
+
+        let out = run_uvg(&["--generator", "ddl", "--apply", &src_url, &tgt_url]);
+        assert!(!out.status.success(), "must exit non-zero on comment-only diff");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("refusing to apply")
+                && stderr.contains("non-executable")
+                && stderr.contains("--outfile"),
+            "expected guidance pointing at --outfile inspection, got: {stderr}"
+        );
+
+        // Target's schema must be unchanged — confirm column type stayed.
+        let tgt_cols: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, type FROM pragma_table_info('users') ORDER BY cid",
+        )
+        .fetch_all(
+            &sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{}?mode=ro", target.display()))
+                .await
+                .expect("sqlite connect"),
+        )
+        .await
+        .expect("schema query");
+        let email = tgt_cols.iter().find(|(n, _)| n == "email").expect("email column");
+        assert_eq!(email.1, "INTEGER", "target schema must be untouched: {tgt_cols:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_apply_rejects_split_tables_combo() {
+        // Regression: codex round 2 caught that --apply --split-tables
+        // was supposed to error, but the only rejection lived inside
+        // DdlGenerator's Split arm — unreachable under --apply because
+        // a diff (target_schema = Some) always returns Single. With
+        // the rejection now hoisted to the top-of-main preflight,
+        // the combination errors before any DB I/O.
+        let dir = tmpdir("apply-split-combo");
+        let source = dir.join("source.db");
+        let target = dir.join("target.db");
+        exec_sql(&source, "CREATE TABLE users(id INTEGER PRIMARY KEY);").await;
+        exec_sql(&target, "CREATE TABLE _bootstrap(id INTEGER); DROP TABLE _bootstrap;").await;
+        let src_url = format!("sqlite:///{}", source.display());
+        let tgt_url = format!("sqlite:///{}", target.display());
+
+        let out = run_uvg(&[
+            "--generator", "ddl",
+            "--apply",
+            "--split-tables",
+            &src_url, &tgt_url,
+        ]);
+        assert!(!out.status.success(), "combo must error");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--apply with --split-tables")
+                && stderr.contains("--out-dir"),
+            "expected guidance pointing at --out-dir, got: {stderr}"
+        );
+
+        // Target schema must be unchanged — assert no `users` table.
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='users'",
+        )
+        .fetch_all(
+            &sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{}?mode=ro", target.display()))
+                .await
+                .expect("sqlite connect"),
+        )
+        .await
+        .expect("query");
+        assert!(tables.is_empty(), "target must not have been mutated by the rejected combo");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_apply_preflight_runs_before_source_connection() {
+        // Regression: codex round 2 caught that the --apply preflight
+        // ran after main had already connected to and introspected
+        // the source DB. An invalid --apply invocation against an
+        // unreachable source URL would error with a connection
+        // failure instead of the friendlier validation message.
+        // The preflight now happens before any DB I/O. We exercise
+        // the missing-target-URL case against an unreachable
+        // postgres URL: the error must be about the missing target,
+        // NOT about the unreachable source.
+        let out = run_uvg(&[
+            "--generator", "ddl",
+            "--apply",
+            "postgres://nobody:nopass@unreachable.invalid:5432/none",
+        ]);
+        assert!(!out.status.success(), "must exit non-zero");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--apply requires a target database URL"),
+            "expected target-URL validation error before source connection, got: {stderr}"
+        );
+        // Conversely, must NOT have leaked the bad source URL's host
+        // into a connection-error message — that would prove we
+        // tried to connect first.
+        assert!(
+            !stderr.contains("unreachable.invalid"),
+            "preflight must run before source connection attempt, got: {stderr}"
+        );
+    }
 }
