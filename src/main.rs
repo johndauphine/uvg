@@ -20,7 +20,7 @@ use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, ConnectionConfig};
+use crate::cli::{redact_url, Cli, ConnectionConfig};
 use crate::codegen::declarative::DeclarativeGenerator;
 use crate::codegen::ddl_diff::compute_changes;
 use crate::codegen::tables::TablesGenerator;
@@ -128,6 +128,18 @@ async fn main() -> Result<()> {
 
     tracing::debug!("Found {} tables/views", schema.tables.len());
 
+    // --apply is only meaningful for the ddl generator. The Python
+    // generators (`declarative`/`tables`) produce model code, not
+    // executable DDL — silently no-op'ing apply for them would let
+    // a scripted "uvg ... --apply" appear successful while never
+    // touching the target database.
+    if cli.apply && cli.generator != "ddl" {
+        return Err(anyhow::anyhow!(
+            "--apply only works with --generator ddl (current: {})",
+            cli.generator,
+        ));
+    }
+
     match cli.generator.as_str() {
         "tables" => {
             if cli.split_tables {
@@ -156,6 +168,25 @@ async fn main() -> Result<()> {
                 return Err(anyhow::anyhow!(
                     "--apply requires a target database URL to execute against"
                 ));
+            }
+
+            // --apply: refuse if --target-dialect was explicitly set to
+            // something different from the target URL's scheme. The
+            // generated DDL would target the explicit dialect, but the
+            // execution would hit the URL's actual engine — e.g. MySQL
+            // DDL sent to a Postgres target. The engine would error at
+            // parse time, but a validation-time error is clearer.
+            if cli.apply {
+                let target_url = cli.target_url.as_ref().unwrap();
+                let url_dialect = cli.parse_target_connection(target_url)?.dialect();
+                if ddl_opts.target_dialect != url_dialect {
+                    return Err(anyhow::anyhow!(
+                        "--apply: --target-dialect ({}) does not match the dialect inferred from the target URL ({}). \
+                         Drop --target-dialect, or change the URL scheme to match.",
+                        ddl_opts.target_dialect,
+                        url_dialect,
+                    ));
+                }
             }
 
             // If a target URL is provided, introspect it for diff
@@ -215,8 +246,9 @@ async fn main() -> Result<()> {
                                 let target_config = cli.parse_target_connection(target_url)?;
                                 let applied = apply_manifest(&target_config, out_dir, &manifest).await?;
                                 eprintln!(
-                                    "uvg: applied {applied} statement(s) across {} table(s) to {target_url}",
+                                    "uvg: applied {applied} statement(s) across {} table(s) to {}",
                                     manifest.files.len(),
+                                    redact_url(target_url),
                                 );
                             }
                         }
@@ -242,7 +274,8 @@ async fn main() -> Result<()> {
                         }
                         let applied = apply_blob(&target_config, &content).await?;
                         eprintln!(
-                            "uvg: applied {applied} statement(s) to {target_url}"
+                            "uvg: applied {applied} statement(s) to {}",
+                            redact_url(target_url),
                         );
                     } else {
                         write_output(&content, &cli.outfile)?;

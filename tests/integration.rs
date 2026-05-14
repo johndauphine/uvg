@@ -412,6 +412,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_apply_rejected_for_non_ddl_generator() {
+        // Regression: codex round 1 caught that --apply with the
+        // default declarative generator silently succeeded — uvg
+        // generated Python models and exited 0 without touching the
+        // target database. In a script that looks like a successful
+        // apply, was actually a no-op. The pre-match guard now
+        // rejects it with a clear message.
+        let dir = tmpdir("apply-wrong-gen");
+        let source = dir.join("source.db");
+        let target = dir.join("target.db");
+        exec_sql(&source, "CREATE TABLE users(id INTEGER PRIMARY KEY);").await;
+        exec_sql(&target, "CREATE TABLE _bootstrap(id INTEGER); DROP TABLE _bootstrap;").await;
+        let src_url = format!("sqlite:///{}", source.display());
+        let tgt_url = format!("sqlite:///{}", target.display());
+
+        // No --generator flag means default = declarative; --apply
+        // with that combination must fail before any DB I/O.
+        let out = run_uvg(&["--apply", &src_url, &tgt_url]);
+        assert!(!out.status.success(), "must exit non-zero");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--apply only works with --generator ddl"),
+            "expected generator-mismatch error, got: {stderr}"
+        );
+
+        // Sanity: same args plus `--generator ddl` succeeds. Both
+        // paths share preflight; this confirms only the guard fires.
+        let out_ddl = run_uvg(&["--generator", "ddl", "--apply", &src_url, &tgt_url]);
+        assert!(out_ddl.status.success(), "ddl variant must succeed: {}", String::from_utf8_lossy(&out_ddl.stderr));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_apply_rejects_target_dialect_url_mismatch() {
+        // Regression: codex round 1 caught that --apply combined with
+        // --target-dialect could send DDL for one engine to a database
+        // of another (e.g. MySQL DDL into a PG target). Now rejected
+        // at validation time with a clear message.
+        let dir = tmpdir("apply-dialect-mismatch");
+        let source = dir.join("source.db");
+        let target = dir.join("target.db");
+        exec_sql(&source, "CREATE TABLE users(id INTEGER PRIMARY KEY);").await;
+        exec_sql(&target, "CREATE TABLE _bootstrap(id INTEGER); DROP TABLE _bootstrap;").await;
+        let src_url = format!("sqlite:///{}", source.display());
+        let tgt_url = format!("sqlite:///{}", target.display());
+
+        // sqlite target but --target-dialect mysql: validation error.
+        let out = run_uvg(&[
+            "--generator", "ddl",
+            "--apply",
+            "--target-dialect", "mysql",
+            &src_url, &tgt_url,
+        ]);
+        assert!(!out.status.success(), "must exit non-zero");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--target-dialect")
+                && stderr.contains("does not match")
+                && stderr.contains("target URL"),
+            "expected dialect-mismatch error, got: {stderr}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn test_apply_requires_target_url() {
         // --apply without a target URL must fail fast with a clear
         // message and non-zero exit, before any introspection.

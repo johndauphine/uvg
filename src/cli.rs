@@ -145,6 +145,27 @@ impl ConnectionConfig {
     }
 }
 
+/// Redact the password component of a database connection URL so it
+/// can be safely printed to stderr / logs. Returns a URL with the
+/// password replaced by `***` if one was present; non-URL strings
+/// pass through unchanged (no parseable secret to redact).
+///
+/// Used by `--apply` summary messages, which often land in CI logs.
+pub(crate) fn redact_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut u) if u.password().is_some() => {
+            // set_password may fail for opaque-scheme URLs; fall back
+            // to the raw string in that case.
+            if u.set_password(Some("***")).is_ok() {
+                u.to_string()
+            } else {
+                raw.to_string()
+            }
+        }
+        _ => raw.to_string(),
+    }
+}
+
 /// Ensure a MySQL URL includes `charset=utf8mb4` so that `information_schema`
 /// returns proper VARCHAR columns instead of VARBINARY.
 fn ensure_mysql_charset(url: &str) -> String {
@@ -505,5 +526,42 @@ mod tests {
         let cli = cli_with_url("mysql://user:pass@host/");
         let config = cli.parse_connection().unwrap();
         assert_eq!(config.database_name(), None);
+    }
+
+    #[test]
+    fn test_redact_url_strips_password() {
+        // Regression: codex round 1 on the --apply branch caught that
+        // raw target URLs landed in stderr summaries, leaking embedded
+        // passwords to CI logs. redact_url replaces the password with
+        // *** so the summary stays informative without spilling secrets.
+        assert_eq!(
+            redact_url("postgres://leakuser:supersecret@host:5432/db"),
+            "postgres://leakuser:***@host:5432/db"
+        );
+        assert_eq!(
+            redact_url("mysql://root:hunter2@example.com/mydb"),
+            "mysql://root:***@example.com/mydb"
+        );
+        assert_eq!(
+            redact_url("mssql://sa:TopSecret@localhost:1433/CRM"),
+            "mssql://sa:***@localhost:1433/CRM"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_leaves_safe_strings_alone() {
+        // No password component → return as-is. Covers sqlite paths
+        // (no credentials in the URL at all) and URLs with a user but
+        // no password (nothing secret to redact).
+        assert_eq!(
+            redact_url("sqlite:///tmp/test.db"),
+            "sqlite:///tmp/test.db"
+        );
+        assert_eq!(
+            redact_url("postgres://justauser@host/db"),
+            "postgres://justauser@host/db"
+        );
+        // Non-URL strings pass through; nothing to redact.
+        assert_eq!(redact_url("not a url"), "not a url");
     }
 }
