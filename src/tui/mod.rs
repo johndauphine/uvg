@@ -415,7 +415,15 @@ fn handle_view_keys(app: &mut App, key: KeyCode) {
             }
         }
         KeyCode::Char('a') => {
-            if app.checked_count() > 0 && !app.empty_diff {
+            // checked_count > 0 isn't enough — a node can be checked
+            // but contain only advisory comment SQL (SQLite ALTER
+            // warnings, MSSQL drop-default notes). Apply must require
+            // at least one executable statement, otherwise the user
+            // sees "successfully applied 0 statement(s)" with no
+            // actual change to the target.
+            if !app.empty_diff
+                && count_statements(&collect_apply_sql(&app.nodes)) > 0
+            {
                 app.state = AppState::Confirming;
             }
         }
@@ -683,7 +691,9 @@ fn render_view_footer(app: &App) -> Paragraph<'static> {
         spans.push(Span::raw(" scroll  "));
     }
 
-    if app.checked_count() > 0 {
+    // Same guard the 'a' key handler uses: don't suggest apply if the
+    // checked SQL is only comments (e.g. SQLite ALTER warnings).
+    if stmt_count > 0 {
         spans.push(Span::styled("a", Style::default().add_modifier(Modifier::BOLD)));
         spans.push(Span::raw(" apply  "));
     }
@@ -974,5 +984,34 @@ mod tests {
             checked: false,
         }];
         assert_eq!(collect_apply_sql(&nodes), "");
+    }
+
+    #[test]
+    fn test_comment_only_changes_have_zero_executable_statements() {
+        // Regression: codex round 5 caught that checked_count() > 0 is
+        // not a sufficient apply gate — SQLite ALTER warnings and
+        // MSSQL default-drop notes are comment-only, so they
+        // contribute non-empty SQL to collect_apply_sql() but split to
+        // zero executable statements. The apply gate now uses
+        // count_statements(collect_apply_sql(...)) instead. This test
+        // pins the property the gate depends on: a node holding only
+        // comment SQL must split to 0 statements.
+        let nodes = vec![TreeNode {
+            name: "users".into(),
+            changes: vec![ch(
+                "",
+                Some("users"),
+                "-- WARNING: SQLite does not support ALTER COLUMN. Table recreation required.\n\
+                 -- ALTER TABLE \"users\" ALTER COLUMN \"email\" TYPE VARCHAR(255);",
+            )],
+            checked: true,
+        }];
+        let sql = collect_apply_sql(&nodes);
+        assert!(!sql.is_empty(), "comment SQL is non-empty as text");
+        assert_eq!(
+            count_statements(&sql),
+            0,
+            "but it must split into zero executable statements; sql was: {sql}"
+        );
     }
 }
