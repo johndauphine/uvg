@@ -25,7 +25,7 @@ use crate::codegen::declarative::DeclarativeGenerator;
 use crate::codegen::ddl_diff::compute_changes;
 use crate::codegen::tables::TablesGenerator;
 use crate::codegen::Generator;
-use crate::output::{write_split_changes, OutputContext};
+use crate::output::{apply_order, write_split_changes, Manifest, OutputContext};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -150,6 +150,14 @@ async fn main() -> Result<()> {
 
             let ddl_opts = cli.ddl_options(dialect)?;
 
+            // --apply requires a target URL — fail fast before we do any
+            // work introspecting source/target schemas.
+            if cli.apply && cli.target_url.is_none() {
+                return Err(anyhow::anyhow!(
+                    "--apply requires a target database URL to execute against"
+                ));
+            }
+
             // If a target URL is provided, introspect it for diff
             let target_schema = if let Some(ref target_url) = cli.target_url {
                 let target_config = cli.parse_target_connection(target_url)?;
@@ -202,6 +210,15 @@ async fn main() -> Result<()> {
                                 out_dir.display(),
                                 run_id,
                             );
+                            if cli.apply {
+                                let target_url = cli.target_url.as_ref().unwrap();
+                                let target_config = cli.parse_target_connection(target_url)?;
+                                let applied = apply_manifest(&target_config, out_dir, &manifest).await?;
+                                eprintln!(
+                                    "uvg: applied {applied} statement(s) across {} table(s) to {target_url}",
+                                    manifest.files.len(),
+                                );
+                            }
                         }
                     }
                     return Ok(());
@@ -213,9 +230,34 @@ async fn main() -> Result<()> {
 
             match ddl_output {
                 DdlOutput::Single(content) => {
-                    write_output(&content, &cli.outfile)?;
+                    // --apply: execute against the target and suppress stdout
+                    // (the user got what they asked for via the eprintln summary;
+                    // dumping the DDL to stdout in addition is noise). If they
+                    // also want a file artifact they can pass --outfile.
+                    if cli.apply {
+                        let target_url = cli.target_url.as_ref().unwrap();
+                        let target_config = cli.parse_target_connection(target_url)?;
+                        if cli.outfile.is_some() {
+                            write_output(&content, &cli.outfile)?;
+                        }
+                        let applied = apply_blob(&target_config, &content).await?;
+                        eprintln!(
+                            "uvg: applied {applied} statement(s) to {target_url}"
+                        );
+                    } else {
+                        write_output(&content, &cli.outfile)?;
+                    }
                 }
                 DdlOutput::Split(files) => {
+                    if cli.apply {
+                        // The Split output path is used by --split-tables for
+                        // Python codegen; mixing it with --apply (an executable
+                        // DDL operation) crosses purposes. Per-table apply is
+                        // available via --out-dir.
+                        return Err(anyhow::anyhow!(
+                            "--apply with --split-tables is not supported (use --out-dir for per-table apply)"
+                        ));
+                    }
                     match cli.outfile {
                         Some(ref dir) => {
                             let dir_path = std::path::PathBuf::from(dir);
@@ -276,4 +318,40 @@ fn write_output(output: &str, outfile: &Option<String>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Apply a single DDL blob to the target. Returns the count of
+/// successful statements. On any failure, returns a contextual error
+/// quoting the offending statement and the database's error message —
+/// the binary then exits non-zero, which is load-bearing for CI/scripted
+/// callers per issue #57's "side benefits" section.
+async fn apply_blob(target_config: &ConnectionConfig, sql: &str) -> anyhow::Result<usize> {
+    let results = db::execute_ddl(target_config, sql).await?;
+    let applied = results.iter().filter(|r| r.error.is_none()).count();
+    if let Some(failed) = results.iter().find(|r| r.error.is_some()) {
+        let first_line = failed.sql.lines().next().unwrap_or("").trim();
+        return Err(anyhow::anyhow!(
+            "DDL apply failed after {applied} statement(s); first failure:\n  {first_line}\n  Error: {}",
+            failed.error.as_ref().unwrap()
+        ));
+    }
+    Ok(applied)
+}
+
+/// Apply every `.sql` file referenced by a manifest, in manifest order
+/// (which is `_schema/` first, then table files in topological FK order
+/// — see [`output::apply_order`] and `test_manifest_preserves_topological_order`).
+/// Returns the total count of statements applied across all files.
+async fn apply_manifest(
+    target_config: &ConnectionConfig,
+    out_dir: &std::path::Path,
+    manifest: &Manifest,
+) -> anyhow::Result<usize> {
+    let mut total = 0;
+    for path in apply_order(manifest, out_dir) {
+        let sql = fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+        total += apply_blob(target_config, &sql).await?;
+    }
+    Ok(total)
 }

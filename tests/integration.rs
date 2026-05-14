@@ -286,4 +286,148 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Introspect a sqlite db and return the sorted list of `(table, column)`
+    /// pairs. Used to assert that --apply made the target match the source.
+    async fn schema_columns(db_path: &Path) -> Vec<(String, String)> {
+        let url = format!("sqlite://{}?mode=ro", db_path.display());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("sqlite connect");
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT m.name, p.name
+             FROM sqlite_master m
+             JOIN pragma_table_info(m.name) p
+             WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%'
+             ORDER BY m.name, p.cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("schema query");
+        pool.close().await;
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_apply_blob_runs_diff_against_target() {
+        // --apply (no --out-dir): generate the diff and execute it
+        // against the target in one shot. The target schema must end
+        // up matching the source, and a second run must report
+        // "no schema changes" (the diff engine is idempotent).
+        let dir = tmpdir("apply-blob");
+        let source = dir.join("source.db");
+        let target = dir.join("target.db");
+
+        exec_sql(
+            &source,
+            "CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+             CREATE TABLE posts(id INTEGER PRIMARY KEY, user_id INTEGER,
+                                FOREIGN KEY(user_id) REFERENCES users(id));",
+        )
+        .await;
+        // Touch the target so the file exists with an empty schema.
+        exec_sql(&target, "CREATE TABLE _bootstrap(id INTEGER); DROP TABLE _bootstrap;").await;
+
+        let src_url = format!("sqlite:///{}", source.display());
+        let tgt_url = format!("sqlite:///{}", target.display());
+
+        let out = run_uvg(&["--generator", "ddl", "--apply", &src_url, &tgt_url]);
+        assert!(out.status.success(), "apply run failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("uvg: applied") && stderr.contains("statement"),
+            "expected applied-count summary, got: {stderr}"
+        );
+
+        // Target now has the same tables/columns as source.
+        let src_cols = schema_columns(&source).await;
+        let tgt_cols = schema_columns(&target).await;
+        assert_eq!(
+            src_cols, tgt_cols,
+            "after --apply, target schema must match source"
+        );
+
+        // Idempotence: second run reports no changes.
+        let out2 = run_uvg(&["--generator", "ddl", "--apply", &src_url, &tgt_url]);
+        assert!(out2.status.success());
+        let stderr2 = String::from_utf8_lossy(&out2.stderr);
+        // No-changes apply prints "uvg: applied 0 statement(s) to ...".
+        assert!(
+            stderr2.contains("applied 0 statement"),
+            "second run must be a zero-statement no-op, got: {stderr2}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_apply_out_dir_writes_and_executes() {
+        // --apply with --out-dir: writes the per-table layout AND
+        // executes each file in manifest order. After running, the
+        // target must match the source AND the migration files must
+        // be on disk for git review.
+        let dir = tmpdir("apply-outdir");
+        let source = dir.join("source.db");
+        let target = dir.join("target.db");
+        let migrations = dir.join("migrations");
+
+        exec_sql(
+            &source,
+            "CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+             CREATE TABLE posts(id INTEGER PRIMARY KEY, user_id INTEGER,
+                                FOREIGN KEY(user_id) REFERENCES users(id));",
+        )
+        .await;
+        exec_sql(&target, "CREATE TABLE _bootstrap(id INTEGER); DROP TABLE _bootstrap;").await;
+
+        let src_url = format!("sqlite:///{}", source.display());
+        let tgt_url = format!("sqlite:///{}", target.display());
+        let mig_str = migrations.display().to_string();
+
+        let out = run_uvg(&[
+            "--generator", "ddl",
+            "--apply",
+            "--out-dir", &mig_str,
+            "--name", "initial",
+            &src_url, &tgt_url,
+        ]);
+        assert!(out.status.success(), "apply+outdir run failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("wrote 2 file(s)"), "expected file-write summary: {stderr}");
+        assert!(stderr.contains("applied") && stderr.contains("across 2 table(s)"), "expected apply summary: {stderr}");
+
+        // Files are on disk for git.
+        assert!(migrations.join("users").is_dir());
+        assert!(migrations.join("posts").is_dir());
+        assert!(migrations.join("_runs").is_dir());
+
+        // Target matches source.
+        let src_cols = schema_columns(&source).await;
+        let tgt_cols = schema_columns(&target).await;
+        assert_eq!(src_cols, tgt_cols);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_apply_requires_target_url() {
+        // --apply without a target URL must fail fast with a clear
+        // message and non-zero exit, before any introspection.
+        let dir = tmpdir("apply-no-target");
+        let source = dir.join("source.db");
+        exec_sql(&source, "CREATE TABLE users(id INTEGER PRIMARY KEY);").await;
+        let src_url = format!("sqlite:///{}", source.display());
+
+        let out = run_uvg(&["--generator", "ddl", "--apply", &src_url]);
+        assert!(!out.status.success(), "must exit non-zero");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--apply requires a target database URL"),
+            "expected friendly error, got: {stderr}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
