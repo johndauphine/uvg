@@ -82,9 +82,15 @@ impl ApplyStats {
         Self::default()
     }
 
-    /// Add one statement's contribution. Called by the on-statement
-    /// observer regardless of progress emission.
+    /// Add one *successful* statement's contribution. Failed statements
+    /// are deliberately excluded so `render_summary`'s count matches
+    /// the apply-summary line ("uvg: applied N statement(s)"), which
+    /// only counts successes. A failure's per-statement progress line
+    /// already carries the FAIL suffix so the user sees where it died.
     pub fn record(&mut self, result: &StmtResult) {
+        if result.error.is_some() {
+            return;
+        }
         self.count += 1;
         self.total_dur += result.duration;
         if result.duration > self.max_dur {
@@ -124,16 +130,20 @@ fn sql_one_line(sql: &str, max: usize) -> String {
     if collapsed.chars().count() <= max {
         return collapsed;
     }
-    // Cut on char boundaries; never split a multi-byte char in half.
-    let mut end = 0;
-    for (i, _) in collapsed.char_indices().take(max.saturating_sub(3)) {
-        end = i;
+    // `max < 3` can't fit even the ellipsis without exceeding the
+    // caller's char budget. Degenerate to a plain prefix in that
+    // window so the function's contract ("≤ max chars out") holds at
+    // every input size.
+    if max < 3 {
+        return collapsed.chars().take(max).collect();
     }
-    // Walk one more char so `end` becomes the byte index AFTER the
-    // (max-3)th char rather than the start of it.
-    if let Some((byte_after, _)) = collapsed.char_indices().nth(max.saturating_sub(3)) {
-        end = byte_after;
-    }
+    // Cut on a char boundary that's the END of the (max-3)th char, so
+    // appending "..." yields exactly `max` chars out.
+    let end = collapsed
+        .char_indices()
+        .nth(max - 3)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(collapsed.len());
     format!("{}...", &collapsed[..end])
 }
 
@@ -150,15 +160,19 @@ fn classify(sql: &str) -> &'static str {
     } else if upper.starts_with("COMMENT ON") {
         "comments"
     } else if upper.starts_with("ALTER TABLE") {
-        // ALTER TABLE wears many hats. Disambiguate by inspecting the
-        // body for the action keyword. Order matters: FK references
-        // can mention CHECK in column comments, etc., so check FK first.
-        if upper.contains(" FOREIGN KEY") {
-            "FKs"
-        } else if upper.contains(" CHECK") {
-            "CHECKs"
-        } else if upper.contains(" ADD COLUMN") || upper.contains(" ADD ") {
-            "alters"
+        // ALTER TABLE wears many hats. Disambiguate via the
+        // ADD CONSTRAINT prefix so we don't mis-classify a column or
+        // identifier that happens to contain the substring "CHECK" or
+        // "FOREIGN KEY". Order matters: an FK-add CONSTRAINT clause
+        // can mention CHECK in a column comment, so check FK first.
+        if upper.contains("ADD CONSTRAINT") {
+            if upper.contains("FOREIGN KEY") {
+                "FKs"
+            } else if upper.contains(" CHECK") {
+                "CHECKs"
+            } else {
+                "alters"
+            }
         } else {
             "alters"
         }
@@ -216,6 +230,58 @@ mod tests {
         let out = sql_one_line(s, 8);
         assert!(out.chars().count() <= 8);
         assert!(out.is_char_boundary(out.len()));
+    }
+
+    #[test]
+    fn sql_one_line_handles_tiny_max() {
+        // Below the ellipsis width (3), degenerate to a plain prefix
+        // so the function's contract (≤ max chars out) still holds.
+        assert_eq!(sql_one_line("CREATE TABLE foo (id int)", 0), "");
+        assert_eq!(sql_one_line("CREATE TABLE foo (id int)", 1), "C");
+        assert_eq!(sql_one_line("CREATE TABLE foo (id int)", 2), "CR");
+        // Exactly 3: emit just the ellipsis.
+        let three = sql_one_line("CREATE TABLE foo (id int)", 3);
+        assert_eq!(three.chars().count(), 3);
+        assert_eq!(three, "...");
+    }
+
+    #[test]
+    fn classify_alter_rejects_loose_keyword_matches() {
+        // Pre-fix bug: `.contains(" FOREIGN KEY")` matched anywhere in
+        // the SQL, including inside identifiers. The fix requires
+        // `ADD CONSTRAINT` to be present before classifying as FK/CHECK,
+        // so a column named "user CHECK" or a table called
+        // `"FOREIGN KEY tbl"` no longer skews the bucket counts.
+        assert_eq!(
+            classify(r#"ALTER TABLE "FOREIGN KEY tbl" ADD COLUMN x int"#),
+            "alters"
+        );
+        assert_eq!(
+            classify(r#"ALTER TABLE foo ADD COLUMN "user CHECK" int"#),
+            "alters"
+        );
+        // Real FK constraint still classifies as FK.
+        assert_eq!(
+            classify("ALTER TABLE foo ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES b(id)"),
+            "FKs"
+        );
+    }
+
+    #[test]
+    fn stats_record_skips_failed_statements() {
+        // The summary's count is "successful statements applied" —
+        // it must match the apply-summary line, which counts only
+        // statements that returned without error.
+        let mut stats = ApplyStats::new();
+        stats.record(&r("CREATE TABLE users (id int)", 10));
+        stats.record(&StmtResult {
+            sql: "CREATE TABLE broken (".to_string(),
+            error: Some("syntax error".to_string()),
+            duration: Duration::from_millis(2),
+        });
+        let s = stats.render_summary();
+        assert!(s.starts_with("Applied 1 statement(s)"), "got: {s}");
+        assert!(!s.contains("syntax"), "error text leaked into summary: {s}");
     }
 
     #[test]

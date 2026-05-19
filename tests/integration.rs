@@ -590,6 +590,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // No E2E for the failed-statement progress path: forcing uvg to
+    // emit a statement that fails-on-apply requires either custom
+    // injection beyond the public CLI's surface (the diff engine
+    // skips emit when source and target match) or a race-prone
+    // "pre-create-after-introspection" trick. The FAIL suffix and
+    // record-skipping-on-failure contracts are covered by unit tests
+    // in `src/apply_progress.rs` (`stats_record_skips_failed_statements`).
+
     #[tokio::test]
     async fn test_apply_progress_auto_is_silent_when_stderr_redirected() {
         // Default --progress=auto consults stderr.is_terminal(); the
