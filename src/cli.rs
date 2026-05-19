@@ -50,10 +50,14 @@ pub struct Cli {
 
     /// Skip the parse-check step that runs before `--apply` would
     /// touch the target. By default uvg pre-validates every DDL
-    /// statement via the dialect's parse-only mode (PG: BEGIN/ROLLBACK
-    /// probe; MSSQL: SET PARSEONLY ON; MySQL/SQLite skipped — no
-    /// parse-only mode available) so syntax errors or missing
-    /// references surface before any real change is made.
+    /// statement via the dialect's parse-only mode:
+    ///   - PG: savepoint-per-statement inside one outer transaction,
+    ///     ROLLBACK at the end. Catches syntax errors AND catalog
+    ///     errors (missing references, wrong column types, etc.).
+    ///   - MSSQL: SET PARSEONLY ON. Catches syntax errors only;
+    ///     name resolution is deferred to real execution.
+    ///   - MySQL / SQLite: skipped (no parse-only mode).
+    /// Bad DDL surfaces before any real change is made.
     #[arg(long)]
     pub no_parse_check: bool,
 

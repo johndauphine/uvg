@@ -352,14 +352,13 @@ async fn run_parse_check(config: &ConnectionConfig, content: &str) -> Result<()>
         errors.len()
     );
     for (i, e) in errors.iter().enumerate() {
-        let preview: String = e
-            .sql
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(120)
-            .collect();
+        let collapsed: String = e.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = if collapsed.chars().count() > 120 {
+            let cut: String = collapsed.chars().take(117).collect();
+            format!("{cut}...")
+        } else {
+            collapsed
+        };
         msg.push_str(&format!(
             "  [{}/{}] {}\n      {}\n",
             i + 1,
