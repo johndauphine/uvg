@@ -78,7 +78,22 @@ cargo build --release
 
 # Run all 9 (source, target) permutations.
 ./testdata/crm/run_matrix.sh
+
+# CI mode: exit non-zero if ANY pair is not OK.
+./testdata/crm/run_matrix.sh --strict
 ```
+
+The same matrix also runs in CI via [`.github/workflows/matrix.yml`](../../.github/workflows/matrix.yml) on every PR, every push to `master`, and on a nightly cron — see the **Matrix** badge at the top of the repo README for status.
+
+### No `sqlcmd` on host?
+
+The runner expects Microsoft's `sqlcmd` on the host `PATH` for MSSQL target operations. If you'd rather not install it (CI does this too), use the included docker-exec shim:
+
+```bash
+sudo install -m 0755 testdata/crm/sqlcmd-shim.sh /usr/local/bin/sqlcmd
+```
+
+It proxies every `sqlcmd ...` invocation into the `mssql-test` container's bundled binary, so the runner works unchanged.
 
 Output (truncated):
 

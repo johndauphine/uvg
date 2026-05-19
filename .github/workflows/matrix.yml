@@ -1,0 +1,131 @@
+name: Matrix E2E
+
+# Runs the CRM cross-dialect matrix end-to-end against live MSSQL,
+# PostgreSQL, and MySQL containers. Green iff all 9 (source, target)
+# pairs report OK. See testdata/crm/README.md.
+#
+# Triggers (per #61):
+#   - push to master / PR to master: primary signal, catches regressions
+#     at PR time when fixing is cheapest.
+#   - nightly cron: catches upstream container-image drift that the
+#     pinned-tag PR runs can't see until the tag is bumped.
+#   - workflow_dispatch: manual re-run, e.g. after closing an upstream
+#     incident.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: '0 8 * * *'  # 08:00 UTC daily
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  matrix:
+    name: CRM 9-pair matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build uvg (release)
+        run: cargo build --release
+
+      # Start the three DB containers with the same names the matrix
+      # runner expects (mssql-test / pg-test / mysql-test). Using
+      # `docker run` rather than GitHub Actions `services:` so the
+      # runner can `docker exec` into each container — that's how
+      # `run_matrix.sh` already talks to PG and MySQL today, and
+      # keeping the script unchanged means local dev and CI exercise
+      # the same path.
+      - name: Start MSSQL container
+        run: |
+          docker run -d --name mssql-test \
+            -e ACCEPT_EULA=Y \
+            -e SA_PASSWORD=TestPass2024 \
+            -e MSSQL_PID=Developer \
+            -p 1433:1433 \
+            mcr.microsoft.com/mssql/server:2022-latest
+
+      - name: Start PostgreSQL container
+        run: |
+          docker run -d --name pg-test \
+            -e POSTGRES_PASSWORD=TestPass2024 \
+            -p 5432:5432 \
+            postgres:16-alpine
+
+      - name: Start MySQL container
+        run: |
+          docker run -d --name mysql-test \
+            -e MYSQL_ROOT_PASSWORD=TestPass2024 \
+            -p 3306:3306 \
+            mysql:8.0
+
+      - name: Install sqlcmd shim
+        # Routes any host-side `sqlcmd ...` call through
+        # `docker exec mssql-test` so we don't need Microsoft's
+        # go-sqlcmd installed in the runner. Same file devs can
+        # install locally if they don't want go-sqlcmd either.
+        run: |
+          sudo install -m 0755 testdata/crm/sqlcmd-shim.sh /usr/local/bin/sqlcmd
+          sqlcmd -? 2>/dev/null | head -1 || true
+
+      - name: Wait for containers to accept connections
+        run: |
+          set -e
+          echo "Waiting for PostgreSQL..."
+          for i in $(seq 1 30); do
+            docker exec pg-test pg_isready -U postgres -h localhost >/dev/null 2>&1 && break
+            sleep 2
+          done
+          echo "Waiting for MySQL..."
+          for i in $(seq 1 60); do
+            docker exec mysql-test mysqladmin ping -h localhost -uroot -pTestPass2024 --silent 2>/dev/null && break
+            sleep 2
+          done
+          echo "Waiting for MSSQL..."
+          for i in $(seq 1 60); do
+            sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -Q "SELECT 1" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          echo "All three containers ready."
+
+      - name: Load MSSQL CRM source
+        run: |
+          sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C \
+            -Q "IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name='CRM_MSSQL') CREATE DATABASE CRM_MSSQL;"
+          sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -d CRM_MSSQL \
+            -i testdata/crm/crm_mssql.sql >/dev/null
+
+      - name: Load PostgreSQL CRM source
+        run: |
+          PGPASSWORD=TestPass2024 docker exec pg-test createdb -U postgres crm_pg
+          PGPASSWORD=TestPass2024 docker exec -i pg-test psql -U postgres -d crm_pg < testdata/crm/crm_postgres.sql >/dev/null
+
+      - name: Load MySQL CRM source
+        run: |
+          docker exec mysql-test mysql -uroot -pTestPass2024 \
+            -e "CREATE DATABASE crm_mysql"
+          docker exec -i mysql-test mysql -uroot -pTestPass2024 crm_mysql < testdata/crm/crm_mysql.sql
+
+      - name: Run CRM matrix (strict)
+        run: bash testdata/crm/run_matrix.sh --strict
+
+      - name: Upload matrix results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-results
+          path: /tmp/uvg-matrix/
+          if-no-files-found: warn
