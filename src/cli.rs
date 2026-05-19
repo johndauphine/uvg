@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 use crate::dialect::Dialect;
 
@@ -10,8 +10,11 @@ use crate::dialect::Dialect;
 #[derive(Parser, Debug)]
 #[command(name = "uvg", version, about)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Source database URL (e.g. postgresql://, mysql://, sqlite:///path, mssql://)
-    pub url: String,
+    pub url: Option<String>,
 
     /// Target database URL for DDL generation/migration (optional)
     pub target_url: Option<String>,
@@ -108,6 +111,67 @@ pub struct Cli {
     /// Launch interactive TUI for DDL diff and apply
     #[arg(long, short = 'i')]
     pub interactive: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Generate a versioned migration file from a source/target diff
+    Revision(RevisionCommand),
+
+    /// Apply pending versioned migrations to a target database
+    Upgrade(UpgradeCommand),
+
+    /// Print the target database's current uvg revision
+    Current(CurrentCommand),
+
+    /// Show the local migration graph
+    History(HistoryCommand),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RevisionCommand {
+    /// Source database URL to diff from
+    pub source_url: String,
+
+    /// Target database URL to converge
+    pub target_url: String,
+
+    /// Human-readable migration description
+    #[arg(long, short = 'm')]
+    pub message: String,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UpgradeCommand {
+    /// Target database URL to apply migrations to
+    pub target_url: String,
+
+    /// Revision to upgrade to; defaults to head
+    pub revision: Option<String>,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CurrentCommand {
+    /// Target database URL to inspect
+    pub target_url: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HistoryCommand {
+    /// Optional target database URL; marks applied/current revisions when provided
+    pub target_url: Option<String>,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -262,28 +326,7 @@ impl Cli {
                 .map_err(|e| crate::error::UvgError::InvalidDialect(e))?
         } else if let Some(ref target_url) = self.target_url {
             // Infer dialect from target URL scheme
-            let cli = Cli {
-                url: target_url.clone(),
-                target_url: None,
-                generator: String::new(),
-                target_dialect: None,
-                split_tables: false,
-                apply: false,
-                progress: crate::apply_progress::ProgressMode::Auto,
-                apply_retries: 3,
-                no_parse_check: false,
-                tables: None,
-                exclude_tables: None,
-                schemas: None,
-                noviews: false,
-                options: None,
-                outfile: None,
-                out_dir: None,
-                name: None,
-                trust_cert: self.trust_cert,
-                interactive: false,
-            };
-            cli.parse_connection()?.dialect()
+            self.parse_connection_url(target_url)?.dialect()
         } else {
             source_dialect
         };
@@ -304,34 +347,24 @@ impl Cli {
         &self,
         target_url: &str,
     ) -> Result<ConnectionConfig, crate::error::UvgError> {
-        let cli = Cli {
-            url: target_url.to_string(),
-            target_url: None,
-            generator: String::new(),
-            target_dialect: None,
-            split_tables: false,
-            apply: false,
-            progress: crate::apply_progress::ProgressMode::Auto,
-            apply_retries: 3,
-            no_parse_check: false,
-            tables: None,
-            exclude_tables: None,
-            schemas: None,
-            noviews: false,
-            options: None,
-            outfile: None,
-            out_dir: None,
-            name: None,
-            trust_cert: self.trust_cert,
-            interactive: false,
-        };
-        cli.parse_connection()
+        self.parse_connection_url(target_url)
     }
 
     /// Parse the URL into a `ConnectionConfig`.
     pub fn parse_connection(&self) -> Result<ConnectionConfig, crate::error::UvgError> {
-        let url = &self.url;
+        let Some(url) = self.url.as_deref() else {
+            return Err(crate::error::UvgError::Connection(
+                "database URL is required".to_string(),
+            ));
+        };
+        self.parse_connection_url(url)
+    }
 
+    /// Parse a URL string into a `ConnectionConfig`.
+    pub fn parse_connection_url(
+        &self,
+        url: &str,
+    ) -> Result<ConnectionConfig, crate::error::UvgError> {
         // PostgreSQL schemes
         if let Some(rest) = url
             .strip_prefix("postgresql+psycopg2://")
@@ -341,7 +374,7 @@ impl Cli {
             return Ok(ConnectionConfig::Postgres(format!("postgres://{rest}")));
         }
         if url.starts_with("postgresql://") || url.starts_with("postgres://") {
-            return Ok(ConnectionConfig::Postgres(url.clone()));
+            return Ok(ConnectionConfig::Postgres(url.to_string()));
         }
 
         // MSSQL schemes
@@ -453,7 +486,8 @@ mod tests {
 
     fn cli_with_url(url: &str) -> Cli {
         Cli {
-            url: url.to_string(),
+            command: None,
+            url: Some(url.to_string()),
             target_url: None,
             generator: "declarative".to_string(),
             target_dialect: None,
@@ -480,7 +514,9 @@ mod tests {
         let cli = cli_with_url("mysql://user:pass@localhost/mydb");
         let config = cli.parse_connection().unwrap();
         assert_eq!(config.dialect(), Dialect::Mysql);
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4"));
+        assert!(
+            matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4")
+        );
     }
 
     #[test]
@@ -488,7 +524,9 @@ mod tests {
         let cli = cli_with_url("mysql+pymysql://user:pass@localhost/mydb");
         let config = cli.parse_connection().unwrap();
         assert_eq!(config.dialect(), Dialect::Mysql);
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4"));
+        assert!(
+            matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4")
+        );
     }
 
     #[test]
@@ -496,7 +534,9 @@ mod tests {
         let cli = cli_with_url("mariadb://user:pass@localhost/mydb");
         let config = cli.parse_connection().unwrap();
         assert_eq!(config.dialect(), Dialect::Mysql);
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4"));
+        assert!(
+            matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4")
+        );
     }
 
     #[test]
@@ -504,14 +544,18 @@ mod tests {
         let cli = cli_with_url("mariadb+pymysql://user:pass@localhost/mydb");
         let config = cli.parse_connection().unwrap();
         assert_eq!(config.dialect(), Dialect::Mysql);
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4"));
+        assert!(
+            matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4")
+        );
     }
 
     #[test]
     fn test_mysql_preserves_existing_charset() {
         let cli = cli_with_url("mysql://user:pass@localhost/mydb?charset=latin1");
         let config = cli.parse_connection().unwrap();
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=latin1"));
+        assert!(
+            matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=latin1")
+        );
     }
 
     #[test]

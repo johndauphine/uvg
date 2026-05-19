@@ -84,6 +84,39 @@ uvg postgresql://source/db mysql://target/db --generator ddl -o migration.sql
 
 The target dialect is inferred from the target URL scheme. Same-dialect migrations converge cleanly — running the diff again after applying shows zero changes.
 
+### Versioned migrations
+
+For Alembic-style workflows, UVg can write timestamped revision files and track the target database's current revision in a `uvg_version` table.
+
+```bash
+# Write migrations/<revision>_add-users-email.sql
+uvg revision postgresql://source/db postgresql://target/db \
+  --message "add users.email"
+
+# Apply pending revisions to the target and update uvg_version
+uvg upgrade postgresql://target/db
+
+# Inspect the target's current revision
+uvg current postgresql://target/db
+
+# Show the local revision chain
+uvg history
+uvg history postgresql://target/db
+```
+
+Revision files use a simple SQL format:
+
+```sql
+-- uvg revision: 20260519_141500
+-- parent: 20260518_120000
+-- description: add users.email
+
+-- UP
+ALTER TABLE "users" ADD COLUMN "email" VARCHAR(255);
+```
+
+The first implementation supports a single linear revision chain. Branched heads, merge revisions, down migrations, stamping, and project scaffolding are tracked as separate follow-up issues.
+
 ### Per-table migration layout (`--out-dir`)
 
 The default DDL diff path writes one blob to stdout (or `--outfile`). For migrations you commit to git, `--out-dir` splits the output one file per table so `git log -- migrations/users/` is the history of the `users` table.

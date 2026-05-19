@@ -63,12 +63,15 @@ struct App {
 
 impl App {
     fn new(cli: &Cli) -> Self {
+        let source_url = cli.url.clone().unwrap_or_default();
+        let source_len = source_url.len();
+        let target_len = cli.target_url.as_ref().map_or(0, |u| u.len());
         Self {
             state: AppState::InputUrls,
-            source_url: cli.url.clone(),
+            source_url,
             target_url: cli.target_url.clone().unwrap_or_default(),
-            focused_field: if cli.url.is_empty() { 0 } else { 1 },
-            cursor_pos: [cli.url.len(), cli.target_url.as_ref().map_or(0, |u| u.len())],
+            focused_field: if source_len == 0 { 0 } else { 1 },
+            cursor_pos: [source_len, target_len],
             nodes: Vec::new(),
             selected_idx: 0,
             scroll_offset: 0,
@@ -855,7 +858,8 @@ async fn apply_ddl(app: &mut App) -> Result<Vec<db::StmtResult>> {
 
 fn make_cli(url: &str, trust_cert: bool) -> Cli {
     Cli {
-        url: url.to_string(),
+        command: None,
+        url: Some(url.to_string()),
         target_url: None,
         generator: "ddl".to_string(),
         target_dialect: None,
