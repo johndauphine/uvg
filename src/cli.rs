@@ -48,6 +48,19 @@ pub struct Cli {
     #[arg(long, default_value_t = 3)]
     pub apply_retries: u8,
 
+    /// Skip the parse-check step that runs before `--apply` would
+    /// touch the target. By default uvg pre-validates every DDL
+    /// statement via the dialect's parse-only mode:
+    ///   - PG: savepoint-per-statement inside one outer transaction,
+    ///     ROLLBACK at the end. Catches syntax errors AND catalog
+    ///     errors (missing references, wrong column types, etc.).
+    ///   - MSSQL: SET PARSEONLY ON. Catches syntax errors only;
+    ///     name resolution is deferred to real execution.
+    ///   - MySQL / SQLite: skipped (no parse-only mode).
+    /// Bad DDL surfaces before any real change is made.
+    #[arg(long)]
+    pub no_parse_check: bool,
+
     /// Tables to process (comma-delimited). Each item is a glob pattern
     /// (`*`, `?`, `[abc]`); bare names with no metacharacters match
     /// exactly. Default: all tables.
@@ -258,6 +271,7 @@ impl Cli {
                 apply: false,
                 progress: crate::apply_progress::ProgressMode::Auto,
                 apply_retries: 3,
+                no_parse_check: false,
                 tables: None,
                 exclude_tables: None,
                 schemas: None,
@@ -299,6 +313,7 @@ impl Cli {
             apply: false,
             progress: crate::apply_progress::ProgressMode::Auto,
             apply_retries: 3,
+            no_parse_check: false,
             tables: None,
             exclude_tables: None,
             schemas: None,
@@ -446,6 +461,7 @@ mod tests {
             apply: false,
             progress: crate::apply_progress::ProgressMode::Auto,
             apply_retries: 3,
+            no_parse_check: false,
             tables: None,
             exclude_tables: None,
             schemas: None,

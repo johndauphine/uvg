@@ -210,6 +210,150 @@ fn strip_leading_comments(s: &str) -> Option<String> {
     }
 }
 
+/// One statement-level parse error from `parse_check_ddl`.
+pub(crate) struct ParseError {
+    pub sql: String,
+    pub error: String,
+}
+
+/// `true` when the dialect supports a per-statement parse probe that
+/// won't commit. PG (`BEGIN`/`ROLLBACK`) and MSSQL (`SET PARSEONLY ON`)
+/// both qualify. MySQL has no clean parse-only mode (DDL auto-commits
+/// and there's no equivalent of `SET PARSEONLY`), and SQLite's
+/// `EXPLAIN` doesn't cover most DDL — both skip silently per #44.
+pub(crate) fn supports_parse_check(config: &ConnectionConfig) -> bool {
+    matches!(
+        config,
+        ConnectionConfig::Postgres(_) | ConnectionConfig::Mssql { .. }
+    )
+}
+
+/// Pre-validate every DDL statement by running it through the target
+/// dialect's parse-only mode without committing. Returns the list of
+/// statements that failed and their errors. Empty list = clean. The
+/// `Result` wrapper is for connection-level failures; per-statement
+/// failures land in the returned Vec, never in the outer Err.
+///
+/// Caller decides what to do with parse errors. The apply path aborts
+/// with the full list rather than only the first, so the user can
+/// fix all issues in one round.
+pub(crate) async fn parse_check_ddl(
+    config: &ConnectionConfig,
+    ddl: &str,
+) -> Result<Vec<ParseError>> {
+    let statements = split_statements(ddl);
+    let mut errors = Vec::new();
+
+    match config {
+        ConnectionConfig::Postgres(url) => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(url)
+                .await?;
+            // Single outer transaction holds all statements visible to
+            // later ones (a CREATE TABLE that references an earlier
+            // CREATE TYPE enum must see the enum during parse, or it
+            // false-positives "type does not exist"). Each statement
+            // runs inside a savepoint so its effects can be reverted
+            // on error without poisoning the outer tx — sqlx's nested
+            // `Transaction::begin()` lowers to SAVEPOINT/RELEASE.
+            // The outer ROLLBACK at the end undoes everything; no
+            // change reaches the database.
+            let mut outer = match pool.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    pool.close().await;
+                    return Err(e.into());
+                }
+            };
+            for (i, stmt) in statements.iter().enumerate() {
+                let sp = format!("uvg_sp_{i}");
+                if let Err(e) = sqlx::query(&format!("SAVEPOINT {sp}"))
+                    .execute(&mut *outer)
+                    .await
+                {
+                    // Savepoint creation should only fail at the
+                    // connection level; surface and stop probing.
+                    let _ = outer.rollback().await;
+                    pool.close().await;
+                    return Err(e.into());
+                }
+                match sqlx::query(stmt).execute(&mut *outer).await {
+                    Ok(_) => {
+                        // RELEASE SAVEPOINT — keep this statement's
+                        // effects visible to later probes within the
+                        // outer tx (a later CREATE TABLE may reference
+                        // a CREATE TYPE just declared).
+                        let _ = sqlx::query(&format!("RELEASE SAVEPOINT {sp}"))
+                            .execute(&mut *outer)
+                            .await;
+                    }
+                    Err(e) => {
+                        errors.push(ParseError {
+                            sql: stmt.clone(),
+                            error: e.to_string(),
+                        });
+                        // ROLLBACK TO SAVEPOINT — undo this statement
+                        // only; outer tx remains live so the probe
+                        // can continue with the next statement.
+                        let _ = sqlx::query(&format!("ROLLBACK TO SAVEPOINT {sp}"))
+                            .execute(&mut *outer)
+                            .await;
+                    }
+                }
+            }
+            let _ = outer.rollback().await;
+            pool.close().await;
+        }
+        ConnectionConfig::Mssql {
+            host,
+            port,
+            database,
+            user,
+            password,
+            trust_cert,
+        } => {
+            let mut client =
+                introspect::mssql::connect(host, *port, database, user, password, *trust_cert)
+                    .await?;
+            // Switch the session to parse-only mode. Per MS docs,
+            // PARSEONLY does pure T-SQL syntax checking — name
+            // resolution (missing tables, FK targets, column types)
+            // is DEFERRED to execution and is NOT caught here. So
+            // this probe catches typos and malformed DDL but not
+            // catalog-level errors. The PG probe (savepoint-per-stmt
+            // in one outer tx) catches both. SET PARSEONLY itself
+            // can't run in PARSEONLY mode, so toggling back is a
+            // real execution call.
+            if let Err(e) = client.execute("SET PARSEONLY ON".to_string(), &[]).await {
+                return Err(e.into());
+            }
+            for stmt in &statements {
+                if let Err(e) = client.execute(stmt.to_string(), &[]).await {
+                    errors.push(ParseError {
+                        sql: stmt.clone(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+            // Always reset; if PARSEONLY OFF itself fails the
+            // connection is closing anyway and that's the caller's
+            // problem to surface.
+            let _ = client
+                .execute("SET PARSEONLY OFF".to_string(), &[])
+                .await;
+        }
+        ConnectionConfig::Mysql(_) | ConnectionConfig::Sqlite(_) => {
+            // No parse-only mode. Caller is expected to gate this
+            // path with `supports_parse_check` and decide whether to
+            // skip silently or emit an info note. The apply path
+            // prints a one-line note rather than aborting.
+        }
+    }
+
+    Ok(errors)
+}
+
 /// Execute DDL statements one-by-one against the target database.
 /// Stops on first non-retryable error.
 ///
@@ -724,6 +868,32 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no retries on non-retryable");
         let err = outcome.error.expect("should surface immediately");
         assert!(err.contains("logical bug"), "got: {err}");
+    }
+
+    #[test]
+    fn supports_parse_check_only_pg_and_mssql() {
+        // PG (BEGIN/ROLLBACK) and MSSQL (SET PARSEONLY ON) both have
+        // server-side parse-only modes uvg can use. MySQL DDL
+        // auto-commits with no PARSEONLY equivalent; SQLite's EXPLAIN
+        // doesn't cover most DDL. Caller is expected to skip silently
+        // on the latter two.
+        assert!(supports_parse_check(&ConnectionConfig::Postgres(
+            "postgres://x".to_string()
+        )));
+        assert!(supports_parse_check(&ConnectionConfig::Mssql {
+            host: "x".to_string(),
+            port: 1433,
+            database: "x".to_string(),
+            user: "x".to_string(),
+            password: "x".to_string(),
+            trust_cert: false,
+        }));
+        assert!(!supports_parse_check(&ConnectionConfig::Mysql(
+            "mysql://x".to_string()
+        )));
+        assert!(!supports_parse_check(&ConnectionConfig::Sqlite(
+            "sqlite::memory:".to_string()
+        )));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
