@@ -433,13 +433,13 @@ fn flatten_for_comment(s: &str) -> String {
 // -------- time formatting (no chrono dep) --------
 
 /// Format UTC epoch seconds as `YYYYMMDDTHHMMSSZ` (compact, sortable).
-fn format_utc_compact(epoch_secs: u64) -> String {
+pub(crate) fn format_utc_compact(epoch_secs: u64) -> String {
     let (y, mo, d, h, mi, s) = epoch_to_ymdhms_utc(epoch_secs);
     format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z")
 }
 
 /// Format UTC epoch seconds as ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`.
-fn format_utc_iso8601(epoch_secs: u64) -> String {
+pub(crate) fn format_utc_iso8601(epoch_secs: u64) -> String {
     let (y, mo, d, h, mi, s) = epoch_to_ymdhms_utc(epoch_secs);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }

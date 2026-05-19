@@ -6,6 +6,7 @@ mod ddl_typemap;
 mod dialect;
 mod error;
 mod introspect;
+mod migrations;
 mod naming;
 mod output;
 mod schema;
@@ -36,6 +37,10 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(command) = cli.command.as_ref() {
+        return migrations::run(&cli, command).await;
+    }
 
     if cli.interactive {
         return tui::run(cli).await;
