@@ -16,8 +16,33 @@
 # Output: per-pair line + a final summary table written to
 # /tmp/uvg-matrix/results.tsv. Exit 0 if at least one pair succeeded,
 # non-zero only on infrastructure failures.
+#
+# Flags:
+#   --strict   Exit non-zero if ANY pair status is not "OK". Used by CI
+#              to gate merges; local-dev default stays permissive so a
+#              one-off probe of a single failing pair doesn't abort the
+#              whole suite.
 
 set -uo pipefail
+
+STRICT=0
+for arg in "$@"; do
+  case "$arg" in
+    --strict) STRICT=1 ;;
+    -h|--help)
+      # Print the leading header comment block (everything from line 2
+      # up to the first non-`#` line). Avoids hard-coding line numbers
+      # that drift as the script evolves, and never leaks code lines
+      # like `set -uo pipefail` into --help output.
+      awk 'NR==1{next} /^[[:space:]]*#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument '$arg' (try --help)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Locate the uvg binary. Prefer an explicit override, then a release
 # build inside the repo, then $PATH.
@@ -197,6 +222,12 @@ column -t -s $'\t' /tmp/uvg-matrix/results.tsv
 echo ""
 echo "Summary: ${ok_count}/9 OK, ${fail_count}/9 failed"
 
-# Exit non-zero if NOTHING worked — useful for CI gating.
-[[ $ok_count -eq 0 ]] && exit 1
+# --strict (CI): fail if any pair didn't reach OK. Default (local dev):
+# fail only if nothing worked, so a single broken pair while you're
+# iterating doesn't kill the whole suite.
+if [[ $STRICT -eq 1 ]]; then
+  [[ $fail_count -gt 0 ]] && exit 1
+else
+  [[ $ok_count -eq 0 ]] && exit 1
+fi
 exit 0

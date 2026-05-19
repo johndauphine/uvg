@@ -2,6 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/uvg.svg)](https://crates.io/crates/uvg)
 [![License](https://img.shields.io/crates/l/uvg.svg)](#license)
+[![CI](https://github.com/johndauphine/uvg/actions/workflows/ci.yml/badge.svg)](https://github.com/johndauphine/uvg/actions/workflows/ci.yml)
+[![Matrix](https://github.com/johndauphine/uvg/actions/workflows/matrix.yml/badge.svg)](https://github.com/johndauphine/uvg/actions/workflows/matrix.yml)
 
 Fast schema introspection for PostgreSQL, MySQL, SQLite, and MSSQL. Generates SQLAlchemy models, cross-dialect DDL, or migration diffs — with an interactive TUI for reviewing and applying changes. Drop-in replacement for [sqlacodegen](https://github.com/agronholm/sqlacodegen).
 
