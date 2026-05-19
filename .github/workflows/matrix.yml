@@ -125,8 +125,13 @@ jobs:
           wait_for "PostgreSQL" 30 \
             'docker exec pg-test pg_isready -U postgres -h localhost' \
             pg-test
+          # Real query over TCP, not `mysqladmin ping`. Ping returns
+          # success during the init phase when the temp socket is up
+          # but auth isn't ready yet — the next step then hits ENOENT
+          # when the socket gets torn down for re-init. SELECT 1 over
+          # TCP proves the listener, auth, and query path are all live.
           wait_for "MySQL" 60 \
-            'docker exec mysql-test mysqladmin ping -h localhost -uroot -pTestPass2024 --silent' \
+            'docker exec mysql-test mysql -h 127.0.0.1 -uroot -pTestPass2024 -e "SELECT 1"' \
             mysql-test
           wait_for "MSSQL" 60 \
             'sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -Q "SELECT 1"' \
@@ -146,10 +151,13 @@ jobs:
           PGPASSWORD=TestPass2024 docker exec -i pg-test psql -U postgres -d crm_pg < testdata/crm/crm_postgres.sql >/dev/null
 
       - name: Load MySQL CRM source
+        # Force TCP via -h 127.0.0.1 (matching the readiness check).
+        # Without it, mysql defaults to the Unix socket, which races
+        # with the entrypoint's init phase tearing the socket down.
         run: |
-          docker exec mysql-test mysql -uroot -pTestPass2024 \
+          docker exec mysql-test mysql -h 127.0.0.1 -uroot -pTestPass2024 \
             -e "CREATE DATABASE crm_mysql"
-          docker exec -i mysql-test mysql -uroot -pTestPass2024 crm_mysql < testdata/crm/crm_mysql.sql
+          docker exec -i mysql-test mysql -h 127.0.0.1 -uroot -pTestPass2024 crm_mysql < testdata/crm/crm_mysql.sql
 
       - name: Run CRM matrix (strict)
         run: bash testdata/crm/run_matrix.sh --strict
