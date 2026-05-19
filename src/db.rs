@@ -656,4 +656,91 @@ mod tests {
         let d = retry_delay_ms(0);
         assert!((90..=110).contains(&d), "attempt 0 should hit the 100ms tier, got {d}");
     }
+
+    // ---- run_with_retry behavior (#43) ----
+    // Uses `start_paused = true` so the backoff `tokio::time::sleep`
+    // calls auto-advance without real-time wall-clock waits — tests
+    // stay sub-millisecond even when exhausting the retry budget.
+
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retry_helper_retries_until_success() {
+        // Fail twice with retryable=true, succeed on the third call.
+        // max_retries=3 leaves enough budget; expect 3 invocations
+        // and a None error.
+        let calls = Arc::new(AtomicU8::new(0));
+        let calls_c = calls.clone();
+        let outcome = run_with_retry(3, move |_attempt| {
+            let calls = calls_c.clone();
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(("transient".to_string(), true))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(outcome.error.is_none(), "expected success after retries");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retry_helper_exhausts_budget_then_surfaces_error() {
+        // Always retryable. max_retries=2 → 1 initial + 2 retries = 3
+        // total invocations, terminal error after.
+        let calls = Arc::new(AtomicU8::new(0));
+        let calls_c = calls.clone();
+        let outcome = run_with_retry(2, move |_attempt| {
+            let calls = calls_c.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(("still transient".to_string(), true))
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "1 initial + 2 retries");
+        let err = outcome.error.expect("should surface terminal error");
+        assert!(err.contains("still transient"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retry_helper_does_not_retry_non_retryable() {
+        // retryable=false on the first failure: no retry budget
+        // consumed, exactly one invocation, error surfaces immediately.
+        let calls = Arc::new(AtomicU8::new(0));
+        let calls_c = calls.clone();
+        let outcome = run_with_retry(5, move |_attempt| {
+            let calls = calls_c.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(("logical bug".to_string(), false))
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retries on non-retryable");
+        let err = outcome.error.expect("should surface immediately");
+        assert!(err.contains("logical bug"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retry_helper_with_zero_retries_runs_once() {
+        // --apply-retries 0 should disable retry entirely: a single
+        // attempt, no second chance even for retryable errors.
+        let calls = Arc::new(AtomicU8::new(0));
+        let calls_c = calls.clone();
+        let outcome = run_with_retry(0, move |_attempt| {
+            let calls = calls_c.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(("transient".to_string(), true))
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "max_retries=0 means single attempt");
+        assert!(outcome.error.is_some());
+    }
 }
