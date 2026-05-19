@@ -24,11 +24,26 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Hygiene: read-only by default; the auto-open-issue step below
+# re-grants `issues: write` for itself only.
+permissions:
+  contents: read
+
+# Don't run two matrix jobs for the same branch in parallel — both
+# would try to bind host ports 1433/5432/3306 (different runners,
+# different VMs, so functionally fine, but it wastes CI minutes).
+concurrency:
+  group: matrix-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   matrix:
     name: CRM 9-pair matrix
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write  # for the scheduled-failure auto-issue step
 
     steps:
       - uses: actions/checkout@v4
@@ -50,10 +65,14 @@ jobs:
       # keeping the script unchanged means local dev and CI exercise
       # the same path.
       - name: Start MSSQL container
+        # MSSQL 2022 deprecated `SA_PASSWORD` in favor of
+        # `MSSQL_SA_PASSWORD`. Set the new name; current images still
+        # honor the old one but emit a warning and will eventually drop
+        # it. Keeping only the new var keeps logs clean.
         run: |
           docker run -d --name mssql-test \
             -e ACCEPT_EULA=Y \
-            -e SA_PASSWORD=TestPass2024 \
+            -e MSSQL_SA_PASSWORD=TestPass2024 \
             -e MSSQL_PID=Developer \
             -p 1433:1433 \
             mcr.microsoft.com/mssql/server:2022-latest
@@ -129,3 +148,26 @@ jobs:
           name: matrix-results
           path: /tmp/uvg-matrix/
           if-no-files-found: warn
+
+      - name: Open issue on nightly failure
+        # Only fires on the scheduled run — PR / push failures already
+        # surface as a red check on the PR/commit. The nightly is the
+        # one that can pass silently if no one's watching the badge.
+        # Dedupes by labeling and checking for an existing open issue.
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -e
+          existing=$(gh issue list --label nightly-matrix-failure --state open --json number --jq '.[0].number // empty')
+          today=$(date -u +%Y-%m-%d)
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "Nightly matrix failed again on $today: $RUN_URL"
+          else
+            gh label create nightly-matrix-failure --color FF0000 --description "Auto-opened by Matrix E2E workflow on a failing nightly run" 2>/dev/null || true
+            gh issue create \
+              --title "Nightly CRM matrix failure ($today)" \
+              --label nightly-matrix-failure \
+              --body "The nightly CRM matrix run failed. Run: $RUN_URL. This issue auto-opens when the scheduled Matrix E2E workflow fails; subsequent failures will comment here rather than opening new issues. Close once the matrix is green again."
+          fi

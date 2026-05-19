@@ -16,7 +16,23 @@
 set -euo pipefail
 
 CONTAINER="${MSSQL_CONTAINER:-mssql-test}"
-SQLCMD_IN_CONTAINER="/opt/mssql-tools18/bin/sqlcmd"
+
+# The sqlcmd binary moved between MSSQL image revisions:
+#   /opt/mssql-tools18/bin/sqlcmd   — newer 2022 cumulative updates
+#   /opt/mssql-tools/bin/sqlcmd     — older 2022 tags + 2019
+# Probe both so the shim survives an image-tag bump in either direction.
+SQLCMD_IN_CONTAINER=""
+for p in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do
+  if docker exec "$CONTAINER" test -x "$p" 2>/dev/null; then
+    SQLCMD_IN_CONTAINER="$p"
+    break
+  fi
+done
+if [[ -z "$SQLCMD_IN_CONTAINER" ]]; then
+  echo "error: sqlcmd not found inside container '$CONTAINER' at either" \
+    "/opt/mssql-tools18/bin/sqlcmd or /opt/mssql-tools/bin/sqlcmd" >&2
+  exit 1
+fi
 
 args=()
 input_file=""
