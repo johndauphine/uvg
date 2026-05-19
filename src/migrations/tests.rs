@@ -1,6 +1,10 @@
 use super::*;
 use crate::cli::ConnectionConfig;
+use crate::dialect::Dialect;
 use crate::output::Change;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmpdir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
