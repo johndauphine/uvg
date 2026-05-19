@@ -347,11 +347,9 @@ fn handle_input_keys(app: &mut App, key: KeyCode) {
                 app.state = AppState::Generating;
             }
         }
-        KeyCode::Esc => {
+        KeyCode::Esc if app.error_msg.is_some() => {
             // If there's an error showing, clear it; otherwise quit is handled in event_loop
-            if app.error_msg.is_some() {
-                app.error_msg = None;
-            }
+            app.error_msg = None;
         }
         _ => {}
     }
@@ -371,18 +369,16 @@ fn handle_view_keys(app: &mut App, key: KeyCode) {
     let multi = app.nodes.len() > 1;
 
     match key {
-        KeyCode::Up if multi => {
-            if app.selected_idx > 0 {
-                app.selected_idx -= 1;
-                app.scroll_offset = 0;
-            }
+        KeyCode::Up if multi && app.selected_idx > 0 => {
+            app.selected_idx -= 1;
+            app.scroll_offset = 0;
         }
-        KeyCode::Down if multi => {
-            if app.selected_idx + 1 < app.nodes.len() {
-                app.selected_idx += 1;
-                app.scroll_offset = 0;
-            }
+        KeyCode::Up if multi => {}
+        KeyCode::Down if multi && app.selected_idx + 1 < app.nodes.len() => {
+            app.selected_idx += 1;
+            app.scroll_offset = 0;
         }
+        KeyCode::Down if multi => {}
         KeyCode::Up | KeyCode::Char('k') => {
             app.scroll_offset = app.scroll_offset.saturating_sub(1);
         }
@@ -413,16 +409,16 @@ fn handle_view_keys(app: &mut App, key: KeyCode) {
                 n.checked = !any_checked;
             }
         }
-        KeyCode::Char('a') => {
+        KeyCode::Char('a')
+            if !app.empty_diff && count_statements(&collect_apply_sql(&app.nodes)) > 0 =>
+        {
             // checked_count > 0 isn't enough — a node can be checked
             // but contain only advisory comment SQL (SQLite ALTER
             // warnings, MSSQL drop-default notes). Apply must require
             // at least one executable statement, otherwise the user
             // sees "successfully applied 0 statement(s)" with no
             // actual change to the target.
-            if !app.empty_diff && count_statements(&collect_apply_sql(&app.nodes)) > 0 {
-                app.state = AppState::Confirming;
-            }
+            app.state = AppState::Confirming;
         }
         KeyCode::Char('q') | KeyCode::Esc => {
             app.state = AppState::InputUrls;
@@ -931,6 +927,55 @@ mod tests {
             table_name: table.map(|s| s.to_string()),
             sql: sql.to_string(),
         }
+    }
+
+    fn node(name: &str) -> TreeNode {
+        TreeNode {
+            name: name.to_string(),
+            changes: vec![ch("", Some(name), "CREATE TABLE t(id int);")],
+            checked: true,
+        }
+    }
+
+    fn view_app(nodes: Vec<TreeNode>) -> App {
+        App {
+            state: AppState::ViewDdl,
+            source_url: String::new(),
+            target_url: String::new(),
+            focused_field: 0,
+            cursor_pos: [0, 0],
+            nodes,
+            selected_idx: 0,
+            scroll_offset: 0,
+            empty_diff: false,
+            status_msg: String::new(),
+            error_msg: None,
+            success_msg: None,
+            apply_results: Vec::new(),
+            trust_cert: false,
+        }
+    }
+
+    #[test]
+    fn test_multi_node_up_down_boundaries_do_not_scroll_detail() {
+        let mut app = view_app(vec![node("users"), node("posts")]);
+        app.scroll_offset = 3;
+
+        handle_view_keys(&mut app, KeyCode::Up);
+        assert_eq!(app.selected_idx, 0);
+        assert_eq!(
+            app.scroll_offset, 3,
+            "Up at the first node should not fall through to detail scrolling",
+        );
+
+        app.selected_idx = 1;
+        app.scroll_offset = 4;
+        handle_view_keys(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_idx, 1);
+        assert_eq!(
+            app.scroll_offset, 4,
+            "Down at the last node should not fall through to detail scrolling",
+        );
     }
 
     #[test]
