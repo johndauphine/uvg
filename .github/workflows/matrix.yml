@@ -101,23 +101,36 @@ jobs:
           sqlcmd -? 2>/dev/null | head -1 || true
 
       - name: Wait for containers to accept connections
+        # `cmd && break` inside `set -e` doesn't fail the step when the
+        # loop times out — control just falls through. Track readiness
+        # explicitly and `exit 1` with container logs so a stuck DB
+        # doesn't silently let the rest of the job proceed and produce
+        # a confusing downstream error.
         run: |
           set -e
-          echo "Waiting for PostgreSQL..."
-          for i in $(seq 1 30); do
-            docker exec pg-test pg_isready -U postgres -h localhost >/dev/null 2>&1 && break
-            sleep 2
-          done
-          echo "Waiting for MySQL..."
-          for i in $(seq 1 60); do
-            docker exec mysql-test mysqladmin ping -h localhost -uroot -pTestPass2024 --silent 2>/dev/null && break
-            sleep 2
-          done
-          echo "Waiting for MSSQL..."
-          for i in $(seq 1 60); do
-            sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -Q "SELECT 1" >/dev/null 2>&1 && break
-            sleep 2
-          done
+          wait_for() {
+            local name=$1 attempts=$2 check_cmd=$3 logs_container=$4
+            echo "Waiting for $name (up to $((attempts * 2))s)..."
+            for i in $(seq 1 "$attempts"); do
+              if eval "$check_cmd" >/dev/null 2>&1; then
+                echo "$name ready after $((i * 2))s."
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$name never became ready; recent logs:" >&2
+            docker logs --tail 80 "$logs_container" >&2 || true
+            return 1
+          }
+          wait_for "PostgreSQL" 30 \
+            'docker exec pg-test pg_isready -U postgres -h localhost' \
+            pg-test
+          wait_for "MySQL" 60 \
+            'docker exec mysql-test mysqladmin ping -h localhost -uroot -pTestPass2024 --silent' \
+            mysql-test
+          wait_for "MSSQL" 60 \
+            'sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -Q "SELECT 1"' \
+            mssql-test
           echo "All three containers ready."
 
       - name: Load MSSQL CRM source

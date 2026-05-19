@@ -30,7 +30,11 @@ for arg in "$@"; do
   case "$arg" in
     --strict) STRICT=1 ;;
     -h|--help)
-      sed -n '2,28p' "$0" | sed 's/^# \?//'
+      # Print the leading header comment block (everything from line 2
+      # up to the first non-`#` line). Avoids hard-coding line numbers
+      # that drift as the script evolves, and never leaks code lines
+      # like `set -uo pipefail` into --help output.
+      awk 'NR==1{next} /^[[:space:]]*#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
       exit 0
       ;;
     *)
