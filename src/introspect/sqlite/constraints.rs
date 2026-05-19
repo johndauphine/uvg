@@ -2,6 +2,10 @@ use std::collections::BTreeMap;
 
 use sqlx::SqlitePool;
 
+use super::parse::{
+    create_table_body, extract_parenthesized_expression, find_keyword_ascii,
+    split_respecting_parens,
+};
 use crate::error::UvgError;
 use crate::schema::{ConstraintInfo, ForeignKeyInfo};
 
@@ -142,9 +146,8 @@ fn parse_check_constraints(create_sql: &str) -> Vec<ConstraintInfo> {
         return vec![];
     }
 
-    // Find the body between outer parentheses
-    let body = match (create_sql.find('('), create_sql.rfind(')')) {
-        (Some(start), Some(end)) if start < end => &create_sql[start + 1..end],
+    let body = match create_table_body(create_sql) {
+        Some(body) => body,
         _ => return vec![],
     };
 
@@ -159,83 +162,15 @@ fn parse_check_constraints(create_sql: &str) -> Vec<ConstraintInfo> {
         // byte-level ASCII comparison to avoid UTF-8 index mismatch.
         if let Some(check_pos) = find_keyword_ascii(trimmed, "CHECK") {
             let after_check = trimmed[check_pos + 5..].trim_start();
-            if after_check.starts_with('(') {
-                if let Some(expr) = extract_check_expression(after_check) {
-                    let name = format!("ck_{idx}");
-                    checks.push(ConstraintInfo::check(name, expr));
-                    idx += 1;
-                }
+            if let Some(expr) = extract_parenthesized_expression(after_check) {
+                let name = format!("ck_{idx}");
+                checks.push(ConstraintInfo::check(name, expr));
+                idx += 1;
             }
         }
     }
 
     checks
-}
-
-/// Case-insensitive ASCII search for a keyword in a string.
-/// Returns the byte offset in the original string, safe for slicing
-/// as long as the keyword is pure ASCII.
-fn find_keyword_ascii(haystack: &str, needle: &str) -> Option<usize> {
-    let needle_bytes = needle.as_bytes();
-    haystack
-        .as_bytes()
-        .windows(needle_bytes.len())
-        .position(|window| {
-            window
-                .iter()
-                .zip(needle_bytes.iter())
-                .all(|(h, n)| h.eq_ignore_ascii_case(n))
-        })
-}
-
-/// Extract the expression from "(...)" respecting nested parentheses.
-fn extract_check_expression(s: &str) -> Option<String> {
-    if !s.starts_with('(') {
-        return None;
-    }
-    let mut depth = 0;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(s[1..i].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split a string by commas, respecting nested parentheses and quoted strings.
-fn split_respecting_parens(s: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut depth: i32 = 0;
-    let mut in_quote = false;
-    let mut start = 0;
-
-    for (i, ch) in s.char_indices() {
-        if in_quote {
-            if ch == '\'' {
-                in_quote = false;
-            }
-            continue;
-        }
-        match ch {
-            '\'' => in_quote = true,
-            '(' => depth += 1,
-            ')' => depth = (depth - 1).max(0),
-            ',' if depth == 0 => {
-                result.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    result.push(&s[start..]);
-    result
 }
 
 struct FkAccumulator {

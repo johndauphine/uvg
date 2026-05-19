@@ -1,5 +1,6 @@
 use sqlx::SqlitePool;
 
+use super::parse::{create_table_body, first_token, identifier_matches, split_respecting_parens};
 use crate::error::UvgError;
 use crate::schema::ColumnInfo;
 
@@ -109,66 +110,25 @@ fn detect_autoincrement(create_sql: &str, column_name: &str) -> bool {
         return false;
     }
 
-    // Split the CREATE TABLE body into column definitions
-    // Find the content between the outer parentheses
-    let body = match (create_sql.find('('), create_sql.rfind(')')) {
-        (Some(start), Some(end)) if start < end => &create_sql[start + 1..end],
+    let body = match create_table_body(create_sql) {
+        Some(body) => body,
         _ => return false,
     };
 
-    // Split by commas, respecting nested parentheses
     let fragments = split_respecting_parens(body);
-    let col_upper = column_name.to_uppercase();
-
     for fragment in fragments {
         let trimmed = fragment.trim();
         let upper_frag = trimmed.to_uppercase();
 
         // Check if this fragment is the column definition for our column
         // Column name is the first token (possibly quoted)
-        let first_token = extract_first_token(trimmed);
-        if first_token.to_uppercase() == col_upper
-            || first_token.to_uppercase() == format!("\"{}\"", col_upper)
-        {
+        let token = first_token(trimmed);
+        if identifier_matches(token, column_name) {
             return upper_frag.contains("AUTOINCREMENT");
         }
     }
 
     false
-}
-
-/// Split a string by commas but respect nested parentheses.
-fn split_respecting_parens(s: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                result.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    result.push(&s[start..]);
-    result
-}
-
-/// Extract the first token from a column definition, handling quoted identifiers.
-fn extract_first_token(s: &str) -> &str {
-    let s = s.trim();
-    if let Some(stripped) = s.strip_prefix('"') {
-        // Quoted identifier
-        if let Some(end) = stripped.find('"') {
-            return &s[..end + 2];
-        }
-    }
-    // Unquoted: first word
-    s.split_whitespace().next().unwrap_or(s)
 }
 
 #[derive(sqlx::FromRow)]
