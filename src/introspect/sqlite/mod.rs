@@ -1,6 +1,7 @@
 mod columns;
 mod constraints;
 mod indexes;
+mod parse;
 mod tables;
 
 use sqlx::SqlitePool;
@@ -40,3 +41,7 @@ pub async fn introspect(
         domains: vec![],
     })
 }
+
+#[cfg(test)]
+#[path = "parse_tests.rs"]
+mod parse_tests;
