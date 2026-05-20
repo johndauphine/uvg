@@ -109,11 +109,7 @@ fn extract_model_name(block: &str) -> Option<String> {
 
     // "class Users(Base):" → "users" (only if block contains __tablename__)
     if first_line.starts_with("class ") && first_line.contains('(') {
-        let class_name = first_line
-            .strip_prefix("class ")?
-            .split('(')
-            .next()?
-            .trim();
+        let class_name = first_line.strip_prefix("class ")?.split('(').next()?.trim();
         // Must have __tablename__ to be a model (not an enum class or Base)
         let has_tablename = block.lines().skip(1).any(|line| {
             let trimmed = line.trim_start();
@@ -226,9 +222,9 @@ pub fn is_unique_constraint_index(
     if !index.is_unique {
         return false;
     }
-    constraints
-        .iter()
-        .any(|c| c.constraint_type == crate::schema::ConstraintType::Unique && c.columns == index.columns)
+    constraints.iter().any(|c| {
+        c.constraint_type == crate::schema::ConstraintType::Unique && c.columns == index.columns
+    })
 }
 
 /// Quote a list of column names for use in constraint arguments.
@@ -289,15 +285,12 @@ pub fn parse_check_enum(expression: &str) -> Option<(String, Vec<String>)> {
     // Find " IN (" (case-insensitive) using byte-level search to avoid
     // index mismatch from to_uppercase() on non-ASCII input.
     let needle = b" IN (";
-    let in_pos = expr
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| {
-            window
-                .iter()
-                .zip(needle.iter())
-                .all(|(b, n)| b.to_ascii_uppercase() == *n)
-        })?;
+    let in_pos = expr.as_bytes().windows(needle.len()).position(|window| {
+        window
+            .iter()
+            .zip(needle.iter())
+            .all(|(b, n)| b.to_ascii_uppercase() == *n)
+    })?;
     let col_part = expr[..in_pos].trim();
 
     // Extract column name (strip optional table prefix)
@@ -343,15 +336,12 @@ pub fn parse_check_boolean(expression: &str) -> Option<String> {
     let expr = expression.trim();
 
     let needle = b" IN (";
-    let in_pos = expr
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| {
-            window
-                .iter()
-                .zip(needle.iter())
-                .all(|(b, n)| b.to_ascii_uppercase() == *n)
-        })?;
+    let in_pos = expr.as_bytes().windows(needle.len()).position(|window| {
+        window
+            .iter()
+            .zip(needle.iter())
+            .all(|(b, n)| b.to_ascii_uppercase() == *n)
+    })?;
     let col_part = expr[..in_pos].trim();
 
     // Extract column name (strip optional schema.table prefix)
@@ -393,7 +383,13 @@ pub fn generate_enum_class(enum_info: &crate::schema::EnumInfo) -> String {
         let mut member_name: String = value
             .to_uppercase()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         if member_name.starts_with(|c: char| c.is_ascii_digit()) {
             member_name = format!("_{member_name}");
@@ -401,7 +397,10 @@ pub fn generate_enum_class(enum_info: &crate::schema::EnumInfo) -> String {
         if member_name.is_empty() {
             member_name = "_".to_string();
         }
-        lines.push(format!("    {member_name} = {}", format_python_string_literal(value)));
+        lines.push(format!(
+            "    {member_name} = {}",
+            format_python_string_literal(value)
+        ));
     }
     lines.join("\n")
 }
@@ -474,8 +473,10 @@ pub fn topo_sort_tables(tables: &[crate::schema::TableInfo]) -> Vec<&crate::sche
 
     // If there's a cycle, append remaining tables alphabetically
     if result.len() < n {
-        let in_result: std::collections::HashSet<usize> =
-            result.iter().map(|t| name_to_idx[t.name.as_str()]).collect();
+        let in_result: std::collections::HashSet<usize> = result
+            .iter()
+            .map(|t| name_to_idx[t.name.as_str()])
+            .collect();
         let mut remaining: Vec<(usize, &str)> = (0..n)
             .filter(|i| !in_result.contains(i))
             .map(|i| (i, tables[i].name.as_str()))
@@ -526,159 +527,5 @@ pub fn is_standard_sequence_name(seq_name: &str, table_name: &str, col_name: &st
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_server_default_pg() {
-        assert_eq!(
-            format_server_default("now()", Dialect::Postgres),
-            "text('now()')"
-        );
-        assert_eq!(
-            format_server_default("0", Dialect::Postgres),
-            "text('0')"
-        );
-    }
-
-    #[test]
-    fn test_strip_pg_typecast() {
-        assert_eq!(strip_pg_typecast("0::integer"), "0");
-        assert_eq!(strip_pg_typecast("'hello'::character varying"), "'hello'");
-        assert_eq!(strip_pg_typecast("now()"), "now()");
-        assert_eq!(
-            strip_pg_typecast("nextval('seq'::regclass)"),
-            "nextval('seq'::regclass)"
-        );
-    }
-
-    #[test]
-    fn test_format_server_default_mssql() {
-        assert_eq!(
-            format_server_default("((0))", Dialect::Mssql),
-            "text('0')"
-        );
-        assert_eq!(
-            format_server_default("(N'hello')", Dialect::Mssql),
-            "text(\"'hello'\")"
-        );
-        assert_eq!(
-            format_server_default("(getdate())", Dialect::Mssql),
-            "text('getdate()')"
-        );
-    }
-
-    #[test]
-    fn test_strip_mssql_parens() {
-        assert_eq!(strip_mssql_parens("((0))"), "0");
-        assert_eq!(strip_mssql_parens("(N'hello')"), "'hello'");
-        assert_eq!(strip_mssql_parens("(getdate())"), "getdate()");
-        assert_eq!(strip_mssql_parens("((1))"), "1");
-    }
-
-    #[test]
-    fn test_is_serial_default() {
-        assert!(is_serial_default("nextval('seq'::regclass)", Dialect::Postgres));
-        assert!(!is_serial_default("nextval('seq')", Dialect::Mssql));
-        assert!(!is_serial_default("((1))", Dialect::Mssql));
-    }
-
-    #[test]
-    fn test_split_python_declarative() {
-        let full = "\
-from typing import Optional
-
-from sqlalchemy import Integer, String
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-class Users(Base):
-    __tablename__ = 'users'
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-
-
-class Posts(Base):
-    __tablename__ = 'posts'
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-";
-        let files = split_python_output(full);
-        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-
-        assert!(names.contains(&"base.py"), "missing base.py: {names:?}");
-        assert!(names.contains(&"users.py"), "missing users.py: {names:?}");
-        assert!(names.contains(&"posts.py"), "missing posts.py: {names:?}");
-        assert!(names.contains(&"__init__.py"), "missing __init__.py: {names:?}");
-
-        // base.py should have imports and Base class
-        let base = &files.iter().find(|(n, _)| n == "base.py").unwrap().1;
-        assert!(base.contains("from sqlalchemy"), "base.py missing imports");
-        assert!(base.contains("class Base"), "base.py missing Base class");
-
-        // model files should have from .base import
-        let users = &files.iter().find(|(n, _)| n == "users.py").unwrap().1;
-        assert!(users.contains("from .base import"), "users.py missing base import");
-        assert!(users.contains("__tablename__"), "users.py missing tablename");
-    }
-
-    #[test]
-    fn test_split_python_enum_stays_in_base() {
-        let full = "\
-import enum
-
-from sqlalchemy import Enum, Integer, String
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-
-class StatusEnum(str, enum.Enum):
-    ACTIVE = 'active'
-    INACTIVE = 'inactive'
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-class Users(Base):
-    __tablename__ = 'users'
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-";
-        let files = split_python_output(full);
-        let base = &files.iter().find(|(n, _)| n == "base.py").unwrap().1;
-        assert!(base.contains("StatusEnum"), "enum should be in base.py");
-
-        // Enum should NOT be split into its own file
-        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(!names.contains(&"status_enum.py"), "enum should not be a separate file");
-    }
-
-    #[test]
-    fn test_split_python_tables_generator() {
-        // Tables generator uses double-newline separators
-        let full = "\
-from sqlalchemy import Column, Integer, MetaData, String, Table
-
-metadata = MetaData()
-
-t_users = Table(
-    'users', metadata,
-    Column('id', Integer, primary_key=True)
-)
-
-t_posts = Table(
-    'posts', metadata,
-    Column('id', Integer, primary_key=True)
-)
-";
-        let files = split_python_output(full);
-        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"t_users.py"), "missing t_users.py: {names:?}");
-        assert!(names.contains(&"t_posts.py"), "missing t_posts.py: {names:?}");
-    }
-}
+#[path = "tests.rs"]
+mod tests;

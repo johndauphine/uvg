@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::dialect::Dialect;
+
+pub const DEFAULT_INTROSPECT_CONCURRENCY: usize = 8;
 
 /// Generate SQLAlchemy model code from an existing database.
 ///
@@ -10,8 +12,15 @@ use crate::dialect::Dialect;
 #[derive(Parser, Debug)]
 #[command(name = "uvg", version, about)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    /// Named profile from ~/.config/uvg/profiles.yaml
+    #[arg(long, env = "UVG_PROFILE")]
+    pub profile: Option<String>,
+
     /// Source database URL (e.g. postgresql://, mysql://, sqlite:///path, mssql://)
-    pub url: String,
+    pub url: Option<String>,
 
     /// Target database URL for DDL generation/migration (optional)
     pub target_url: Option<String>,
@@ -28,17 +37,58 @@ pub struct Cli {
     #[arg(long)]
     pub split_tables: bool,
 
-    /// After generating the DDL diff, execute it against the target
-    /// database. Requires a target URL. With `--out-dir`, applies each
-    /// per-table file in manifest order (`_schema/` first, then tables
-    /// in topological FK order). Stops on the first failed statement and
-    /// exits non-zero.
+    /// Execute generated DDL against the target database after rendering it.
+    /// Requires a target URL. Combines naturally with `--out-dir`: the
+    /// per-table files are written first, then applied in manifest order.
+    /// Exits non-zero on the first failed statement.
     #[arg(long)]
     pub apply: bool,
 
-    /// Tables to process (comma-delimited)
+    /// Per-statement progress reporting on `--apply`. Default `auto`
+    /// emits when stderr is a terminal and stays silent when redirected.
+    #[arg(long, value_enum, default_value_t = crate::apply_progress::ProgressMode::Auto)]
+    pub progress: crate::apply_progress::ProgressMode,
+
+    /// Maximum retry attempts per statement on `--apply` for transient
+    /// errors (deadlock, lock-wait timeout, brief connection drops).
+    /// Logical errors (constraint, syntax, missing column) fail
+    /// immediately regardless. `0` disables retry; default `3`.
+    /// Backoff is 100ms / 500ms / 2s with jitter.
+    #[arg(long, default_value_t = 3)]
+    pub apply_retries: u8,
+
+    /// Skip the parse-check step that runs before `--apply` would
+    /// touch the target. By default uvg pre-validates every DDL
+    /// statement via the dialect's parse-only mode:
+    ///   - PG: savepoint-per-statement inside one outer transaction,
+    ///     ROLLBACK at the end. Catches syntax errors AND catalog
+    ///     errors (missing references, wrong column types, etc.).
+    ///   - MSSQL: SET PARSEONLY ON. Catches syntax errors only;
+    ///     name resolution is deferred to real execution.
+    ///   - MySQL / SQLite: skipped (no parse-only mode).
+    ///
+    /// Bad DDL surfaces before any real change is made.
+    #[arg(long)]
+    pub no_parse_check: bool,
+
+    /// Annotate DDL diff statements with AI-generated risk classes
+    #[arg(long)]
+    pub risk_classify: bool,
+
+    /// Concurrent table metadata queries for PostgreSQL/MySQL introspection
+    #[arg(long, env = "UVG_INTROSPECT_CONCURRENCY", default_value_t = DEFAULT_INTROSPECT_CONCURRENCY, value_parser = parse_positive_usize)]
+    pub introspect_concurrency: usize,
+
+    /// Tables to process (comma-delimited). Each item is a glob pattern
+    /// (`*`, `?`, `[abc]`); bare names with no metacharacters match
+    /// exactly. Default: all tables.
     #[arg(long)]
     pub tables: Option<String>,
+
+    /// Tables to exclude (comma-delimited), evaluated after `--tables`.
+    /// Same glob syntax as `--tables`.
+    #[arg(long)]
+    pub exclude_tables: Option<String>,
 
     /// Schemas to load (comma-delimited)
     #[arg(long)]
@@ -76,6 +126,144 @@ pub struct Cli {
     /// Launch interactive TUI for DDL diff and apply
     #[arg(long, short = 'i')]
     pub interactive: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Scaffold a migrations directory and project config
+    Init(InitCommand),
+
+    /// Generate a versioned migration file from a source/target diff
+    Revision(RevisionCommand),
+
+    /// Apply pending versioned migrations to a target database
+    Upgrade(UpgradeCommand),
+
+    /// Roll back versioned migrations on a target database
+    Downgrade(DowngradeCommand),
+
+    /// Create a merge revision from multiple migration heads
+    Merge(MergeCommand),
+
+    /// Mark a target database at a revision without running migrations
+    Stamp(StampCommand),
+
+    /// Print the target database's current uvg revision
+    Current(CurrentCommand),
+
+    /// Show the local migration graph
+    History(HistoryCommand),
+
+    /// Capture an introspected schema snapshot as YAML
+    Snapshot(SnapshotCommand),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InitCommand {
+    /// Directory for versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+
+    /// Project-local config file to create
+    #[arg(long, default_value = "./uvg.toml")]
+    pub config: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RevisionCommand {
+    /// Source database URL to diff from
+    pub source_url: String,
+
+    /// Target database URL to converge
+    pub target_url: String,
+
+    /// Human-readable migration description
+    #[arg(long, short = 'm')]
+    pub message: String,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UpgradeCommand {
+    /// Target database URL to apply migrations to
+    pub target_url: String,
+
+    /// Revision to upgrade to; defaults to head
+    pub revision: Option<String>,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DowngradeCommand {
+    /// Target database URL to roll back
+    pub target_url: String,
+
+    /// Revision to downgrade to; defaults to one revision back
+    pub revision: Option<String>,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MergeCommand {
+    /// Human-readable merge revision description
+    #[arg(long, short = 'm')]
+    pub message: String,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct StampCommand {
+    /// Target database URL to stamp
+    pub target_url: String,
+
+    /// Existing migration revision to record
+    pub revision: String,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+
+    /// Skip confirmation prompt
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CurrentCommand {
+    /// Target database URL to inspect
+    pub target_url: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HistoryCommand {
+    /// Optional target database URL; marks applied/current revisions when provided
+    pub target_url: Option<String>,
+
+    /// Directory containing versioned migration files
+    #[arg(long, default_value = "./migrations")]
+    pub migrations_dir: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SnapshotCommand {
+    /// Database URL to snapshot
+    pub url: String,
+
+    /// Output snapshot YAML file
+    #[arg(long, short = 'o')]
+    pub output: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -145,25 +333,14 @@ impl ConnectionConfig {
     }
 }
 
-/// Redact the password component of a database connection URL so it
-/// can be safely printed to stderr / logs. Returns a URL with the
-/// password replaced by `***` if one was present; non-URL strings
-/// pass through unchanged (no parseable secret to redact).
-///
-/// Used by `--apply` summary messages, which often land in CI logs.
-pub(crate) fn redact_url(raw: &str) -> String {
-    match url::Url::parse(raw) {
-        Ok(mut u) if u.password().is_some() => {
-            // set_password may fail for opaque-scheme URLs; fall back
-            // to the raw string in that case.
-            if u.set_password(Some("***")).is_ok() {
-                u.to_string()
-            } else {
-                raw.to_string()
-            }
-        }
-        _ => raw.to_string(),
-    }
+/// Split a comma-delimited CLI value, trimming whitespace and dropping
+/// empty entries. `None` / empty string produce an empty vec.
+fn split_csv(raw: Option<&str>) -> Vec<String> {
+    let Some(s) = raw else { return Vec::new() };
+    s.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// Ensure a MySQL URL includes `charset=utf8mb4` so that `information_schema`
@@ -181,13 +358,48 @@ fn ensure_mysql_charset(url: &str) -> String {
     parsed.into()
 }
 
+fn parse_positive_usize(raw: &str) -> Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|e| format!("expected positive integer: {e}"))?;
+    if value == 0 {
+        return Err("must be at least 1".to_string());
+    }
+    Ok(value)
+}
+
 impl Cli {
-    /// Parse the comma-delimited --tables flag into a Vec of table names.
+    /// Parse CLI args and then apply any requested named profile.
+    ///
+    /// clap's derive parser gives us final values, but profile merging needs
+    /// to know which values came from the command line so explicit flags can
+    /// win over profile defaults.
+    pub fn parse_with_profile() -> anyhow::Result<Self> {
+        let matches = Self::command().get_matches();
+        let mut cli =
+            Self::from_arg_matches(&matches).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        crate::profile::apply_requested_profile(&mut cli, &matches)?;
+        Ok(cli)
+    }
+
+    /// Parse the comma-delimited --tables flag into a Vec of glob patterns.
+    /// Bare names with no metacharacters degenerate to exact-match (back-compat
+    /// with the original exact-name behavior). Empty / missing flag → empty vec.
     pub fn table_list(&self) -> Vec<String> {
-        self.tables
-            .as_deref()
-            .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-            .unwrap_or_default()
+        split_csv(self.tables.as_deref())
+    }
+
+    /// Parse the comma-delimited --exclude-tables flag into a Vec of glob
+    /// patterns. Same syntax and degeneration rule as `table_list`.
+    pub fn exclude_table_list(&self) -> Vec<String> {
+        split_csv(self.exclude_tables.as_deref())
+    }
+
+    /// Build a `TableFilter` from `--tables` and `--exclude-tables`.
+    /// Validates every glob pattern up front so bad input surfaces
+    /// before any DB connection is opened.
+    pub fn table_filter(&self) -> Result<crate::table_filter::TableFilter, crate::error::UvgError> {
+        crate::table_filter::TableFilter::new(&self.table_list(), &self.exclude_table_list())
     }
 
     /// Parse the comma-delimited --schemas flag, falling back to the given default.
@@ -224,29 +436,25 @@ impl Cli {
         &self,
         source_dialect: Dialect,
     ) -> Result<DdlOptions, crate::error::UvgError> {
+        self.ddl_options_with_target_dialect(source_dialect, None)
+    }
+
+    /// Build DDL-specific options with an optional already-loaded target
+    /// dialect. This matters for `@snapshot.yaml` targets, where there is no
+    /// URL scheme to infer from.
+    pub fn ddl_options_with_target_dialect(
+        &self,
+        source_dialect: Dialect,
+        target_dialect_hint: Option<Dialect>,
+    ) -> Result<DdlOptions, crate::error::UvgError> {
         let target_dialect = if let Some(ref td) = self.target_dialect {
             td.parse::<Dialect>()
-                .map_err(|e| crate::error::UvgError::InvalidDialect(e))?
+                .map_err(crate::error::UvgError::InvalidDialect)?
+        } else if let Some(dialect) = target_dialect_hint {
+            dialect
         } else if let Some(ref target_url) = self.target_url {
             // Infer dialect from target URL scheme
-            let cli = Cli {
-                url: target_url.clone(),
-                target_url: None,
-                generator: String::new(),
-                target_dialect: None,
-                split_tables: false,
-                apply: false,
-                tables: None,
-                schemas: None,
-                noviews: false,
-                options: None,
-                outfile: None,
-                out_dir: None,
-                name: None,
-                trust_cert: self.trust_cert,
-                interactive: false,
-            };
-            cli.parse_connection()?.dialect()
+            self.parse_connection_url(target_url)?.dialect()
         } else {
             source_dialect
         };
@@ -267,30 +475,24 @@ impl Cli {
         &self,
         target_url: &str,
     ) -> Result<ConnectionConfig, crate::error::UvgError> {
-        let cli = Cli {
-            url: target_url.to_string(),
-            target_url: None,
-            generator: String::new(),
-            target_dialect: None,
-            split_tables: false,
-            apply: false,
-            tables: None,
-            schemas: None,
-            noviews: false,
-            options: None,
-            outfile: None,
-            out_dir: None,
-            name: None,
-            trust_cert: self.trust_cert,
-            interactive: false,
-        };
-        cli.parse_connection()
+        self.parse_connection_url(target_url)
     }
 
     /// Parse the URL into a `ConnectionConfig`.
     pub fn parse_connection(&self) -> Result<ConnectionConfig, crate::error::UvgError> {
-        let url = &self.url;
+        let Some(url) = self.url.as_deref() else {
+            return Err(crate::error::UvgError::Connection(
+                "database URL is required".to_string(),
+            ));
+        };
+        self.parse_connection_url(url)
+    }
 
+    /// Parse a URL string into a `ConnectionConfig`.
+    pub fn parse_connection_url(
+        &self,
+        url: &str,
+    ) -> Result<ConnectionConfig, crate::error::UvgError> {
         // PostgreSQL schemes
         if let Some(rest) = url
             .strip_prefix("postgresql+psycopg2://")
@@ -300,7 +502,7 @@ impl Cli {
             return Ok(ConnectionConfig::Postgres(format!("postgres://{rest}")));
         }
         if url.starts_with("postgresql://") || url.starts_with("postgres://") {
-            return Ok(ConnectionConfig::Postgres(url.clone()));
+            return Ok(ConnectionConfig::Postgres(url.to_string()));
         }
 
         // MSSQL schemes
@@ -407,161 +609,5 @@ impl Cli {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cli_with_url(url: &str) -> Cli {
-        Cli {
-            url: url.to_string(),
-            target_url: None,
-            generator: "declarative".to_string(),
-            target_dialect: None,
-            split_tables: false,
-            apply: false,
-            tables: None,
-            schemas: None,
-            noviews: false,
-            options: None,
-            outfile: None,
-            out_dir: None,
-            name: None,
-            trust_cert: false,
-            interactive: false,
-        }
-    }
-
-    #[test]
-    fn test_mysql_url() {
-        let cli = cli_with_url("mysql://user:pass@localhost/mydb");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.dialect(), Dialect::Mysql);
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4"));
-    }
-
-    #[test]
-    fn test_mysql_pymysql_url() {
-        let cli = cli_with_url("mysql+pymysql://user:pass@localhost/mydb");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.dialect(), Dialect::Mysql);
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4"));
-    }
-
-    #[test]
-    fn test_mariadb_url() {
-        let cli = cli_with_url("mariadb://user:pass@localhost/mydb");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.dialect(), Dialect::Mysql);
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4"));
-    }
-
-    #[test]
-    fn test_mariadb_pymysql_url() {
-        let cli = cli_with_url("mariadb+pymysql://user:pass@localhost/mydb");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.dialect(), Dialect::Mysql);
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=utf8mb4"));
-    }
-
-    #[test]
-    fn test_mysql_preserves_existing_charset() {
-        let cli = cli_with_url("mysql://user:pass@localhost/mydb?charset=latin1");
-        let config = cli.parse_connection().unwrap();
-        assert!(matches!(config, ConnectionConfig::Mysql(ref u) if u == "mysql://user:pass@localhost/mydb?charset=latin1"));
-    }
-
-    #[test]
-    fn test_mysql_database_name() {
-        let cli = cli_with_url("mysql://user:pass@localhost/testdb");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.database_name(), Some("testdb".to_string()));
-    }
-
-    #[test]
-    fn test_sqlite_relative_path() {
-        let cli = cli_with_url("sqlite:///test.db");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.dialect(), Dialect::Sqlite);
-        assert!(matches!(config, ConnectionConfig::Sqlite(ref u) if u == "sqlite:test.db"));
-    }
-
-    #[test]
-    fn test_sqlite_absolute_path() {
-        let cli = cli_with_url("sqlite:////tmp/test.db");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.dialect(), Dialect::Sqlite);
-        assert!(matches!(config, ConnectionConfig::Sqlite(ref u) if u == "sqlite:///tmp/test.db"));
-    }
-
-    #[test]
-    fn test_sqlite_memory() {
-        let cli = cli_with_url("sqlite:///:memory:");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.dialect(), Dialect::Sqlite);
-        assert!(matches!(config, ConnectionConfig::Sqlite(ref u) if u == "sqlite::memory:"));
-    }
-
-    #[test]
-    fn test_postgres_url_unchanged() {
-        let cli = cli_with_url("postgresql://user:pass@localhost/mydb");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.dialect(), Dialect::Postgres);
-    }
-
-    #[test]
-    fn test_unsupported_scheme() {
-        let cli = cli_with_url("oracle://user:pass@localhost/mydb");
-        let result = cli.parse_connection();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_non_mysql_database_name() {
-        let cli = cli_with_url("postgresql://user:pass@localhost/testdb");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.database_name(), None);
-    }
-
-    #[test]
-    fn test_mysql_empty_database_name() {
-        let cli = cli_with_url("mysql://user:pass@host/");
-        let config = cli.parse_connection().unwrap();
-        assert_eq!(config.database_name(), None);
-    }
-
-    #[test]
-    fn test_redact_url_strips_password() {
-        // Regression: codex round 1 on the --apply branch caught that
-        // raw target URLs landed in stderr summaries, leaking embedded
-        // passwords to CI logs. redact_url replaces the password with
-        // *** so the summary stays informative without spilling secrets.
-        assert_eq!(
-            redact_url("postgres://leakuser:supersecret@host:5432/db"),
-            "postgres://leakuser:***@host:5432/db"
-        );
-        assert_eq!(
-            redact_url("mysql://root:hunter2@example.com/mydb"),
-            "mysql://root:***@example.com/mydb"
-        );
-        assert_eq!(
-            redact_url("mssql://sa:TopSecret@localhost:1433/CRM"),
-            "mssql://sa:***@localhost:1433/CRM"
-        );
-    }
-
-    #[test]
-    fn test_redact_url_leaves_safe_strings_alone() {
-        // No password component → return as-is. Covers sqlite paths
-        // (no credentials in the URL at all) and URLs with a user but
-        // no password (nothing secret to redact).
-        assert_eq!(
-            redact_url("sqlite:///tmp/test.db"),
-            "sqlite:///tmp/test.db"
-        );
-        assert_eq!(
-            redact_url("postgres://justauser@host/db"),
-            "postgres://justauser@host/db"
-        );
-        // Non-URL strings pass through; nothing to redact.
-        assert_eq!(redact_url("not a url"), "not a url");
-    }
-}
+#[path = "cli_tests.rs"]
+mod tests;

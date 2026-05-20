@@ -8,15 +8,18 @@ use sqlx::PgPool;
 use crate::cli::GeneratorOptions;
 use crate::dialect::Dialect;
 use crate::error::UvgError;
+use crate::introspect::populate_tables_concurrently;
 use crate::schema::{EnumInfo, IntrospectedSchema};
+use crate::table_filter::TableFilter;
 
 /// Introspect a PostgreSQL database and return the full schema metadata.
 pub async fn introspect(
     pool: &PgPool,
     schemas: &[String],
-    table_filter: &[String],
+    table_filter: &TableFilter,
     noviews: bool,
     _options: &GeneratorOptions,
+    concurrency: usize,
 ) -> Result<IntrospectedSchema, UvgError> {
     let mut all_tables = Vec::new();
     let mut all_enums = Vec::new();
@@ -24,18 +27,17 @@ pub async fn introspect(
     for schema in schemas {
         let mut schema_tables = tables::query_tables(pool, schema, noviews).await?;
 
-        // Apply table filter if specified
-        if !table_filter.is_empty() {
-            schema_tables.retain(|t| table_filter.contains(&t.name));
-        }
+        schema_tables.retain(|t| table_filter.matches(&t.name));
 
-        // Populate columns, constraints, and indexes for each table
-        for table in &mut schema_tables {
-            table.columns = columns::query_columns(pool, &table.schema, &table.name).await?;
-            table.constraints =
-                constraints::query_constraints(pool, &table.schema, &table.name).await?;
-            table.indexes = indexes::query_indexes(pool, &table.schema, &table.name).await?;
-        }
+        let schema_tables =
+            populate_tables_concurrently(schema_tables, concurrency, |mut table| async move {
+                table.columns = columns::query_columns(pool, &table.schema, &table.name).await?;
+                table.constraints =
+                    constraints::query_constraints(pool, &table.schema, &table.name).await?;
+                table.indexes = indexes::query_indexes(pool, &table.schema, &table.name).await?;
+                Ok(table)
+            })
+            .await?;
 
         all_tables.extend(schema_tables);
 

@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
-
 use sqlx::PgPool;
 
 use crate::error::UvgError;
-use crate::schema::{ConstraintInfo, ConstraintType, ForeignKeyInfo};
+use crate::introspect::grouping::{
+    foreign_key_constraints, primary_key_constraints, unique_constraints, ForeignKeyColumn,
+};
+use crate::schema::ConstraintInfo;
 
 pub async fn query_constraints(
     pool: &PgPool,
@@ -29,23 +30,9 @@ pub async fn query_constraints(
     .fetch_all(pool)
     .await?;
 
-    // Group PK columns by constraint name
-    let mut pk_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in pk_rows {
-        pk_map
-            .entry(row.constraint_name)
-            .or_default()
-            .push(row.column_name);
-    }
-    for (name, columns) in pk_map {
-        constraints.push(ConstraintInfo {
-            name,
-            constraint_type: ConstraintType::PrimaryKey,
-            columns,
-            foreign_key: None,
-            check_expression: None,
-        });
-    }
+    constraints.extend(primary_key_constraints(pk_rows, |row| {
+        (row.constraint_name, row.column_name)
+    }));
 
     // Foreign keys
     let fk_rows = sqlx::query_as::<_, FkRow>(
@@ -74,41 +61,17 @@ pub async fn query_constraints(
     .fetch_all(pool)
     .await?;
 
-    // Group FK columns by constraint name
-    let mut fk_map: BTreeMap<String, FkAccumulator> = BTreeMap::new();
-    for row in fk_rows {
-        let acc = fk_map
-            .entry(row.constraint_name.clone())
-            .or_insert_with(|| FkAccumulator {
-                columns: Vec::new(),
-                ref_schema: row.ref_schema.clone(),
-                ref_table: row.ref_table.clone(),
-                ref_columns: Vec::new(),
-                update_rule: row.update_rule.clone(),
-                delete_rule: row.delete_rule.clone(),
-            });
-        if !acc.columns.contains(&row.column_name) {
-            acc.columns.push(row.column_name);
+    constraints.extend(foreign_key_constraints(fk_rows.into_iter().map(|row| {
+        ForeignKeyColumn {
+            constraint_name: row.constraint_name,
+            column: row.column_name,
+            ref_schema: row.ref_schema,
+            ref_table: row.ref_table,
+            ref_column: row.ref_column,
+            update_rule: row.update_rule,
+            delete_rule: row.delete_rule,
         }
-        if !acc.ref_columns.contains(&row.ref_column) {
-            acc.ref_columns.push(row.ref_column);
-        }
-    }
-    for (name, acc) in fk_map {
-        constraints.push(ConstraintInfo {
-            name,
-            constraint_type: ConstraintType::ForeignKey,
-            columns: acc.columns,
-            foreign_key: Some(ForeignKeyInfo {
-                ref_schema: acc.ref_schema,
-                ref_table: acc.ref_table,
-                ref_columns: acc.ref_columns,
-                update_rule: acc.update_rule,
-                delete_rule: acc.delete_rule,
-            }),
-            check_expression: None,
-        });
-    }
+    })));
 
     // Unique constraints
     let uq_rows = sqlx::query_as::<_, UqRow>(
@@ -127,22 +90,9 @@ pub async fn query_constraints(
     .fetch_all(pool)
     .await?;
 
-    let mut uq_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in uq_rows {
-        uq_map
-            .entry(row.constraint_name)
-            .or_default()
-            .push(row.column_name);
-    }
-    for (name, columns) in uq_map {
-        constraints.push(ConstraintInfo {
-            name,
-            constraint_type: ConstraintType::Unique,
-            columns,
-            foreign_key: None,
-            check_expression: None,
-        });
-    }
+    constraints.extend(unique_constraints(uq_rows, |row| {
+        (row.constraint_name, row.column_name)
+    }));
 
     // CHECK constraints. pg_constraint.contype='c' is the catalog-side filter;
     // pg_get_constraintdef returns a readable predicate string like
@@ -172,13 +122,7 @@ pub async fn query_constraints(
         // emitter doesn't double-wrap. Also strip any leading "NOT VALID"
         // suffix which constraint metadata can carry but isn't predicate.
         let predicate = strip_check_wrapper(&row.predicate);
-        constraints.push(ConstraintInfo {
-            name: row.constraint_name,
-            constraint_type: ConstraintType::Check,
-            columns: vec![],
-            foreign_key: None,
-            check_expression: Some(predicate),
-        });
+        constraints.push(ConstraintInfo::check(row.constraint_name, predicate));
     }
 
     Ok(constraints)
@@ -224,15 +168,6 @@ fn strip_check_wrapper(def: &str) -> String {
     trimmed
 }
 
-struct FkAccumulator {
-    columns: Vec<String>,
-    ref_schema: String,
-    ref_table: String,
-    ref_columns: Vec<String>,
-    update_rule: String,
-    delete_rule: String,
-}
-
 #[derive(sqlx::FromRow)]
 struct PkRow {
     column_name: String,
@@ -263,37 +198,5 @@ struct ChkRow {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::strip_check_wrapper;
-
-    #[test]
-    fn strips_check_wrapper() {
-        assert_eq!(strip_check_wrapper("CHECK (x > 0)"), "x > 0");
-        assert_eq!(strip_check_wrapper("CHECK ((x > 0))"), "(x > 0)");
-        assert_eq!(
-            strip_check_wrapper("  CHECK (a IS NOT NULL)  "),
-            "a IS NOT NULL"
-        );
-        // Defensive: unrecognized format returns input unchanged.
-        assert_eq!(strip_check_wrapper("(x > 0)"), "(x > 0)");
-    }
-
-    #[test]
-    fn strips_check_wrapper_with_trailing_modifiers() {
-        // PG's pg_get_constraintdef emits trailing NOT VALID / NO INHERIT
-        // for constraints created with those clauses. Without stripping,
-        // the wrapper match would miss and the emitter would double-wrap
-        // as `CHECK (CHECK (...) NOT VALID)`. Per Copilot review on PR #37.
-        assert_eq!(strip_check_wrapper("CHECK (x > 0) NOT VALID"), "x > 0");
-        assert_eq!(strip_check_wrapper("CHECK ((x > 0)) NO INHERIT"), "(x > 0)");
-        assert_eq!(
-            strip_check_wrapper("CHECK (a IS NOT NULL) NOT VALID NO INHERIT"),
-            "a IS NOT NULL"
-        );
-        // Order independence — NO INHERIT can come before NOT VALID too.
-        assert_eq!(
-            strip_check_wrapper("CHECK (a IS NOT NULL) NO INHERIT NOT VALID"),
-            "a IS NOT NULL"
-        );
-    }
-}
+#[path = "constraints_tests.rs"]
+mod tests;

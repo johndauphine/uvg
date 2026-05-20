@@ -35,28 +35,52 @@ pub fn map_column_type_dialect(col: &ColumnInfo) -> MappedType {
                 Some(n) => format!("VARCHAR({n})"),
                 None => "VARCHAR".to_string(),
             };
-            MappedType { sa_type, python_type: "str".to_string(), import_module: ms.to_string(), import_name: "VARCHAR".to_string(), element_import: None }
+            MappedType {
+                sa_type,
+                python_type: "str".to_string(),
+                import_module: ms.to_string(),
+                import_name: "VARCHAR".to_string(),
+                element_import: None,
+            }
         }
         "char" => {
             let sa_type = match col.character_maximum_length {
                 Some(n) => format!("CHAR({n})"),
                 None => "CHAR".to_string(),
             };
-            MappedType { sa_type, python_type: "str".to_string(), import_module: ms.to_string(), import_name: "CHAR".to_string(), element_import: None }
+            MappedType {
+                sa_type,
+                python_type: "str".to_string(),
+                import_module: ms.to_string(),
+                import_name: "CHAR".to_string(),
+                element_import: None,
+            }
         }
         "nvarchar" => {
             let sa_type = match col.character_maximum_length {
                 Some(n) => format!("NVARCHAR({n})"),
                 None => "NVARCHAR".to_string(),
             };
-            MappedType { sa_type, python_type: "str".to_string(), import_module: ms.to_string(), import_name: "NVARCHAR".to_string(), element_import: None }
+            MappedType {
+                sa_type,
+                python_type: "str".to_string(),
+                import_module: ms.to_string(),
+                import_name: "NVARCHAR".to_string(),
+                element_import: None,
+            }
         }
         "nchar" => {
             let sa_type = match col.character_maximum_length {
                 Some(n) => format!("NCHAR({n})"),
                 None => "NCHAR".to_string(),
             };
-            MappedType { sa_type, python_type: "str".to_string(), import_module: ms.to_string(), import_name: "NCHAR".to_string(), element_import: None }
+            MappedType {
+                sa_type,
+                python_type: "str".to_string(),
+                import_module: ms.to_string(),
+                import_name: "NCHAR".to_string(),
+                element_import: None,
+            }
         }
         "text" => simple("TEXT", "str", ms),
         "ntext" => simple("NTEXT", "str", ms),
@@ -121,7 +145,11 @@ pub fn map_column_type(col: &ColumnInfo) -> MappedType {
             element_import: None,
         },
         "varchar" | "char" => {
-            let sa_type = format_string_type("String", col.character_maximum_length, col.collation.as_deref());
+            let sa_type = format_string_type(
+                "String",
+                col.character_maximum_length,
+                col.collation.as_deref(),
+            );
             MappedType {
                 sa_type,
                 python_type: "str".to_string(),
@@ -131,7 +159,11 @@ pub fn map_column_type(col: &ColumnInfo) -> MappedType {
             }
         }
         "nvarchar" | "nchar" => {
-            let sa_type = format_string_type("Unicode", col.character_maximum_length, col.collation.as_deref());
+            let sa_type = format_string_type(
+                "Unicode",
+                col.character_maximum_length,
+                col.collation.as_deref(),
+            );
             MappedType {
                 sa_type,
                 python_type: "str".to_string(),
@@ -155,9 +187,7 @@ pub fn map_column_type(col: &ColumnInfo) -> MappedType {
         },
         "date" => simple("Date", "datetime.date", "sqlalchemy"),
         "time" => simple("Time", "datetime.time", "sqlalchemy"),
-        "uniqueidentifier" => {
-            simple("UNIQUEIDENTIFIER", "str", "sqlalchemy.dialects.mssql")
-        }
+        "uniqueidentifier" => simple("UNIQUEIDENTIFIER", "str", "sqlalchemy.dialects.mssql"),
         // Fallback: use the data_type as-is, uppercased
         other => MappedType {
             sa_type: other.to_uppercase(),
@@ -181,124 +211,5 @@ fn format_string_type(base: &str, length: Option<i32>, collation: Option<&str>) 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testutil::test_column;
-
-    fn col(udt_name: &str) -> ColumnInfo {
-        ColumnInfo {
-            udt_name: udt_name.to_string(),
-            data_type: udt_name.to_string(),
-            ..test_column("test")
-        }
-    }
-
-    fn col_with_length(udt_name: &str, len: i32) -> ColumnInfo {
-        ColumnInfo {
-            character_maximum_length: Some(len),
-            ..col(udt_name)
-        }
-    }
-
-    fn col_with_precision(udt_name: &str, precision: i32, scale: i32) -> ColumnInfo {
-        ColumnInfo {
-            numeric_precision: Some(precision),
-            numeric_scale: Some(scale),
-            ..col(udt_name)
-        }
-    }
-
-    #[test]
-    fn test_bit() {
-        let m = map_column_type(&col("bit"));
-        assert_eq!(m.sa_type, "Boolean");
-        assert_eq!(m.python_type, "bool");
-    }
-
-    #[test]
-    fn test_integer_types() {
-        assert_eq!(map_column_type(&col("tinyint")).sa_type, "TINYINT");
-        assert_eq!(
-            map_column_type(&col("tinyint")).import_module,
-            "sqlalchemy.dialects.mssql"
-        );
-        assert_eq!(map_column_type(&col("smallint")).sa_type, "SmallInteger");
-        assert_eq!(map_column_type(&col("int")).sa_type, "Integer");
-        assert_eq!(map_column_type(&col("bigint")).sa_type, "BigInteger");
-    }
-
-    #[test]
-    fn test_float_types() {
-        assert_eq!(map_column_type(&col("real")).sa_type, "Float");
-        assert_eq!(map_column_type(&col("float")).sa_type, "Double");
-    }
-
-    #[test]
-    fn test_decimal() {
-        let m = map_column_type(&col_with_precision("decimal", 10, 2));
-        assert_eq!(m.sa_type, "Numeric(10, 2)");
-    }
-
-    #[test]
-    fn test_money() {
-        assert_eq!(map_column_type(&col("money")).sa_type, "Numeric(19, 4)");
-        assert_eq!(
-            map_column_type(&col("smallmoney")).sa_type,
-            "Numeric(10, 4)"
-        );
-    }
-
-    #[test]
-    fn test_string_types() {
-        assert_eq!(
-            map_column_type(&col_with_length("varchar", 100)).sa_type,
-            "String(100)"
-        );
-        assert_eq!(
-            map_column_type(&col_with_length("nvarchar", 50)).sa_type,
-            "Unicode(50)"
-        );
-        assert_eq!(map_column_type(&col("text")).sa_type, "Text");
-        assert_eq!(map_column_type(&col("ntext")).sa_type, "UnicodeText");
-    }
-
-    #[test]
-    fn test_varchar_max() {
-        // varchar(max) has no character_maximum_length
-        let m = map_column_type(&col("varchar"));
-        assert_eq!(m.sa_type, "String");
-    }
-
-    #[test]
-    fn test_binary_types() {
-        assert_eq!(map_column_type(&col("binary")).sa_type, "LargeBinary");
-        assert_eq!(map_column_type(&col("varbinary")).sa_type, "LargeBinary");
-        assert_eq!(map_column_type(&col("image")).sa_type, "LargeBinary");
-    }
-
-    #[test]
-    fn test_datetime_types() {
-        assert_eq!(map_column_type(&col("datetime")).sa_type, "DateTime");
-        assert_eq!(map_column_type(&col("datetime2")).sa_type, "DateTime");
-        assert_eq!(map_column_type(&col("smalldatetime")).sa_type, "DateTime");
-        assert_eq!(
-            map_column_type(&col("datetimeoffset")).sa_type,
-            "DateTime(True)"
-        );
-        assert_eq!(map_column_type(&col("date")).sa_type, "Date");
-        assert_eq!(map_column_type(&col("time")).sa_type, "Time");
-    }
-
-    #[test]
-    fn test_uniqueidentifier() {
-        let m = map_column_type(&col("uniqueidentifier"));
-        assert_eq!(m.sa_type, "UNIQUEIDENTIFIER");
-        assert_eq!(m.import_module, "sqlalchemy.dialects.mssql");
-    }
-
-    #[test]
-    fn test_fallback() {
-        let m = map_column_type(&col("xml"));
-        assert_eq!(m.sa_type, "XML");
-    }
-}
+#[path = "mssql_tests.rs"]
+mod tests;

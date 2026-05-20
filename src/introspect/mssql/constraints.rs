@@ -1,11 +1,12 @@
-use std::collections::BTreeMap;
-
 use tiberius::Client;
 use tokio::net::TcpStream;
 use tokio_util::compat::Compat;
 
 use crate::error::UvgError;
-use crate::schema::{ConstraintInfo, ConstraintType, ForeignKeyInfo};
+use crate::introspect::grouping::{
+    foreign_key_constraints, typed_column_constraints, ForeignKeyColumn,
+};
+use crate::schema::{ConstraintInfo, ConstraintType};
 
 pub async fn query_constraints(
     client: &mut Client<Compat<TcpStream>>,
@@ -35,8 +36,7 @@ pub async fn query_constraints(
     let stream = client.query(pk_uq_query, &[&schema, &table_name]).await?;
     let rows = stream.into_first_result().await?;
 
-    let mut pk_uq_map: BTreeMap<String, (ConstraintType, Vec<String>)> = BTreeMap::new();
-    for row in rows {
+    constraints.extend(typed_column_constraints(rows, |row| {
         let name: String = row
             .get::<&str, _>("CONSTRAINT_NAME")
             .unwrap_or("")
@@ -47,25 +47,11 @@ pub async fn query_constraints(
         let ctype = match ctype_str {
             "PRIMARY KEY" => ConstraintType::PrimaryKey,
             "UNIQUE" => ConstraintType::Unique,
-            _ => continue,
+            _ => return None,
         };
 
-        pk_uq_map
-            .entry(name)
-            .or_insert_with(|| (ctype, Vec::new()))
-            .1
-            .push(col);
-    }
-
-    for (name, (ctype, columns)) in pk_uq_map {
-        constraints.push(ConstraintInfo {
-            name,
-            constraint_type: ctype,
-            columns,
-            foreign_key: None,
-            check_expression: None,
-        });
-    }
+        Some((name, ctype, col))
+    }));
 
     // Foreign keys via sys.foreign_keys + sys.foreign_key_columns
     let fk_query = r#"
@@ -87,8 +73,7 @@ pub async fn query_constraints(
     let stream = client.query(fk_query, &[&schema, &table_name]).await?;
     let fk_rows = stream.into_first_result().await?;
 
-    let mut fk_map: BTreeMap<String, FkAccumulator> = BTreeMap::new();
-    for row in fk_rows {
+    constraints.extend(foreign_key_constraints(fk_rows.into_iter().map(|row| {
         let name: String = row
             .get::<&str, _>("constraint_name")
             .unwrap_or("")
@@ -107,37 +92,16 @@ pub async fn query_constraints(
             .unwrap_or("NO_ACTION")
             .replace('_', " ");
 
-        let acc = fk_map.entry(name).or_insert_with(|| FkAccumulator {
-            columns: Vec::new(),
+        ForeignKeyColumn {
+            constraint_name: name,
+            column: col,
             ref_schema,
             ref_table,
-            ref_columns: Vec::new(),
+            ref_column: ref_col,
             update_rule,
             delete_rule,
-        });
-        if !acc.columns.contains(&col) {
-            acc.columns.push(col);
         }
-        if !acc.ref_columns.contains(&ref_col) {
-            acc.ref_columns.push(ref_col);
-        }
-    }
-
-    for (name, acc) in fk_map {
-        constraints.push(ConstraintInfo {
-            name,
-            constraint_type: ConstraintType::ForeignKey,
-            columns: acc.columns,
-            foreign_key: Some(ForeignKeyInfo {
-                ref_schema: acc.ref_schema,
-                ref_table: acc.ref_table,
-                ref_columns: acc.ref_columns,
-                update_rule: acc.update_rule,
-                delete_rule: acc.delete_rule,
-            }),
-            check_expression: None,
-        });
-    }
+    })));
 
     // CHECK constraints via sys.check_constraints. The `definition` column
     // carries the predicate text MSSQL stores after creation — typically
@@ -167,23 +131,8 @@ pub async fn query_constraints(
         if name.is_empty() || predicate.is_empty() {
             continue;
         }
-        constraints.push(ConstraintInfo {
-            name,
-            constraint_type: ConstraintType::Check,
-            columns: vec![],
-            foreign_key: None,
-            check_expression: Some(predicate),
-        });
+        constraints.push(ConstraintInfo::check(name, predicate));
     }
 
     Ok(constraints)
-}
-
-struct FkAccumulator {
-    columns: Vec<String>,
-    ref_schema: String,
-    ref_table: String,
-    ref_columns: Vec<String>,
-    update_rule: String,
-    delete_rule: String,
 }

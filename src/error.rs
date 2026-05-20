@@ -23,6 +23,10 @@ pub enum UvgError {
     #[error("Invalid dialect: {0}")]
     InvalidDialect(String),
 
-    #[error("--{0} is only valid with --generator ddl")]
-    DdlOnlyOption(String),
+    #[error("Invalid {flag} pattern `{pattern}`: {reason}")]
+    InvalidTablePattern {
+        flag: &'static str,
+        pattern: String,
+        reason: String,
+    },
 }

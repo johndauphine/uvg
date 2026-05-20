@@ -2,6 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/uvg.svg)](https://crates.io/crates/uvg)
 [![License](https://img.shields.io/crates/l/uvg.svg)](#license)
+[![CI](https://github.com/johndauphine/uvg/actions/workflows/ci.yml/badge.svg)](https://github.com/johndauphine/uvg/actions/workflows/ci.yml)
+[![Matrix](https://github.com/johndauphine/uvg/actions/workflows/matrix.yml/badge.svg)](https://github.com/johndauphine/uvg/actions/workflows/matrix.yml)
 
 Fast schema introspection for PostgreSQL, MySQL, SQLite, and MSSQL. Generates SQLAlchemy models, cross-dialect DDL, or migration diffs — with an interactive TUI for reviewing and applying changes. Drop-in replacement for [sqlacodegen](https://github.com/agronholm/sqlacodegen).
 
@@ -44,6 +46,11 @@ sqlite:///path/to/db.sqlite
 mssql://user:pass@host/db
 ```
 
+For production use, read [Operations and Security](docs/operations-security.md)
+before connecting to protected databases. It covers credential redaction, TLS
+settings, required privileges, logs/errors, generated artifacts, and safe apply
+workflows.
+
 ### Generate SQLAlchemy models
 
 ```bash
@@ -81,6 +88,67 @@ uvg postgresql://source/db mysql://target/db --generator ddl -o migration.sql
 ```
 
 The target dialect is inferred from the target URL scheme. Same-dialect migrations converge cleanly — running the diff again after applying shows zero changes.
+
+### Versioned migrations
+
+For Alembic-style workflows, UVg can write timestamped revision files and track the target database's current revision in a `uvg_version` table.
+
+```bash
+# Scaffold migrations/ and uvg.toml
+uvg init
+
+# Write migrations/<revision>_add-users-email.sql
+uvg revision postgresql://source/db postgresql://target/db \
+  --message "add users.email"
+
+# Apply pending revisions to the target and update uvg_version
+uvg upgrade postgresql://target/db
+
+# Roll back one revision, or back to a named revision/base
+uvg downgrade postgresql://target/db
+uvg downgrade postgresql://target/db base
+
+# Collapse multiple migration heads into one merge revision
+uvg merge --message "merge active migration branches"
+
+# Adopt an already-current target without running migration SQL
+uvg stamp postgresql://target/db 20260519_141500 --yes
+
+# Inspect the target's current revision
+uvg current postgresql://target/db
+
+# Show the local revision chain
+uvg history
+uvg history postgresql://target/db
+```
+
+Revision files use a simple SQL format:
+
+```sql
+-- uvg revision: 20260519_141500
+-- parent: 20260518_120000
+-- description: add users.email
+
+-- UP
+ALTER TABLE "users" ADD COLUMN "email" VARCHAR(255);
+
+-- DOWN
+ALTER TABLE "users" DROP COLUMN "email";
+```
+
+Optional hook sections run around the main change: `-- PRE`, `-- UP`, `-- POST`, then `uvg_version` is bumped. Downgrades run `-- POST DOWN`, `-- DOWN`, `-- PRE DOWN` before moving the recorded revision back. Generated irreversible down sections are marked with `-- IRREVERSIBLE:` and are refused by `uvg downgrade` until the user replaces them with real rollback SQL.
+
+Branched histories are supported through explicit merge revisions. When `uvg history` shows multiple heads, run `uvg merge --message <name>` to write an empty multi-parent merge revision that restores a single head. Automatic downgrade through merge revisions is refused because `uvg_version` records one current revision; resolve that case manually and use `uvg stamp`.
+
+#### Migration safety model
+
+`uvg upgrade` and `uvg downgrade` parse-check migration SQL before applying it when the target dialect has a reliable parse-only mode. PostgreSQL uses a savepoint per statement inside one rolled-back transaction, so it catches syntax and catalog errors. SQL Server uses `SET PARSEONLY ON`, which catches syntax errors but still defers name resolution to execution. MySQL and SQLite do not expose a safe parse-only DDL mode, so UVg prints a one-line skip note and continues. Pass `--no-parse-check` before the subcommand to disable this phase explicitly.
+
+Migration DDL is applied statement-by-statement, not as one cross-dialect transaction. On failure, UVg stops at the first failed statement and prints the migration revision, section, statement number, dialect error, and failed SQL without printing the target URL. Earlier statements in the same migration may already be applied. `uvg_version` is advanced only after all `-- PRE`, `-- UP`, and `-- POST` SQL succeeds; downgrades move or clear `uvg_version` only after all down SQL succeeds.
+
+Recovery is intentionally explicit: fix the target manually if needed, rerun an idempotent migration once the target is safe, or use `uvg stamp <target-url> <revision> --yes` only after verifying the schema already matches that revision. If a downgrade to base applied but clearing `uvg_version` failed, verify the target and clear `uvg_version` manually.
+
+Statement retry is bounded and only applies to transient execution errors such as deadlocks, lock waits, and brief connection drops. Logical errors such as syntax errors, missing objects, and constraint failures are not retried. Generated rollback SQL marks unknown or destructive reversals with `-- IRREVERSIBLE:`; `uvg downgrade` refuses those sections until they are replaced with real rollback SQL.
 
 ### Per-table migration layout (`--out-dir`)
 
@@ -159,7 +227,7 @@ When the diff spans multiple tables, the TUI shows a left tree pane (one entry p
 | `--out-dir <DIR>` | Per-table migration layout for `--generator ddl` with a target URL. No-op runs write nothing — see [above](#per-table-migration-layout---out-dir) |
 | `--name <SLUG>` | Filename suffix used inside `--out-dir` (default: `<source>_to_<target>`) |
 | `--interactive`, `-i` | Launch interactive TUI for DDL diff and apply |
-| `--trust-cert` | Trust the server certificate (MSSQL only) |
+| `--trust-cert` | Trust the server certificate (MSSQL only; see [Operations and Security](docs/operations-security.md#tls-and-certificate-behavior)) |
 
 ## Output Examples
 
@@ -274,11 +342,40 @@ Benchmarked against sqlacodegen 3.2.0 on the StackOverflow 2010 database (9 tabl
 cargo test
 ```
 
+Before opening a PR, run the same quality gates CI enforces:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```
+
+For a local advisory view of Rust module size and test layout:
+
+```bash
+./scripts/module_size_report.py
+```
+
+This report is not a CI gate by default. It distinguishes approximate
+production lines from inline `#[cfg(test)]` lines and dedicated test files; see
+[`docs/module-size-report.md`](docs/module-size-report.md) for the guideline.
+
+CI also runs dependency, advisory, license, and source checks with
+`cargo-deny`. To run the same gate locally:
+
+```bash
+cargo install --locked cargo-deny
+cargo deny --all-features --locked check advisories licenses bans sources
+```
+
 Integration tests require a live database (except SQLite which runs in-memory):
 
 ```bash
 # PostgreSQL
 DATABASE_URL=postgresql://user:pass@localhost/testdb cargo test --test integration -- --ignored
+
+# PostgreSQL versioned migration workflow on a disposable database
+UVG_DISPOSABLE_PG_URL=postgresql://user:pass@localhost/testdb cargo test --test integration test_versioned_migration_live_postgres_workflow_cli -- --ignored
 
 # MySQL
 MYSQL_URL=mysql://user:pass@localhost/testdb cargo test --test integration -- --ignored
@@ -302,6 +399,12 @@ for setup and expected counts.
 cargo build --release
 ./testdata/crm/run_matrix.sh
 ```
+
+## Release process
+
+Maintainers cut releases using [`docs/release.md`](docs/release.md). User-facing
+changes are tracked in [`CHANGELOG.md`](CHANGELOG.md), and GitHub release
+archives include SHA-256 checksum files generated by the release workflow.
 
 ## Acknowledgments
 

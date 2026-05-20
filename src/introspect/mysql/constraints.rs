@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
-
 use sqlx::MySqlPool;
 
 use crate::error::UvgError;
-use crate::schema::{ConstraintInfo, ConstraintType, ForeignKeyInfo};
+use crate::introspect::grouping::{
+    foreign_key_constraints, typed_column_constraints, ForeignKeyColumn,
+};
+use crate::schema::{ConstraintInfo, ConstraintType};
 
 pub async fn query_constraints(
     pool: &MySqlPool,
@@ -36,28 +37,14 @@ pub async fn query_constraints(
     .fetch_all(pool)
     .await?;
 
-    let mut pk_uq_map: BTreeMap<String, (ConstraintType, Vec<String>)> = BTreeMap::new();
-    for row in pk_uq_rows {
-        let ct = match row.constraint_type.as_str() {
+    constraints.extend(typed_column_constraints(pk_uq_rows, |row| {
+        let constraint_type = match row.constraint_type.as_str() {
             "PRIMARY KEY" => ConstraintType::PrimaryKey,
             "UNIQUE" => ConstraintType::Unique,
-            _ => continue,
+            _ => return None,
         };
-        pk_uq_map
-            .entry(row.constraint_name)
-            .or_insert_with(|| (ct, Vec::new()))
-            .1
-            .push(row.column_name);
-    }
-    for (name, (ct, columns)) in pk_uq_map {
-        constraints.push(ConstraintInfo {
-            name,
-            constraint_type: ct,
-            columns,
-            foreign_key: None,
-            check_expression: None,
-        });
-    }
+        Some((row.constraint_name, constraint_type, row.column_name))
+    }));
 
     // Foreign keys
     let fk_rows = sqlx::query_as::<_, FkRow>(
@@ -85,40 +72,17 @@ pub async fn query_constraints(
     .fetch_all(pool)
     .await?;
 
-    let mut fk_map: BTreeMap<String, FkAccumulator> = BTreeMap::new();
-    for row in fk_rows {
-        let acc = fk_map
-            .entry(row.constraint_name.clone())
-            .or_insert_with(|| FkAccumulator {
-                columns: Vec::new(),
-                ref_schema: row.ref_schema.clone(),
-                ref_table: row.ref_table.clone(),
-                ref_columns: Vec::new(),
-                update_rule: row.update_rule.clone(),
-                delete_rule: row.delete_rule.clone(),
-            });
-        if !acc.columns.contains(&row.column_name) {
-            acc.columns.push(row.column_name);
+    constraints.extend(foreign_key_constraints(fk_rows.into_iter().map(|row| {
+        ForeignKeyColumn {
+            constraint_name: row.constraint_name,
+            column: row.column_name,
+            ref_schema: row.ref_schema,
+            ref_table: row.ref_table,
+            ref_column: row.ref_column,
+            update_rule: row.update_rule,
+            delete_rule: row.delete_rule,
         }
-        if !acc.ref_columns.contains(&row.ref_column) {
-            acc.ref_columns.push(row.ref_column);
-        }
-    }
-    for (name, acc) in fk_map {
-        constraints.push(ConstraintInfo {
-            name,
-            constraint_type: ConstraintType::ForeignKey,
-            columns: acc.columns,
-            foreign_key: Some(ForeignKeyInfo {
-                ref_schema: acc.ref_schema,
-                ref_table: acc.ref_table,
-                ref_columns: acc.ref_columns,
-                update_rule: acc.update_rule,
-                delete_rule: acc.delete_rule,
-            }),
-            check_expression: None,
-        });
-    }
+    })));
 
     // Check constraints (MySQL 8.0+; older versions lack CHECK_CONSTRAINTS table)
     let check_rows = match sqlx::query_as::<_, CheckRow>(
@@ -162,13 +126,10 @@ pub async fn query_constraints(
     };
 
     for row in check_rows {
-        constraints.push(ConstraintInfo {
-            name: row.constraint_name,
-            constraint_type: ConstraintType::Check,
-            columns: vec![],
-            foreign_key: None,
-            check_expression: Some(normalize_mysql_check_clause(&row.check_clause)),
-        });
+        constraints.push(ConstraintInfo::check(
+            row.constraint_name,
+            normalize_mysql_check_clause(&row.check_clause),
+        ));
     }
 
     Ok(constraints)
@@ -232,15 +193,6 @@ fn normalize_mysql_check_clause(clause: &str) -> String {
     out
 }
 
-struct FkAccumulator {
-    columns: Vec<String>,
-    ref_schema: String,
-    ref_table: String,
-    ref_columns: Vec<String>,
-    update_rule: String,
-    delete_rule: String,
-}
-
 #[derive(sqlx::FromRow)]
 struct PkUqRow {
     #[sqlx(rename = "CONSTRAINT_NAME")]
@@ -280,52 +232,5 @@ struct CheckRow {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::normalize_mysql_check_clause;
-
-    #[test]
-    fn strips_charset_prefix() {
-        // Single charset prefix. After normalization, `\'individual\'` is
-        // un-escaped to `'individual'` (the original SQL string-literal
-        // form) and the leading `_latin1` is stripped.
-        assert_eq!(
-            normalize_mysql_check_clause("`status` = _latin1\\'active\\'"),
-            "`status` = 'active'"
-        );
-        // Multiple in one predicate.
-        assert_eq!(
-            normalize_mysql_check_clause(
-                "`type` in (_latin1\\'company\\',_latin1\\'government\\')"
-            ),
-            "`type` in ('company','government')"
-        );
-        // Different charsets — utf8mb4, cp1251 etc.
-        assert_eq!(
-            normalize_mysql_check_clause("`x` = _utf8mb4\\'a\\'"),
-            "`x` = 'a'"
-        );
-    }
-
-    #[test]
-    fn passes_through_when_no_quirks() {
-        // Predicates that don't have charset prefix or backslash escapes
-        // pass through unchanged.
-        let predicate = "(`is_active` in (0,1))";
-        assert_eq!(normalize_mysql_check_clause(predicate), predicate);
-    }
-
-    #[test]
-    fn does_not_strip_underscore_in_identifier() {
-        // `_internal` is part of a column name, not a charset prefix —
-        // there's no quote after it. Should pass through.
-        let predicate = "(`row_internal_state` >= 0)";
-        assert_eq!(normalize_mysql_check_clause(predicate), predicate);
-    }
-
-    #[test]
-    fn converts_backslash_escape_only() {
-        // No charset prefix, but backslash-escaped quote: un-escape to
-        // plain quote (the original delimiter).
-        assert_eq!(normalize_mysql_check_clause("`x` = \\'a\\'"), "`x` = 'a'");
-    }
-}
+#[path = "constraints_tests.rs"]
+mod tests;

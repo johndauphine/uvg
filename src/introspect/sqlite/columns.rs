@@ -1,5 +1,6 @@
 use sqlx::SqlitePool;
 
+use super::parse::{create_table_body, first_token, identifier_matches, split_respecting_parens};
 use crate::error::UvgError;
 use crate::schema::ColumnInfo;
 
@@ -22,11 +23,6 @@ pub async fn query_columns(
             let has_autoincrement = row.pk > 0 && detect_autoincrement(create_sql, &row.name);
 
             ColumnInfo {
-                name: row.name,
-                ordinal_position: row.cid + 1, // SQLite cid is 0-based, convert to 1-based
-                is_nullable: row.notnull == 0,
-                data_type: row.type_name.clone(),
-                udt_name: base_type,
                 character_maximum_length: max_len,
                 numeric_precision: precision,
                 numeric_scale: scale,
@@ -36,11 +32,14 @@ pub async fn query_columns(
                 identity: None,
                 comment: None, // SQLite has no column comments
                 collation: None,
-                autoincrement: if has_autoincrement {
-                    Some(true)
-                } else {
-                    None
-                },
+                autoincrement: if has_autoincrement { Some(true) } else { None },
+                ..ColumnInfo::new(
+                    row.name,
+                    row.cid + 1, // SQLite cid is 0-based, convert to 1-based
+                    row.notnull == 0,
+                    row.type_name,
+                    base_type,
+                )
             }
         })
         .collect();
@@ -111,66 +110,25 @@ fn detect_autoincrement(create_sql: &str, column_name: &str) -> bool {
         return false;
     }
 
-    // Split the CREATE TABLE body into column definitions
-    // Find the content between the outer parentheses
-    let body = match (create_sql.find('('), create_sql.rfind(')')) {
-        (Some(start), Some(end)) if start < end => &create_sql[start + 1..end],
+    let body = match create_table_body(create_sql) {
+        Some(body) => body,
         _ => return false,
     };
 
-    // Split by commas, respecting nested parentheses
     let fragments = split_respecting_parens(body);
-    let col_upper = column_name.to_uppercase();
-
     for fragment in fragments {
         let trimmed = fragment.trim();
         let upper_frag = trimmed.to_uppercase();
 
         // Check if this fragment is the column definition for our column
         // Column name is the first token (possibly quoted)
-        let first_token = extract_first_token(trimmed);
-        if first_token.to_uppercase() == col_upper
-            || first_token.to_uppercase() == format!("\"{}\"", col_upper)
-        {
+        let token = first_token(trimmed);
+        if identifier_matches(token, column_name) {
             return upper_frag.contains("AUTOINCREMENT");
         }
     }
 
     false
-}
-
-/// Split a string by commas but respect nested parentheses.
-fn split_respecting_parens(s: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                result.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    result.push(&s[start..]);
-    result
-}
-
-/// Extract the first token from a column definition, handling quoted identifiers.
-fn extract_first_token(s: &str) -> &str {
-    let s = s.trim();
-    if s.starts_with('"') {
-        // Quoted identifier
-        if let Some(end) = s[1..].find('"') {
-            return &s[..end + 2];
-        }
-    }
-    // Unquoted: first word
-    s.split_whitespace().next().unwrap_or(s)
 }
 
 #[derive(sqlx::FromRow)]
@@ -185,55 +143,5 @@ struct ColumnRow {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_declared_type_integer() {
-        let (base, len, prec, scale) = parse_declared_type("INTEGER");
-        assert_eq!(base, "integer");
-        assert_eq!(len, None);
-        assert_eq!(prec, None);
-        assert_eq!(scale, None);
-    }
-
-    #[test]
-    fn test_parse_declared_type_varchar() {
-        let (base, len, prec, scale) = parse_declared_type("VARCHAR(255)");
-        assert_eq!(base, "varchar");
-        assert_eq!(len, Some(255));
-        assert_eq!(prec, None);
-        assert_eq!(scale, None);
-    }
-
-    #[test]
-    fn test_parse_declared_type_decimal() {
-        let (base, len, prec, scale) = parse_declared_type("DECIMAL(10,2)");
-        assert_eq!(base, "decimal");
-        assert_eq!(len, None);
-        assert_eq!(prec, Some(10));
-        assert_eq!(scale, Some(2));
-    }
-
-    #[test]
-    fn test_parse_declared_type_empty() {
-        let (base, len, prec, scale) = parse_declared_type("");
-        assert_eq!(base, "");
-        assert_eq!(len, None);
-        assert_eq!(prec, None);
-        assert_eq!(scale, None);
-    }
-
-    #[test]
-    fn test_detect_autoincrement() {
-        let sql = "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)";
-        assert!(detect_autoincrement(sql, "id"));
-        assert!(!detect_autoincrement(sql, "name"));
-    }
-
-    #[test]
-    fn test_detect_autoincrement_no_keyword() {
-        let sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)";
-        assert!(!detect_autoincrement(sql, "id"));
-    }
-}
+#[path = "columns_tests.rs"]
+mod tests;
