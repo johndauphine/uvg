@@ -524,7 +524,20 @@ where
                 .max_connections(1)
                 .connect(url)
                 .await?;
-            if let Some(idx) = first_non_transactional_pg_statement(&statements) {
+            if let Some((i, stmt, kw)) = first_transaction_control(&statements) {
+                // Refuse transaction-control statements before choosing a path,
+                // so the refusal holds on BOTH the atomic and the non-atomic
+                // fallback paths (an embedded COMMIT would subvert the wrapper,
+                // or defeat uvg's per-statement model in the fallback).
+                let result = StmtResult {
+                    sql: stmt.to_string(),
+                    error: Some(transaction_control_rejection(i, kw)),
+                    duration: Duration::from_secs(0),
+                    rolled_back: true,
+                };
+                on_statement(&result, i + 1, total);
+                results = vec![result];
+            } else if let Some(idx) = first_non_transactional_pg_statement(&statements) {
                 // Some valid PostgreSQL DDL cannot run inside a transaction
                 // block (CREATE INDEX CONCURRENTLY, VACUUM, CREATE DATABASE,
                 // ...). Wrapping it would make PostgreSQL reject it, so this
@@ -974,32 +987,66 @@ fn transaction_control_rejection(index: usize, keyword: &str) -> String {
     )
 }
 
+/// Walk up to the first few command words of `s` (comment-aware, stopping at
+/// `(`) looking for the unquoted keyword `target`. Used to spot `CONCURRENTLY`
+/// where it can only be the keyword — a *quoted* `"concurrently"` identifier
+/// keeps its quotes in the token and so never matches.
+fn command_prefix_has_keyword(s: &str, target: &str) -> bool {
+    let mut cur = s;
+    for _ in 0..6 {
+        cur = skip_leading_sql_comments(cur);
+        if cur.starts_with('(') {
+            break;
+        }
+        let (word, rest) = next_command_word(cur);
+        if word.is_empty() {
+            break;
+        }
+        if word.eq_ignore_ascii_case(target) {
+            return true;
+        }
+        cur = rest;
+    }
+    false
+}
+
 /// `true` if `stmt` is a PostgreSQL command that cannot run inside a
 /// transaction block (e.g. `CREATE INDEX CONCURRENTLY`, `VACUUM`,
 /// `CREATE DATABASE`). uvg's generator never emits these, but hand-authored
 /// migrations can — and wrapping them in a transaction makes PostgreSQL reject
 /// them outright, so a batch containing one is applied statement-by-statement
-/// (non-atomic) instead. Detection is intentionally conservative: it keys off
-/// leading command words plus the `CONCURRENTLY` marker.
+/// (non-atomic) instead.
+///
+/// Detection is command-aware: `CONCURRENTLY` only makes an INDEX/REINDEX
+/// command non-transactional, and only as the unquoted keyword before the
+/// column list — so an ordinary statement that merely mentions a
+/// `"concurrently"` identifier or literal stays on the atomic path.
 fn is_non_transactional_pg_statement(stmt: &str) -> bool {
     let cleaned = skip_leading_sql_comments(stmt);
-    // `CONCURRENTLY` appears in CREATE/DROP INDEX ... CONCURRENTLY and REINDEX
-    // ... CONCURRENTLY. Match it as a standalone word anywhere in the statement.
-    let has_concurrently = cleaned
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|w| w.eq_ignore_ascii_case("concurrently"));
-    if has_concurrently {
-        return true;
-    }
     let (w1, rest) = next_command_word(cleaned);
     let first = w1.to_ascii_uppercase();
     let second = next_command_word(skip_leading_sql_comments(rest))
         .0
         .to_ascii_uppercase();
-    matches!(first.as_str(), "VACUUM" | "REINDEX")
-        || (first == "ALTER" && second == "SYSTEM")
-        || (matches!(first.as_str(), "CREATE" | "DROP")
-            && matches!(second.as_str(), "DATABASE" | "TABLESPACE"))
+
+    if first == "VACUUM" {
+        return true;
+    }
+    if first == "ALTER" && second == "SYSTEM" {
+        return true;
+    }
+    if matches!(first.as_str(), "CREATE" | "DROP")
+        && matches!(second.as_str(), "DATABASE" | "TABLESPACE")
+    {
+        return true;
+    }
+
+    // `CONCURRENTLY` variants: CREATE [UNIQUE] INDEX ... CONCURRENTLY,
+    // DROP INDEX ... CONCURRENTLY, REINDEX ... CONCURRENTLY.
+    let is_index_command = first == "REINDEX"
+        || (first == "CREATE" && (second == "INDEX" || second == "UNIQUE"))
+        || (first == "DROP" && second == "INDEX");
+    is_index_command && command_prefix_has_keyword(cleaned, "CONCURRENTLY")
 }
 
 /// The first non-transactional statement in `statements` as `(index, keyword)`.

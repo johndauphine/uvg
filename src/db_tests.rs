@@ -557,6 +557,7 @@ fn detects_non_transactional_pg_statements() {
     for sql in [
         "CREATE INDEX CONCURRENTLY idx ON t (c)",
         "create index concurrently idx on t (c)",
+        "CREATE UNIQUE INDEX CONCURRENTLY idx ON t (c)",
         "DROP INDEX CONCURRENTLY idx",
         "REINDEX INDEX CONCURRENTLY idx",
         "VACUUM",
@@ -580,6 +581,12 @@ fn ordinary_ddl_is_transactional() {
         "DROP TABLE t",
         // 'concurrently' only as part of another identifier must not trip it.
         "CREATE TABLE concurrently_log (id INT)",
+        // A *quoted* column/identifier named concurrently keeps the atomic path.
+        "CREATE TABLE t (\"concurrently\" int)",
+        "CREATE INDEX \"concurrently\" ON t (c)",
+        // CONCURRENTLY appearing only in a predicate literal, past the column
+        // list, must not be treated as the keyword.
+        "CREATE INDEX idx ON t (val) WHERE val = 'concurrently'",
     ] {
         assert!(!is_non_transactional_pg_statement(sql), "sql: {sql}");
     }
