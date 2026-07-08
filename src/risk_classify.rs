@@ -126,6 +126,7 @@ pub(crate) fn annotate_changes(changes: &[Change], risks: &[RiskClass]) -> Resul
             table_schema: change.table_schema.clone(),
             table_name: change.table_name.clone(),
             sql: format!("-- RISK: {}\n{}", risk.as_str(), change.sql),
+            kind: change.kind,
         })
         .collect())
 }

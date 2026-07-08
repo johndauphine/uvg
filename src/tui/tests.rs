@@ -12,6 +12,7 @@ fn ch(schema: &str, table: Option<&str>, sql: &str) -> Change {
         table_schema: schema.to_string(),
         table_name: table.map(|s| s.to_string()),
         sql: sql.to_string(),
+        kind: crate::output::ChangeKind::Other,
     }
 }
 

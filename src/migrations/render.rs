@@ -1,7 +1,7 @@
 use crate::dialect::Dialect;
 use crate::output::Change;
 
-use super::reverse::reverse_change_sql;
+use super::reverse::reverse_change;
 
 pub(super) fn render_up_sql(changes: &[Change]) -> String {
     changes
@@ -15,7 +15,7 @@ pub(super) fn render_down_sql(changes: &[Change], target_dialect: Dialect) -> St
     let mut reversed = changes
         .iter()
         .rev()
-        .map(|change| reverse_change_sql(&change.sql, target_dialect))
+        .map(|change| reverse_change(change, target_dialect))
         .collect::<Vec<_>>()
         .join("\n\n");
     if reversed.is_empty() {

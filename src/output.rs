@@ -24,10 +24,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
 
+/// The structural operation a `Change` performs, as classified by the diff
+/// engine that produced it. Carried alongside the rendered SQL so the
+/// down-migration generator can dispatch on a known operation kind rather
+/// than string-matching the rendered statement (see `reverse_change`). New
+/// generator vocabulary must add a variant here, which forces the reversal
+/// `match` to handle it — the coverage is compiler-enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChangeKind {
+    CreateTable,
+    DropTable,
+    AddColumn,
+    DropColumn,
+    AlterColumn,
+    CreateIndex,
+    DropIndex,
+    AddConstraint,
+    DropConstraint,
+    /// Anything not produced by the structured diff paths (e.g. risk- or
+    /// comment-annotated statements assembled elsewhere). Treated as
+    /// irreversible by the down-migration generator.
+    #[default]
+    Other,
+}
+
 /// A single SQL statement emitted by the diff engine, tagged with the
-/// table it pertains to. The tag lets the per-table splitter route the
-/// statement into the right subdirectory; non-table-scoped DDL
-/// (enums, `CREATE SCHEMA`, etc.) uses `table_name: None`.
+/// table it pertains to and the structural operation it performs. The
+/// table tag lets the per-table splitter route the statement into the
+/// right subdirectory; non-table-scoped DDL (enums, `CREATE SCHEMA`, etc.)
+/// uses `table_name: None`. The `kind` tag drives down-migration reversal.
 ///
 /// `table_schema` is normalized: default schemas (`public`, `dbo`, `main`,
 /// the MySQL default database, and `""`) are stored as `""`, so the
@@ -37,6 +62,7 @@ pub struct Change {
     pub table_schema: String,
     pub table_name: Option<String>,
     pub sql: String,
+    pub kind: ChangeKind,
 }
 
 /// Context describing a single uvg invocation. Owns the timestamps and
