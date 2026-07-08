@@ -368,6 +368,21 @@ pub(crate) async fn parse_check_ddl(
     let statements = split_statements(ddl, config.dialect());
     let mut errors = Vec::new();
 
+    // The PG parse-check itself runs statements inside a transaction it
+    // rolls back at the end. An embedded COMMIT would commit that transaction
+    // — persisting the statements probed so far — before the apply-path guard
+    // ever runs. Reject transaction-control statements here too, before
+    // touching the database, so the default (parse-checked) flow is safe.
+    if config.dialect().supports_transactional_ddl() {
+        if let Some((i, stmt, kw)) = first_transaction_control(&statements) {
+            errors.push(ParseError {
+                sql: stmt.to_string(),
+                error: transaction_control_rejection(i, kw),
+            });
+            return Ok(errors);
+        }
+    }
+
     match config {
         ConnectionConfig::Postgres(url) => {
             let pool = sqlx::postgres::PgPoolOptions::new()
@@ -688,22 +703,12 @@ where
     // ends our transaction and persists earlier statements, after which the
     // rollback claim would be false. uvg's own generator never emits these,
     // but hand-authored migration files can — refuse before executing anything
-    // so the target is genuinely untouched.
-    if let Some((i, stmt)) = statements
-        .iter()
-        .enumerate()
-        .find(|(_, s)| transaction_control_keyword(s).is_some())
-    {
-        let kw = transaction_control_keyword(stmt).unwrap();
+    // so the target is genuinely untouched. (The parse-check path rejects
+    // these too, so the default flow never reaches here with one.)
+    if let Some((i, stmt, kw)) = first_transaction_control(statements) {
         let result = StmtResult {
-            sql: stmt.clone(),
-            error: Some(format!(
-                "refusing to apply: statement {} is a transaction-control statement (`{}`), \
-                 which is incompatible with uvg's single-transaction apply on PostgreSQL. \
-                 Nothing was executed; remove it or split the migration.",
-                i + 1,
-                kw
-            )),
+            sql: stmt.to_string(),
+            error: Some(transaction_control_rejection(i, kw)),
             duration: Duration::from_secs(0),
             rolled_back: true,
         };
@@ -863,17 +868,41 @@ fn skip_leading_sql_comments(stmt: &str) -> &str {
     &stmt[i..]
 }
 
+/// Read the next command word from `s` (which should already have leading
+/// comments stripped), returning `(word, rest)`. The word ends at whitespace,
+/// `;`, or the start of a comment (`--` or `/*`) — PostgreSQL treats comments
+/// as token separators, so `COMMIT/*x*/` and `ROLLBACK--x` are the commands
+/// `COMMIT` and `ROLLBACK`, not opaque tokens.
+fn next_command_word(s: &str) -> (&str, &str) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() || c == b';' {
+            break;
+        }
+        if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            break;
+        }
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            break;
+        }
+        i += 1;
+    }
+    (&s[..i], &s[i..])
+}
+
 /// If `stmt` begins with a PostgreSQL transaction-control command, return its
 /// canonical keyword; otherwise `None`. Used to guard the transactional apply
-/// wrapper (#109) — these statements would end the wrapper transaction and
-/// break its all-or-nothing guarantee.
+/// wrapper AND the PG parse-check (#109) — these statements would end the
+/// wrapper/parse transaction and break its all-or-nothing guarantee.
+///
+/// Comments are treated as PostgreSQL treats them — as whitespace — both
+/// before the command (`/* x */ COMMIT`) and attached to it (`COMMIT/*x*/`),
+/// so the guard can't be sidestepped with comment placement.
 fn transaction_control_keyword(stmt: &str) -> Option<&'static str> {
-    // PostgreSQL ignores leading comments, so a statement like `/* x */ COMMIT`
-    // executes the COMMIT. Strip leading comments/whitespace before reading the
-    // command word, or the guard is trivially bypassed.
-    let mut words = skip_leading_sql_comments(stmt).split_whitespace();
-    let first = words.next()?.trim_end_matches(';').to_ascii_uppercase();
-    let kw = match first.as_str() {
+    let (first_raw, rest) = next_command_word(skip_leading_sql_comments(stmt));
+    let kw = match first_raw.to_ascii_uppercase().as_str() {
         "BEGIN" => "BEGIN",
         "START" => "START",
         "COMMIT" => "COMMIT",
@@ -885,11 +914,8 @@ fn transaction_control_keyword(stmt: &str) -> Option<&'static str> {
         // `PREPARE TRANSACTION` is transaction control; a bare `PREPARE name AS
         // ...` is an ordinary prepared statement and is left alone.
         "PREPARE" => {
-            let second = words.next().unwrap_or("");
-            if second
-                .trim_end_matches(';')
-                .eq_ignore_ascii_case("transaction")
-            {
+            let (second, _) = next_command_word(skip_leading_sql_comments(rest));
+            if second.eq_ignore_ascii_case("transaction") {
                 "PREPARE TRANSACTION"
             } else {
                 return None;
@@ -898,6 +924,28 @@ fn transaction_control_keyword(stmt: &str) -> Option<&'static str> {
         _ => return None,
     };
     Some(kw)
+}
+
+/// The first transaction-control statement in `statements` as
+/// `(index, statement, keyword)`, or `None`. Both the PG parse-check and the
+/// PG transactional apply reject on this, so an embedded `COMMIT` can't commit
+/// during parse-check (leaving changes behind) nor subvert the apply wrapper.
+fn first_transaction_control(statements: &[String]) -> Option<(usize, &str, &'static str)> {
+    statements
+        .iter()
+        .enumerate()
+        .find_map(|(i, s)| transaction_control_keyword(s).map(|kw| (i, s.as_str(), kw)))
+}
+
+/// Error message for a rejected transaction-control statement.
+fn transaction_control_rejection(index: usize, keyword: &str) -> String {
+    format!(
+        "refusing to apply: statement {} is a transaction-control statement (`{}`), which is \
+         incompatible with uvg's single-transaction apply on PostgreSQL. Nothing was executed; \
+         remove it or split the migration.",
+        index + 1,
+        keyword
+    )
 }
 
 /// Internal: retry an async DDL action up to `max_retries` times when

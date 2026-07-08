@@ -524,6 +524,18 @@ fn transaction_control_keyword_sees_through_leading_comments() {
 }
 
 #[test]
+fn transaction_control_keyword_treats_attached_comments_as_separators() {
+    // PostgreSQL treats a comment as whitespace even with no space before it,
+    // so `COMMIT/*x*/` and `ROLLBACK--x` are still transaction control.
+    assert_eq!(transaction_control_keyword("COMMIT/*x*/"), Some("COMMIT"));
+    assert_eq!(transaction_control_keyword("ROLLBACK--x"), Some("ROLLBACK"));
+    assert_eq!(
+        transaction_control_keyword("PREPARE/*c*/TRANSACTION 'g'"),
+        Some("PREPARE TRANSACTION")
+    );
+}
+
+#[test]
 fn transaction_control_keyword_ignores_ordinary_ddl() {
     for sql in [
         "CREATE TABLE t (id INT)",

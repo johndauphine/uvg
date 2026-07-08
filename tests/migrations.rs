@@ -420,19 +420,31 @@ mod tests {
         .unwrap();
         let migrations_arg = migrations.display().to_string();
 
-        let out = run_uvg(&[
-            "--no-parse-check",
-            "upgrade",
-            &url,
-            "--migrations-dir",
-            &migrations_arg,
-        ]);
-        assert!(!out.status.success(), "must refuse embedded COMMIT");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("transaction-control statement"),
-            "should name the refusal reason: {stderr}"
-        );
+        // Both paths must refuse and leave nothing behind: the default
+        // (parse-check runs statements in a transaction an embedded COMMIT
+        // would commit) and --no-parse-check (straight to the apply wrapper).
+        for extra in [Vec::new(), vec!["--no-parse-check"]] {
+            let mut args: Vec<&str> = extra.clone();
+            args.push("upgrade");
+            args.push(url.as_str());
+            args.push("--migrations-dir");
+            args.push(migrations_arg.as_str());
+            let out = run_uvg(&args);
+            assert!(
+                !out.status.success(),
+                "must refuse embedded COMMIT (extra={extra:?})"
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("transaction-control statement"),
+                "should name the refusal reason (extra={extra:?}): {stderr}"
+            );
+            assert!(
+                !postgres_table_exists(&url, "uvg_tc_probe").await,
+                "refusal must execute nothing (extra={extra:?})"
+            );
+        }
+
         // Nothing ran, so the CREATE from before the COMMIT must not exist.
         assert!(
             !postgres_table_exists(&url, "uvg_tc_probe").await,
