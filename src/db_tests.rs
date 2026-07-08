@@ -550,47 +550,7 @@ fn transaction_control_keyword_ignores_ordinary_ddl() {
     }
 }
 
-// ---- non-transactional PG statements fall back to statement-by-statement (#109) ----
-
-#[test]
-fn detects_non_transactional_pg_statements() {
-    for sql in [
-        "CREATE INDEX CONCURRENTLY idx ON t (c)",
-        "create index concurrently idx on t (c)",
-        "CREATE UNIQUE INDEX CONCURRENTLY idx ON t (c)",
-        "DROP INDEX CONCURRENTLY idx",
-        "REINDEX INDEX CONCURRENTLY idx",
-        "REINDEX DATABASE mydb",
-        "REINDEX SCHEMA public",
-        "REINDEX TABLE t",
-        "VACUUM",
-        "VACUUM ANALYZE t",
-        "CREATE DATABASE foo",
-        "DROP DATABASE foo",
-        "CREATE TABLESPACE ts LOCATION '/x'",
-        "ALTER SYSTEM SET work_mem = '64MB'",
-        "/* c */ CREATE INDEX CONCURRENTLY idx ON t (c)",
-    ] {
-        assert!(is_non_transactional_pg_statement(sql), "sql: {sql}");
-    }
-}
-
-#[test]
-fn ordinary_ddl_is_transactional() {
-    for sql in [
-        "CREATE INDEX idx ON t (c)",
-        "CREATE TABLE t (id INT)",
-        "ALTER TABLE t ADD COLUMN c INT",
-        "DROP TABLE t",
-        // 'concurrently' only as part of another identifier must not trip it.
-        "CREATE TABLE concurrently_log (id INT)",
-        // A *quoted* column/identifier named concurrently keeps the atomic path.
-        "CREATE TABLE t (\"concurrently\" int)",
-        "CREATE INDEX \"concurrently\" ON t (c)",
-        // CONCURRENTLY appearing only in a predicate literal, past the column
-        // list, must not be treated as the keyword.
-        "CREATE INDEX idx ON t (val) WHERE val = 'concurrently'",
-    ] {
-        assert!(!is_non_transactional_pg_statement(sql), "sql: {sql}");
-    }
-}
+// Non-transactional statements (CREATE INDEX CONCURRENTLY, VACUUM, CLUSTER,
+// REINDEX DATABASE, ...) are detected at runtime via SQLSTATE 25001 and routed
+// to the statement-by-statement fallback; that behavior is covered by the
+// ignored live-PostgreSQL test `test_postgres_apply_falls_back_for_non_transactional_ddl`.

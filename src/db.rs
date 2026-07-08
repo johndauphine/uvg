@@ -525,10 +525,9 @@ where
                 .connect(url)
                 .await?;
             if let Some((i, stmt, kw)) = first_transaction_control(&statements) {
-                // Refuse transaction-control statements before choosing a path,
-                // so the refusal holds on BOTH the atomic and the non-atomic
-                // fallback paths (an embedded COMMIT would subvert the wrapper,
-                // or defeat uvg's per-statement model in the fallback).
+                // Refuse transaction-control statements (an embedded COMMIT
+                // would subvert the wrapper, or defeat uvg's per-statement model
+                // in the fallback). Nothing is executed.
                 let result = StmtResult {
                     sql: stmt.to_string(),
                     error: Some(transaction_control_rejection(i, kw)),
@@ -537,30 +536,13 @@ where
                 };
                 on_statement(&result, i + 1, total);
                 results = vec![result];
-            } else if let Some(idx) = first_non_transactional_pg_statement(&statements) {
-                // Some valid PostgreSQL DDL cannot run inside a transaction
-                // block (CREATE INDEX CONCURRENTLY, VACUUM, CREATE DATABASE,
-                // ...). Wrapping it would make PostgreSQL reject it, so this
-                // batch is applied statement-by-statement (non-atomic) — the
-                // same behavior as before #109. These statements are inherently
-                // non-atomic anyway.
-                tracing::warn!(
-                    "uvg: applying to PostgreSQL statement-by-statement (non-atomic): \
-                     statement {} cannot run inside a transaction block",
-                    idx + 1
-                );
-                results = execute_sqlx_ddl_statements(
-                    &pool,
-                    &statements,
-                    max_retries,
-                    &mut on_statement,
-                    is_retryable_sqlx_pg_error,
-                )
-                .await;
             } else {
                 // PostgreSQL supports transactional DDL: run the whole batch in
                 // a single transaction so any failure rolls back and leaves the
-                // target unchanged (#109), instead of partial-on-failure.
+                // target unchanged (#109), instead of partial-on-failure. A
+                // statement that cannot run in a transaction block makes this
+                // fall back to statement-by-statement internally (detected at
+                // runtime via SQLSTATE 25001).
                 results = execute_pg_ddl_transactional(
                     &pool,
                     &statements,
@@ -757,32 +739,59 @@ where
 
     let mut attempt = 0u8;
     loop {
-        let (results, retryable) = run_pg_ddl_batch_once(pool, statements).await;
-        let failed = results.iter().any(|r| r.error.is_some());
-        if failed && retryable && attempt < max_retries {
+        let batch = run_pg_ddl_batch_once(pool, statements).await;
+        if batch.non_transactional {
+            // A statement cannot run inside a transaction block (CREATE INDEX
+            // CONCURRENTLY, VACUUM, CLUSTER, REINDEX DATABASE, CREATE DATABASE,
+            // ...). The attempt rolled back, so nothing persisted; re-run the
+            // batch statement-by-statement (non-atomic) — the same behavior as
+            // before #109. Detecting this at runtime (SQLSTATE 25001) covers
+            // every such command without parsing their grammar, and never
+            // demotes a batch that would in fact run transactionally.
+            tracing::warn!(
+                "uvg: applying to PostgreSQL statement-by-statement (non-atomic): the batch \
+                 contains a statement that cannot run inside a transaction block"
+            );
+            return execute_sqlx_ddl_statements(
+                pool,
+                statements,
+                max_retries,
+                on_statement,
+                is_retryable_sqlx_pg_error,
+            )
+            .await;
+        }
+        let failed = batch.results.iter().any(|r| r.error.is_some());
+        if failed && batch.retryable && attempt < max_retries {
             let delay = retry_delay_ms(attempt + 1);
             tokio::time::sleep(Duration::from_millis(delay)).await;
             attempt += 1;
             continue;
         }
-        for (i, r) in results.iter().enumerate() {
+        for (i, r) in batch.results.iter().enumerate() {
             on_statement(r, i + 1, total);
         }
-        return results;
+        return batch.results;
     }
 }
 
-/// Run one attempt of a transactional PostgreSQL DDL batch. Returns the
-/// per-statement results and whether the failure (if any) is retryable.
+/// Outcome of one transactional PostgreSQL batch attempt.
+struct PgBatchAttempt {
+    results: Vec<StmtResult>,
+    /// The failure (if any) is transient and the whole transaction may be retried.
+    retryable: bool,
+    /// A statement was rejected because it cannot run inside a transaction
+    /// block (SQLSTATE 25001); the caller should re-run non-atomically.
+    non_transactional: bool,
+}
+
+/// Run one attempt of a transactional PostgreSQL DDL batch.
 ///
-/// On success every result has `error: None, rolled_back: false`. On failure
-/// the batch is rolled back and every result carries `rolled_back: true`,
-/// with the offending statement's `error` set (results stop at the first
-/// failure, matching the non-transactional path's reporting shape).
-async fn run_pg_ddl_batch_once(
-    pool: &sqlx::PgPool,
-    statements: &[String],
-) -> (Vec<StmtResult>, bool) {
+/// On success every result has `error: None, rolled_back: false`. On a
+/// statement failure the batch is rolled back and every result carries
+/// `rolled_back: true`, with the offending statement's `error` set (results
+/// stop at the first failure, matching the non-transactional reporting shape).
+async fn run_pg_ddl_batch_once(pool: &sqlx::PgPool, statements: &[String]) -> PgBatchAttempt {
     let mut results: Vec<StmtResult> = Vec::new();
 
     let mut tx = match pool.begin().await {
@@ -795,11 +804,16 @@ async fn run_pg_ddl_batch_once(
                 duration: Duration::from_secs(0),
                 rolled_back: true,
             });
-            return (results, retryable);
+            return PgBatchAttempt {
+                results,
+                retryable,
+                non_transactional: false,
+            };
         }
     };
 
     let mut retryable = false;
+    let mut non_transactional = false;
     let mut failed = false;
     for stmt in statements {
         let start = Instant::now();
@@ -812,6 +826,7 @@ async fn run_pg_ddl_batch_once(
             }),
             Err(e) => {
                 retryable = is_retryable_sqlx_pg_error(&e);
+                non_transactional = is_cannot_run_in_transaction_error(&e);
                 results.push(StmtResult {
                     sql: stmt.clone(),
                     error: Some(e.to_string()),
@@ -826,13 +841,18 @@ async fn run_pg_ddl_batch_once(
 
     if failed {
         // A statement failed mid-batch: the transaction is definitively rolled
-        // back, so nothing persisted. This is the retryable case (a class-40
-        // abort applies to the whole transaction).
+        // back, so nothing persisted. A class-40 abort is retryable; a 25001
+        // ("cannot run inside a transaction block") triggers the non-atomic
+        // re-run in the caller.
         let _ = tx.rollback().await;
         for r in results.iter_mut() {
             r.rolled_back = true;
         }
-        return (results, retryable);
+        return PgBatchAttempt {
+            results,
+            retryable,
+            non_transactional,
+        };
     }
 
     if let Err(e) = tx.commit().await {
@@ -849,7 +869,11 @@ async fn run_pg_ddl_batch_once(
             if let Some(last) = results.last_mut() {
                 last.error = Some(format!("commit failed; transaction rolled back ({e})"));
             }
-            return (results, commit_retryable);
+            return PgBatchAttempt {
+                results,
+                retryable: commit_retryable,
+                non_transactional: false,
+            };
         }
         // A transport/acknowledgement failure (dropped connection, I/O): the
         // outcome is UNKNOWN — PostgreSQL may have committed server-side even
@@ -863,10 +887,30 @@ async fn run_pg_ddl_batch_once(
             ));
         }
         // rolled_back stays false; not retryable.
-        return (results, false);
+        return PgBatchAttempt {
+            results,
+            retryable: false,
+            non_transactional: false,
+        };
     }
 
-    (results, retryable)
+    PgBatchAttempt {
+        results,
+        retryable,
+        non_transactional: false,
+    }
+}
+
+/// `true` if `err` is PostgreSQL's "cannot run inside a transaction block"
+/// (SQLSTATE 25001) — e.g. `CREATE INDEX CONCURRENTLY`, `VACUUM`, `CLUSTER`,
+/// `REINDEX DATABASE`, `CREATE DATABASE`. Detecting it at runtime lets the
+/// apply fall back to statement-by-statement for exactly the statements that
+/// need it, with no SQL-grammar parsing.
+fn is_cannot_run_in_transaction_error(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|e| e.code())
+        .map(|c| c == "25001")
+        .unwrap_or(false)
 }
 
 /// Return `stmt` with leading whitespace and SQL comments removed — line
@@ -985,80 +1029,6 @@ fn transaction_control_rejection(index: usize, keyword: &str) -> String {
         index + 1,
         keyword
     )
-}
-
-/// Walk up to the first few command words of `s` (comment-aware, stopping at
-/// `(`) looking for the unquoted keyword `target`. Used to spot `CONCURRENTLY`
-/// where it can only be the keyword — a *quoted* `"concurrently"` identifier
-/// keeps its quotes in the token and so never matches.
-fn command_prefix_has_keyword(s: &str, target: &str) -> bool {
-    let mut cur = s;
-    for _ in 0..6 {
-        cur = skip_leading_sql_comments(cur);
-        if cur.starts_with('(') {
-            break;
-        }
-        let (word, rest) = next_command_word(cur);
-        if word.is_empty() {
-            break;
-        }
-        if word.eq_ignore_ascii_case(target) {
-            return true;
-        }
-        cur = rest;
-    }
-    false
-}
-
-/// `true` if `stmt` is a PostgreSQL command that cannot run inside a
-/// transaction block (e.g. `CREATE INDEX CONCURRENTLY`, `VACUUM`,
-/// `CREATE DATABASE`). uvg's generator never emits these, but hand-authored
-/// migrations can — and wrapping them in a transaction makes PostgreSQL reject
-/// them outright, so a batch containing one is applied statement-by-statement
-/// (non-atomic) instead.
-///
-/// Detection is command-aware: for CREATE/DROP INDEX, `CONCURRENTLY` counts
-/// only as the unquoted keyword before the column list — so an ordinary
-/// statement that merely mentions a `"concurrently"` identifier or literal
-/// stays on the atomic path. VACUUM and REINDEX are matched by command word.
-fn is_non_transactional_pg_statement(stmt: &str) -> bool {
-    let cleaned = skip_leading_sql_comments(stmt);
-    let (w1, rest) = next_command_word(cleaned);
-    let first = w1.to_ascii_uppercase();
-    let second = next_command_word(skip_leading_sql_comments(rest))
-        .0
-        .to_ascii_uppercase();
-
-    // VACUUM never runs in a transaction. REINDEX is treated as
-    // non-transactional wholesale: its DATABASE/SYSTEM/SCHEMA and CONCURRENTLY
-    // forms are rejected inside a transaction, and the transactional-only forms
-    // (REINDEX INDEX/TABLE) are single maintenance statements where atomic vs.
-    // statement-by-statement is indistinguishable — so this avoids parsing
-    // REINDEX's option/target grammar without any real loss.
-    if first == "VACUUM" || first == "REINDEX" {
-        return true;
-    }
-    if first == "ALTER" && second == "SYSTEM" {
-        return true;
-    }
-    if matches!(first.as_str(), "CREATE" | "DROP")
-        && matches!(second.as_str(), "DATABASE" | "TABLESPACE")
-    {
-        return true;
-    }
-
-    // `CONCURRENTLY` makes an index build/drop non-transactional: CREATE
-    // [UNIQUE] INDEX ... CONCURRENTLY, DROP INDEX ... CONCURRENTLY.
-    let is_index_command = (first == "CREATE" && (second == "INDEX" || second == "UNIQUE"))
-        || (first == "DROP" && second == "INDEX");
-    is_index_command && command_prefix_has_keyword(cleaned, "CONCURRENTLY")
-}
-
-/// The first non-transactional statement in `statements` as `(index, keyword)`.
-fn first_non_transactional_pg_statement(statements: &[String]) -> Option<usize> {
-    statements
-        .iter()
-        .position(|s| is_non_transactional_pg_statement(s))
 }
 
 /// Internal: retry an async DDL action up to `max_retries` times when
