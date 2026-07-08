@@ -1,7 +1,7 @@
 use super::*;
 use crate::cli::ConnectionConfig;
 use crate::dialect::Dialect;
-use crate::output::Change;
+use crate::output::{Change, ChangeKind};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -346,6 +346,7 @@ fn test_write_revision_file_and_meta() {
         table_schema: "".into(),
         table_name: Some("users".into()),
         sql: "CREATE TABLE users(id integer);".into(),
+        kind: ChangeKind::CreateTable,
     }];
     let path = write_revision_file(
         &dir,
@@ -411,16 +412,19 @@ fn test_render_down_sql_reverses_known_changes_and_marks_irreversible() {
             table_schema: "".into(),
             table_name: Some("users".into()),
             sql: "CREATE TABLE \"users\" (id INTEGER);".into(),
+            kind: ChangeKind::CreateTable,
         },
         Change {
             table_schema: "".into(),
             table_name: Some("users".into()),
             sql: "ALTER TABLE \"users\" ADD COLUMN \"email\" TEXT;".into(),
+            kind: ChangeKind::AddColumn,
         },
         Change {
             table_schema: "".into(),
             table_name: Some("legacy".into()),
             sql: "DROP TABLE IF EXISTS \"legacy\";".into(),
+            kind: ChangeKind::DropTable,
         },
     ];
 
@@ -435,13 +439,60 @@ fn test_render_down_sql_reverses_known_changes_and_marks_irreversible() {
 }
 
 #[test]
-fn test_reverse_change_sql_does_not_treat_add_constraint_as_add_column() {
-    let down = reverse_change_sql(
-        "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);",
-        Dialect::Postgres,
+fn test_reverse_add_column_is_flagged_destructive_but_still_applies() {
+    // Reversing an ADD COLUMN drops the column, destroying any data written
+    // to it since the upgrade. The DOWN must carry the destructive-operation
+    // warning (like a forward DROP COLUMN) yet must remain applicable -- i.e.
+    // it must NOT be marked IRREVERSIBLE, which would refuse to run.
+    let change = Change {
+        table_schema: "".into(),
+        table_name: Some("users".into()),
+        sql: "ALTER TABLE \"users\" ADD COLUMN \"email\" TEXT;".into(),
+        kind: ChangeKind::AddColumn,
+    };
+    let down = reverse_change(&change, Dialect::Postgres);
+    assert!(
+        down.contains("-- WARNING: destructive operation"),
+        "reversed ADD COLUMN must warn about data loss: {down}"
     );
+    assert!(
+        down.contains("ALTER TABLE \"users\" DROP COLUMN \"email\";"),
+        "reversed ADD COLUMN must drop the added column: {down}"
+    );
+    assert!(
+        !down.contains("-- IRREVERSIBLE"),
+        "a reversible ADD COLUMN must not be refused as irreversible: {down}"
+    );
+}
+
+#[test]
+fn test_reverse_dropped_column_is_irreversible() {
+    // A forward DROP COLUMN cannot be reversed (the column definition and its
+    // data are gone), so its DOWN must be refused rather than silently applied.
+    let change = Change {
+        table_schema: "".into(),
+        table_name: Some("users".into()),
+        sql: "-- WARNING: destructive operation\nALTER TABLE \"users\" DROP COLUMN \"email\";"
+            .into(),
+        kind: ChangeKind::DropColumn,
+    };
+    let down = reverse_change(&change, Dialect::Postgres);
+    assert!(down.contains("-- IRREVERSIBLE"), "{down}");
+}
+
+#[test]
+fn test_reverse_change_does_not_treat_add_constraint_as_add_column() {
+    // Constraint additions carry `ChangeKind::AddConstraint`, so reversal is
+    // driven by the kind -- it can never be mistaken for a column addition.
+    let change = Change {
+        table_schema: "".into(),
+        table_name: Some("users".into()),
+        sql: "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);".into(),
+        kind: ChangeKind::AddConstraint,
+    };
+    let down = reverse_change(&change, Dialect::Postgres);
     assert!(down.contains("-- IRREVERSIBLE"));
-    assert!(!down.contains("DROP COLUMN CONSTRAINT"));
+    assert!(!down.contains("DROP COLUMN"));
 }
 
 #[test]

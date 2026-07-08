@@ -1,49 +1,68 @@
 use crate::dialect::Dialect;
+use crate::output::{Change, ChangeKind};
 
 use super::files::flatten_for_comment;
 
-pub(super) fn reverse_change_sql(sql: &str, target_dialect: Dialect) -> String {
-    let Some(statement) = executable_statement(sql) else {
+/// Derive the DOWN SQL that reverses a single forward `Change`.
+///
+/// Dispatch is driven by `change.kind` through an exhaustive `match`, so a
+/// new `ChangeKind` variant fails to compile until its reversal is handled --
+/// the coverage cannot silently drift from the generator's vocabulary the way
+/// the previous prefix-matching implementation could. The rendered SQL is
+/// still parsed to recover table/column/index names, but only inside the
+/// branch already known to be the right operation.
+pub(super) fn reverse_change(change: &Change, target_dialect: Dialect) -> String {
+    let Some(statement) = executable_statement(&change.sql) else {
         return "-- IRREVERSIBLE: no executable SQL found to reverse.".to_string();
     };
-    let upper = statement.to_ascii_uppercase();
 
-    if upper.starts_with("CREATE TABLE ") {
-        let rest = statement["CREATE TABLE".len()..].trim();
-        let table = rest
-            .split_once('(')
-            .map(|(name, _)| name)
-            .unwrap_or(rest)
-            .trim();
-        return format!("DROP TABLE IF EXISTS {table};");
-    }
-    if upper.starts_with("DROP TABLE ") {
-        return irreversible_down(
-            "this migration drops a table; original schema/data is lost",
-            sql,
-        );
-    }
-    if upper.starts_with("ALTER TABLE ") {
-        if let Some(reverse) = reverse_alter_table_add_column(&statement, target_dialect) {
-            return reverse;
+    match change.kind {
+        ChangeKind::CreateTable => reverse_create_table(&statement),
+        ChangeKind::CreateIndex => {
+            reverse_create_index(&statement, target_dialect).unwrap_or_else(|| {
+                irreversible_down(
+                    "uvg cannot automatically reverse this index creation",
+                    &change.sql,
+                )
+            })
         }
-        if upper.contains(" DROP COLUMN ") {
-            return irreversible_down("this migration drops a column; column data is lost", sql);
+        // Reversing an added column drops it. That destroys any data written
+        // to the column since the upgrade, so it is flagged destructive (like
+        // a forward DROP COLUMN) -- but it is a valid, applicable reversal, so
+        // it is NOT marked IRREVERSIBLE (which would refuse to run).
+        ChangeKind::AddColumn => {
+            reverse_add_column(&statement, target_dialect).unwrap_or_else(|| {
+                irreversible_down(
+                    "uvg cannot automatically reverse this column addition",
+                    &change.sql,
+                )
+            })
         }
+        ChangeKind::DropTable => irreversible_down(
+            "this migration drops a table; original schema and data are lost",
+            &change.sql,
+        ),
+        ChangeKind::DropColumn => irreversible_down(
+            "this migration drops a column; column data is lost",
+            &change.sql,
+        ),
+        ChangeKind::DropIndex => irreversible_down(
+            "this migration drops an index; the original definition is not available here",
+            &change.sql,
+        ),
+        ChangeKind::AlterColumn => irreversible_down(
+            "this migration alters a column; the prior definition is not captured here",
+            &change.sql,
+        ),
+        ChangeKind::AddConstraint | ChangeKind::DropConstraint => irreversible_down(
+            "uvg cannot automatically reverse this constraint change",
+            &change.sql,
+        ),
+        ChangeKind::Other => irreversible_down(
+            "uvg cannot automatically reverse this statement",
+            &change.sql,
+        ),
     }
-    if upper.starts_with("CREATE INDEX ") || upper.starts_with("CREATE UNIQUE INDEX ") {
-        if let Some(reverse) = reverse_create_index(&statement, target_dialect) {
-            return reverse;
-        }
-    }
-    if upper.starts_with("DROP INDEX ") {
-        return irreversible_down(
-            "this migration drops an index; original definition is not available here",
-            sql,
-        );
-    }
-
-    irreversible_down("uvg cannot automatically reverse this statement", sql)
 }
 
 fn executable_statement(sql: &str) -> Option<String> {
@@ -60,8 +79,19 @@ fn executable_statement(sql: &str) -> Option<String> {
     }
 }
 
-fn reverse_alter_table_add_column(statement: &str, target_dialect: Dialect) -> Option<String> {
+fn reverse_create_table(statement: &str) -> String {
+    let rest = statement["CREATE TABLE".len()..].trim();
+    let table = rest
+        .split_once('(')
+        .map(|(name, _)| name)
+        .unwrap_or(rest)
+        .trim();
+    format!("DROP TABLE IF EXISTS {table};")
+}
+
+fn reverse_add_column(statement: &str, target_dialect: Dialect) -> Option<String> {
     let upper = statement.to_ascii_uppercase();
+    // MSSQL spells column additions `ADD`; the others use `ADD COLUMN`.
     let add_idx = upper.find(" ADD COLUMN ").or_else(|| {
         if target_dialect == Dialect::Mssql {
             upper.find(" ADD ")
@@ -76,13 +106,9 @@ fn reverse_alter_table_add_column(statement: &str, target_dialect: Dialect) -> O
         &statement[add_idx + " ADD ".len()..]
     };
     let column = first_sql_token(after_add)?;
-    let column_upper = column
-        .trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'))
-        .to_ascii_uppercase();
-    if matches!(column_upper.as_str(), "CONSTRAINT" | "DEFAULT" | "CHECK") {
-        return None;
-    }
-    Some(format!("ALTER TABLE {table} DROP COLUMN {column};"))
+    Some(format!(
+        "-- WARNING: destructive operation\nALTER TABLE {table} DROP COLUMN {column};"
+    ))
 }
 
 fn reverse_create_index(statement: &str, target_dialect: Dialect) -> Option<String> {

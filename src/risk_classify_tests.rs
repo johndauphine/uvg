@@ -5,6 +5,7 @@ fn change(sql: &str) -> Change {
         table_schema: "main".to_string(),
         table_name: Some("users".to_string()),
         sql: sql.to_string(),
+        kind: crate::output::ChangeKind::Other,
     }
 }
 

@@ -48,6 +48,8 @@ fn test_subdir_for_default_schema() {
         table_schema: "".into(),
         table_name: Some("users".into()),
         sql: "".into(),
+
+        kind: ChangeKind::Other,
     };
     assert_eq!(subdir_for(&c), "users");
 }
@@ -58,6 +60,8 @@ fn test_subdir_for_non_default_schema() {
         table_schema: "billing".into(),
         table_name: Some("orders".into()),
         sql: "".into(),
+
+        kind: ChangeKind::Other,
     };
     assert_eq!(subdir_for(&c), "billing__orders");
 }
@@ -68,6 +72,8 @@ fn test_subdir_for_schema_scoped_ddl() {
         table_schema: "".into(),
         table_name: None,
         sql: "CREATE TYPE ...".into(),
+
+        kind: ChangeKind::Other,
     };
     assert_eq!(subdir_for(&c), "_schema");
 }
@@ -102,21 +108,29 @@ fn test_write_per_table_layout() {
             table_schema: "".into(),
             table_name: Some("users".into()),
             sql: "CREATE TABLE \"users\" (id integer);".into(),
+
+            kind: ChangeKind::Other,
         },
         Change {
             table_schema: "".into(),
             table_name: Some("users".into()),
             sql: "CREATE INDEX ix_users_email ON \"users\" (email);".into(),
+
+            kind: ChangeKind::Other,
         },
         Change {
             table_schema: "".into(),
             table_name: Some("posts".into()),
             sql: "ALTER TABLE \"posts\" ADD COLUMN \"body\" text;".into(),
+
+            kind: ChangeKind::Other,
         },
         Change {
             table_schema: "".into(),
             table_name: None,
             sql: "CREATE TYPE status AS ENUM ('a', 'b');".into(),
+
+            kind: ChangeKind::Other,
         },
     ];
 
@@ -174,6 +188,8 @@ fn test_provenance_header_present() {
         table_schema: "".into(),
         table_name: Some("users".into()),
         sql: "CREATE TABLE x();".into(),
+
+        kind: ChangeKind::Other,
     }];
     write_split_changes(&changes, &ctx).unwrap();
     let body =
@@ -196,6 +212,8 @@ fn test_non_default_schema_subdir() {
         table_schema: "billing".into(),
         table_name: Some("orders".into()),
         sql: "CREATE TABLE \"billing\".\"orders\" ();".into(),
+
+        kind: ChangeKind::Other,
     }];
     write_split_changes(&changes, &ctx).unwrap();
 
@@ -277,11 +295,15 @@ fn test_manifest_preserves_topological_order() {
             table_schema: "".into(),
             table_name: Some("users".into()),
             sql: "CREATE TABLE users();".into(),
+
+            kind: ChangeKind::Other,
         },
         Change {
             table_schema: "".into(),
             table_name: Some("posts".into()),
             sql: "CREATE TABLE posts(user_id int REFERENCES users(id));".into(),
+
+            kind: ChangeKind::Other,
         },
     ];
     let manifest = write_split_changes(&changes, &ctx).unwrap().unwrap();
@@ -351,6 +373,8 @@ fn test_table_named_schema_does_not_collide_with_metadata_dir() {
         table_schema: "".into(),
         table_name: Some("_schema".into()),
         sql: "CREATE TABLE \"_schema\"(id int);".into(),
+
+        kind: ChangeKind::Other,
     };
     assert_eq!(subdir_for(&schema_table), "_schema_table");
 
@@ -358,6 +382,8 @@ fn test_table_named_schema_does_not_collide_with_metadata_dir() {
         table_schema: "".into(),
         table_name: Some("_runs".into()),
         sql: "CREATE TABLE \"_runs\"(id int);".into(),
+
+        kind: ChangeKind::Other,
     };
     assert_eq!(subdir_for(&runs_table), "_runs_table");
 
@@ -366,6 +392,8 @@ fn test_table_named_schema_does_not_collide_with_metadata_dir() {
         table_schema: "".into(),
         table_name: None,
         sql: "CREATE TYPE color AS ENUM('r','g','b');".into(),
+
+        kind: ChangeKind::Other,
     };
     assert_eq!(subdir_for(&scoped), "_schema");
 }
@@ -381,11 +409,15 @@ fn test_table_named_schema_writes_to_distinct_subdir() {
             table_schema: "".into(),
             table_name: None,
             sql: "CREATE TYPE color AS ENUM('r','g','b');".into(),
+
+            kind: ChangeKind::Other,
         },
         Change {
             table_schema: "".into(),
             table_name: Some("_schema".into()),
             sql: "CREATE TABLE \"_schema\"(id int);".into(),
+
+            kind: ChangeKind::Other,
         },
     ];
     let manifest = write_split_changes(&changes, &ctx).unwrap().unwrap();
@@ -433,11 +465,15 @@ fn test_preflight_aborts_when_subdir_is_regular_file() {
             table_schema: "".into(),
             table_name: Some("users".into()),
             sql: "CREATE TABLE users();".into(),
+
+            kind: ChangeKind::Other,
         },
         Change {
             table_schema: "".into(),
             table_name: Some("posts".into()),
             sql: "CREATE TABLE posts();".into(),
+
+            kind: ChangeKind::Other,
         },
     ];
     let result = write_split_changes(&changes, &ctx);
@@ -488,6 +524,8 @@ fn test_header_cannot_be_escaped_via_newline_in_table_name() {
         table_schema: "".into(),
         table_name: Some("evil\nDROP TABLE users;".into()),
         sql: "CREATE TABLE evil(id int);".into(),
+
+        kind: ChangeKind::Other,
     }];
     write_split_changes(&changes, &ctx).unwrap();
 
@@ -577,6 +615,8 @@ fn test_collision_refuses_overwrite() {
         table_schema: "".into(),
         table_name: Some("users".into()),
         sql: "CREATE TABLE users();".into(),
+
+        kind: ChangeKind::Other,
     }];
 
     let first = write_split_changes(&changes, &ctx).unwrap();
@@ -628,6 +668,8 @@ fn test_name_with_separators_sanitized() {
         table_schema: "".into(),
         table_name: Some("users".into()),
         sql: "CREATE TABLE users();".into(),
+
+        kind: ChangeKind::Other,
     }];
     let manifest = write_split_changes(&changes, &ctx)
         .expect("sanitized tag must let write_split_changes succeed")
@@ -665,11 +707,15 @@ fn test_malicious_table_name_cannot_escape_out_dir() {
             table_schema: "".into(),
             table_name: Some("../escape".into()),
             sql: "CREATE TABLE evil();".into(),
+
+            kind: ChangeKind::Other,
         },
         Change {
             table_schema: "".into(),
             table_name: Some("/etc/passwd".into()),
             sql: "CREATE TABLE worse();".into(),
+
+            kind: ChangeKind::Other,
         },
     ];
     let manifest = write_split_changes(&changes, &ctx).unwrap().unwrap();

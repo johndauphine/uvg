@@ -9,7 +9,7 @@ use crate::cli::DdlOptions;
 use crate::codegen::{is_auto_increment_column, is_unique_constraint_index, topo_sort_tables};
 use crate::ddl_typemap;
 use crate::dialect::Dialect;
-use crate::output::Change;
+use crate::output::{Change, ChangeKind};
 use crate::schema::{
     ColumnInfo, ConstraintInfo, ConstraintType, IndexInfo, IntrospectedSchema, TableInfo, TableType,
 };
@@ -83,6 +83,7 @@ pub fn compute_changes(
                 table_schema: schema.clone(),
                 table_name: Some(name.clone()),
                 sql: generate_create_table(table, source_dialect, target_dialect, options),
+                kind: ChangeKind::CreateTable,
             });
             if !options.noindexes {
                 for sql in generate_indexes(table, source_dialect, target_dialect) {
@@ -90,6 +91,7 @@ pub fn compute_changes(
                         table_schema: schema.clone(),
                         table_name: Some(name.clone()),
                         sql,
+                        kind: ChangeKind::CreateIndex,
                     });
                 }
             }
@@ -123,21 +125,43 @@ pub fn compute_changes(
             } else {
                 diff_table_indexes(table, target_table, source_dialect, target_dialect)
             };
-            let mut table_sql = constraint_drops;
-            table_sql.extend(index_drops);
+            // Tag each group with its structural kind before flattening, so
+            // the down-migration generator can reverse by operation rather
+            // than re-parsing rendered SQL. Order is unchanged (see the
+            // ordering note above); only the kind tag is added.
+            let mut table_sql: Vec<(ChangeKind, String)> = Vec::new();
+            table_sql.extend(
+                constraint_drops
+                    .into_iter()
+                    .map(|sql| (ChangeKind::DropConstraint, sql)),
+            );
+            table_sql.extend(
+                index_drops
+                    .into_iter()
+                    .map(|sql| (ChangeKind::DropIndex, sql)),
+            );
             table_sql.extend(diff_table_columns(
                 table,
                 target_table,
                 source_dialect,
                 target_dialect,
             ));
-            table_sql.extend(constraint_adds);
-            table_sql.extend(index_adds);
-            for sql in table_sql {
+            table_sql.extend(
+                constraint_adds
+                    .into_iter()
+                    .map(|sql| (ChangeKind::AddConstraint, sql)),
+            );
+            table_sql.extend(
+                index_adds
+                    .into_iter()
+                    .map(|sql| (ChangeKind::CreateIndex, sql)),
+            );
+            for (kind, sql) in table_sql {
                 changes.push(Change {
                     table_schema: schema.clone(),
                     table_name: Some(name.clone()),
                     sql,
+                    kind,
                 });
             }
         }
@@ -160,6 +184,7 @@ pub fn compute_changes(
             table_schema: schema.to_string(),
             table_name: Some(name.to_string()),
             sql: format!("-- WARNING: destructive operation\nDROP TABLE IF EXISTS {qname};"),
+            kind: ChangeKind::DropTable,
         });
     }
 
@@ -240,8 +265,8 @@ fn diff_table_columns(
     target: &TableInfo,
     source_dialect: Dialect,
     target_dialect: Dialect,
-) -> Vec<String> {
-    let mut stmts = Vec::new();
+) -> Vec<(ChangeKind, String)> {
+    let mut stmts: Vec<(ChangeKind, String)> = Vec::new();
     let tname = qualified_table_name(&source.schema, &source.name, source_dialect, target_dialect);
 
     let source_cols: HashMap<&str, &ColumnInfo> = source
@@ -265,7 +290,10 @@ fn diff_table_columns(
                 Dialect::Mssql => "ADD",
                 _ => "ADD COLUMN",
             };
-            stmts.push(format!("ALTER TABLE {tname} {add_clause} {col_def};"));
+            stmts.push((
+                ChangeKind::AddColumn,
+                format!("ALTER TABLE {tname} {add_clause} {col_def};"),
+            ));
         }
     }
 
@@ -280,7 +308,7 @@ fn diff_table_columns(
                 source_dialect,
                 target_dialect,
             );
-            stmts.extend(alters);
+            stmts.extend(alters.into_iter().map(|sql| (ChangeKind::AlterColumn, sql)));
         }
     }
 
@@ -293,8 +321,9 @@ fn diff_table_columns(
     dropped.sort();
     for name in dropped {
         let qcol = quote_identifier(name, target_dialect);
-        stmts.push(format!(
-            "-- WARNING: destructive operation\nALTER TABLE {tname} DROP COLUMN {qcol};"
+        stmts.push((
+            ChangeKind::DropColumn,
+            format!("-- WARNING: destructive operation\nALTER TABLE {tname} DROP COLUMN {qcol};"),
         ));
     }
 

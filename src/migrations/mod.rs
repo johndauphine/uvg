@@ -29,7 +29,7 @@ use self::{
     graph::MigrationGraph,
     model::{MigrationDirection, MigrationFile},
     render::render_down_sql,
-    reverse::{first_sql_token, reverse_change_sql},
+    reverse::{first_sql_token, reverse_change},
     version_table::{clear_revision, ensure_version_table, record_revision, stamp_revision},
 };
 #[cfg(test)]
