@@ -508,19 +508,39 @@ async fn apply_inline(
     let applied = results.iter().take_while(|r| r.error.is_none()).count();
     if let Some(failed) = results.iter().find(|r| r.error.is_some()) {
         return Err(anyhow::anyhow!(
-            "uvg: apply failed on statement {}/{} against {}: {}\n--- SQL ---\n{}",
+            "uvg: apply failed on statement {}/{} against {}: {}{}\n--- SQL ---\n{}",
             applied + 1,
             results.len(),
             label,
             failed.error.as_deref().unwrap_or(""),
+            apply_rollback_note(&results),
             failed.sql,
         ));
     }
-    eprintln!("uvg: applied {} statement(s) to {}", applied, label);
+    let atomic = if config.dialect().supports_transactional_ddl() {
+        " atomically"
+    } else {
+        ""
+    };
+    eprintln!(
+        "uvg: applied {} statement(s){} to {}",
+        applied, atomic, label
+    );
     if progress_enabled {
         eprintln!("{}", stats.render_summary());
     }
     Ok(())
+}
+
+/// Trailing note appended to an apply failure message. When the failed batch
+/// ran transactionally (PostgreSQL) it was rolled back, so the target is
+/// unchanged; otherwise earlier statements may have landed.
+fn apply_rollback_note(results: &[db::StmtResult]) -> &'static str {
+    if results.iter().any(|r| r.rolled_back) {
+        "\n(the apply ran in a transaction and was rolled back; the target is unchanged)"
+    } else {
+        ""
+    }
 }
 
 /// Apply a manifest's per-table files in `apply_order` (schema-scoped
@@ -578,11 +598,12 @@ async fn apply_manifest(
         total_applied += applied_here;
         if let Some(failed) = results.iter().find(|r| r.error.is_some()) {
             return Err(anyhow::anyhow!(
-                "uvg: apply failed in {} (statement {}/{}): {}\n--- SQL ---\n{}",
+                "uvg: apply failed in {} (statement {}/{}): {}{}\n--- SQL ---\n{}",
                 path.display(),
                 applied_here + 1,
                 results.len(),
                 failed.error.as_deref().unwrap_or(""),
+                apply_rollback_note(&results),
                 failed.sql,
             ));
         }

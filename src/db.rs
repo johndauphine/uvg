@@ -91,6 +91,11 @@ pub(crate) struct StmtResult {
     /// Wall-clock time the statement took to execute on the target.
     /// Used by the per-statement progress reporter (#45).
     pub duration: Duration,
+    /// True when this statement ran inside a transactional apply that was
+    /// rolled back (PostgreSQL, #109). Its effects did NOT persist, whether
+    /// or not `error` is set. Non-transactional dialects leave this `false`
+    /// and are partial-on-failure as before.
+    pub rolled_back: bool,
 }
 
 /// Split DDL output into individual statements using a SQL-aware splitter.
@@ -504,14 +509,12 @@ where
                 .max_connections(1)
                 .connect(url)
                 .await?;
-            results = execute_sqlx_ddl_statements(
-                &pool,
-                &statements,
-                max_retries,
-                &mut on_statement,
-                is_retryable_sqlx_pg_error,
-            )
-            .await;
+            // PostgreSQL supports transactional DDL: run the whole batch in a
+            // single transaction so any failure rolls back and leaves the
+            // target unchanged (#109), instead of partial-on-failure.
+            results =
+                execute_pg_ddl_transactional(&pool, &statements, max_retries, &mut on_statement)
+                    .await;
             pool.close().await;
         }
         ConnectionConfig::Mysql(url) => {
@@ -545,6 +548,7 @@ where
                     sql: stmt.to_string(),
                     error: r.err().map(|e| e.to_string()),
                     duration: start.elapsed(),
+                    rolled_back: false,
                 };
                 on_statement(&result, i + 1, total);
                 let failed = result.error.is_some();
@@ -593,6 +597,7 @@ where
                     sql: stmt.to_string(),
                     error: error_msg,
                     duration: start.elapsed(),
+                    rolled_back: false,
                 };
                 on_statement(&result, i + 1, total);
                 let failed = result.error.is_some();
@@ -639,6 +644,7 @@ where
             sql: stmt.to_string(),
             error: result.error,
             duration: result.duration,
+            rolled_back: false,
         };
         on_statement(&result, i + 1, total);
         let failed = result.error.is_some();
@@ -649,6 +655,121 @@ where
     }
 
     results
+}
+
+/// Apply a DDL batch to PostgreSQL inside a single transaction (#109).
+///
+/// PostgreSQL supports transactional DDL, so the whole batch is atomic:
+/// either every statement commits, or the first failure rolls the entire
+/// batch back and the target is left unchanged. Because a failed statement
+/// poisons a PostgreSQL transaction (subsequent commands error with "current
+/// transaction is aborted"), per-statement retry is impossible here; instead
+/// a *retryable* failure (serialization/deadlock, SQLSTATE class 40) retries
+/// the **whole** transaction — which is exactly the unit a class-40 abort
+/// applies to, so retry is correct by construction.
+///
+/// `on_statement` is invoked once per statement, for the final attempt only,
+/// after the transaction has committed or rolled back — nothing in a
+/// transactional apply is durable until commit, so progress is reported when
+/// the outcome is known rather than streamed mid-transaction.
+async fn execute_pg_ddl_transactional<F>(
+    pool: &sqlx::PgPool,
+    statements: &[String],
+    max_retries: u8,
+    on_statement: &mut F,
+) -> Vec<StmtResult>
+where
+    F: FnMut(&StmtResult, usize, usize),
+{
+    let total = statements.len();
+    let mut attempt = 0u8;
+    loop {
+        let (results, retryable) = run_pg_ddl_batch_once(pool, statements).await;
+        let failed = results.iter().any(|r| r.error.is_some());
+        if failed && retryable && attempt < max_retries {
+            let delay = retry_delay_ms(attempt + 1);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            attempt += 1;
+            continue;
+        }
+        for (i, r) in results.iter().enumerate() {
+            on_statement(r, i + 1, total);
+        }
+        return results;
+    }
+}
+
+/// Run one attempt of a transactional PostgreSQL DDL batch. Returns the
+/// per-statement results and whether the failure (if any) is retryable.
+///
+/// On success every result has `error: None, rolled_back: false`. On failure
+/// the batch is rolled back and every result carries `rolled_back: true`,
+/// with the offending statement's `error` set (results stop at the first
+/// failure, matching the non-transactional path's reporting shape).
+async fn run_pg_ddl_batch_once(
+    pool: &sqlx::PgPool,
+    statements: &[String],
+) -> (Vec<StmtResult>, bool) {
+    let mut results: Vec<StmtResult> = Vec::new();
+
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            let retryable = is_retryable_sqlx_pg_error(&e);
+            results.push(StmtResult {
+                sql: statements.first().cloned().unwrap_or_default(),
+                error: Some(e.to_string()),
+                duration: Duration::from_secs(0),
+                rolled_back: true,
+            });
+            return (results, retryable);
+        }
+    };
+
+    let mut retryable = false;
+    let mut failed = false;
+    for stmt in statements {
+        let start = Instant::now();
+        match sqlx::query(stmt).execute(&mut *tx).await {
+            Ok(_) => results.push(StmtResult {
+                sql: stmt.clone(),
+                error: None,
+                duration: start.elapsed(),
+                rolled_back: false,
+            }),
+            Err(e) => {
+                retryable = is_retryable_sqlx_pg_error(&e);
+                results.push(StmtResult {
+                    sql: stmt.clone(),
+                    error: Some(e.to_string()),
+                    duration: start.elapsed(),
+                    rolled_back: true,
+                });
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    if failed {
+        let _ = tx.rollback().await;
+    } else if let Err(e) = tx.commit().await {
+        // Commit itself failed: nothing persisted. Attribute the error to the
+        // last statement so the caller reports a failure and rolls back.
+        retryable = is_retryable_sqlx_pg_error(&e);
+        failed = true;
+        if let Some(last) = results.last_mut() {
+            last.error = Some(format!("commit failed: {e}"));
+        }
+    }
+
+    if failed {
+        for r in results.iter_mut() {
+            r.rolled_back = true;
+        }
+    }
+
+    (results, retryable)
 }
 
 /// Internal: retry an async DDL action up to `max_retries` times when

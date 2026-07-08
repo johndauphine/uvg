@@ -123,7 +123,16 @@ Use UVG as a review-first tool in production:
    migration is safe and idempotent. Use `uvg stamp` only after verifying the
    target schema already matches the revision being recorded.
 
-Remember that apply is statement-by-statement, not one cross-dialect
-transaction. PostgreSQL parse checks reduce risk but still require privileges
-and are not a substitute for review and staging. MSSQL, MySQL, and SQLite skip
-parse checks.
+Apply atomicity is per-dialect. On **PostgreSQL**, each apply (and each
+per-file apply under `--out-dir`) runs inside a single transaction: it either
+commits in full or rolls back completely, so a mid-batch failure leaves the
+target unchanged. A retryable failure (serialization/deadlock, SQLSTATE class
+40) retries the whole transaction. On **MySQL, MSSQL, and SQLite**, DDL
+implicitly commits, so apply is statement-by-statement and partial-on-failure —
+step 8 above applies: verify what landed before rerunning. The `uvg_version`
+bump is a transactional DELETE+INSERT on every backend, so it can never be left
+empty by a crash between the two.
+
+PostgreSQL parse checks reduce risk further but still require privileges and are
+not a substitute for review and staging. MSSQL, MySQL, and SQLite skip parse
+checks.

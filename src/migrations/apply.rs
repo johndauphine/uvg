@@ -184,14 +184,22 @@ async fn execute_migration_section(
     let results = db::execute_ddl(config, sql, 3, |_, _, _| {}).await?;
     let applied = results.iter().take_while(|r| r.error.is_none()).count();
     if let Some(failed) = results.iter().find(|r| r.error.is_some()) {
+        // On a transactional (PostgreSQL) backend the whole section rolled
+        // back, so nothing landed; otherwise earlier statements may have.
+        let aftermath = if results.iter().any(|r| r.rolled_back) {
+            "This section ran in a transaction and was rolled back; no statements were applied and uvg_version was not changed. Fix the cause and retry."
+        } else {
+            "Earlier statements in this migration may have been applied; uvg_version was not changed. Fix the target manually if needed, then retry or use `uvg stamp` after verification."
+        };
         return Err(anyhow!(
-            "uvg: migration {} failed in {} section of {} at statement {}/{}: {}\nEarlier statements in this migration may have been applied; uvg_version was not changed. Fix the target manually if needed, then retry or use `uvg stamp` after verification.\n--- SQL ---\n{}",
+            "uvg: migration {} failed in {} section of {} at statement {}/{}: {}\n{}\n--- SQL ---\n{}",
             migration.revision,
             section.label(),
             migration.path.display(),
             applied + 1,
             results.len(),
             failed.error.as_deref().unwrap_or(""),
+            aftermath,
             failed.sql
         ));
     }

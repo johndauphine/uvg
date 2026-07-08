@@ -284,6 +284,90 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
+    async fn test_postgres_apply_is_atomic_on_failure() {
+        // #109: a migration UP section whose second statement fails must roll
+        // the whole section back on PostgreSQL — the table the first statement
+        // created must NOT survive, and uvg_version must stay at base.
+        let url =
+            std::env::var("UVG_DISPOSABLE_PG_URL").expect("UVG_DISPOSABLE_PG_URL must be set");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres connect");
+        for stmt in [
+            "DROP TABLE IF EXISTS uvg_rollback_probe",
+            "DROP TABLE IF EXISTS uvg_version",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect("cleanup");
+        }
+        pool.close().await;
+
+        let dir = tmpdir("pg-atomic-rollback");
+        let migrations = dir.join("migrations");
+        std::fs::create_dir_all(&migrations).unwrap();
+        // Second statement references a table that doesn't exist, so the
+        // section fails after the CREATE — which must be rolled back.
+        std::fs::write(
+            migrations.join("20260513_193000_atomic_probe.sql"),
+            "-- uvg revision: 20260513_193000\n\
+             -- parent:\n\
+             -- description: atomic probe\n\n\
+             -- UP\n\
+             CREATE TABLE uvg_rollback_probe(id integer PRIMARY KEY);\n\
+             INSERT INTO uvg_rollback_definitely_absent VALUES (1);\n\n\
+             -- DOWN\n\
+             DROP TABLE IF EXISTS uvg_rollback_probe;\n",
+        )
+        .unwrap();
+        let migrations_arg = migrations.display().to_string();
+
+        // `--no-parse-check` is a top-level flag and must precede the
+        // subcommand; without it the bad statement is caught at parse-check
+        // time, and we want to exercise the transactional apply/rollback path.
+        let out = run_uvg(&[
+            "--no-parse-check",
+            "upgrade",
+            &url,
+            "--migrations-dir",
+            &migrations_arg,
+        ]);
+        assert!(
+            !out.status.success(),
+            "upgrade should fail on the bad statement"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("rolled back"),
+            "failure should report the rollback: {stderr}"
+        );
+
+        // The atomic guarantee: the CREATE from the first statement was undone.
+        assert!(
+            !postgres_table_exists(&url, "uvg_rollback_probe").await,
+            "transaction must have rolled back the CREATE TABLE"
+        );
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres reconnect");
+        sqlx::query("DROP TABLE IF EXISTS uvg_rollback_probe")
+            .execute(&pool)
+            .await
+            .expect("cleanup probe table");
+        sqlx::query("DROP TABLE IF EXISTS uvg_version")
+            .execute(&pool)
+            .await
+            .expect("cleanup version table");
+        pool.close().await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_versioned_merge_writes_multi_parent_revision_cli() {
         let dir = tmpdir("versioned-merge");

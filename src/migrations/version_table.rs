@@ -275,13 +275,19 @@ pub(super) async fn record_revision(
     description: &str,
 ) -> Result<()> {
     match config {
+        // DELETE + INSERT is the single-row "replace current revision"
+        // pattern. Wrapping it in a transaction makes the bump atomic so a
+        // crash between the two never leaves the version table empty (which
+        // would read back as "base"). Version-table writes are DML, so this
+        // is transactional on every backend, including MySQL/MSSQL (#109).
         ConnectionConfig::Postgres(url) => {
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)
                 .connect(url)
                 .await?;
+            let mut tx = pool.begin().await?;
             sqlx::query(&format!("DELETE FROM {VERSION_TABLE}"))
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
             sqlx::query(&format!(
                 "INSERT INTO {VERSION_TABLE} (revision, applied_at, description)
@@ -289,8 +295,9 @@ pub(super) async fn record_revision(
             ))
             .bind(revision)
             .bind(description)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             pool.close().await;
         }
         ConnectionConfig::Mysql(url) => {
@@ -298,8 +305,9 @@ pub(super) async fn record_revision(
                 .max_connections(1)
                 .connect(url)
                 .await?;
+            let mut tx = pool.begin().await?;
             sqlx::query(&format!("DELETE FROM {VERSION_TABLE}"))
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
             sqlx::query(&format!(
                 "INSERT INTO {VERSION_TABLE} (revision, applied_at, description)
@@ -307,8 +315,9 @@ pub(super) async fn record_revision(
             ))
             .bind(revision)
             .bind(description)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             pool.close().await;
         }
         ConnectionConfig::Sqlite(url) => {
@@ -316,8 +325,9 @@ pub(super) async fn record_revision(
                 .max_connections(1)
                 .connect(url)
                 .await?;
+            let mut tx = pool.begin().await?;
             sqlx::query(&format!("DELETE FROM {VERSION_TABLE}"))
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
             sqlx::query(&format!(
                 "INSERT INTO {VERSION_TABLE} (revision, applied_at, description)
@@ -325,8 +335,9 @@ pub(super) async fn record_revision(
             ))
             .bind(revision)
             .bind(description)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             pool.close().await;
         }
         ConnectionConfig::Mssql {
@@ -346,18 +357,35 @@ pub(super) async fn record_revision(
                 *trust_cert,
             )
             .await?;
-            client
-                .execute(&format!("DELETE FROM {VERSION_TABLE}"), &[])
-                .await?;
-            client
-                .execute(
-                    &format!(
-                        "INSERT INTO {VERSION_TABLE} (revision, applied_at, description)
-                         VALUES (@P1, SYSUTCDATETIME(), @P2)"
-                    ),
-                    &[&revision, &description],
-                )
-                .await?;
+            // Tiberius has no borrow-friendly transaction handle, so drive the
+            // transaction with explicit statements and roll back on any error
+            // so the DELETE never lands without its INSERT.
+            client.execute("BEGIN TRANSACTION", &[]).await?;
+            let bump: Result<()> = async {
+                client
+                    .execute(&format!("DELETE FROM {VERSION_TABLE}"), &[])
+                    .await?;
+                client
+                    .execute(
+                        &format!(
+                            "INSERT INTO {VERSION_TABLE} (revision, applied_at, description)
+                             VALUES (@P1, SYSUTCDATETIME(), @P2)"
+                        ),
+                        &[&revision, &description],
+                    )
+                    .await?;
+                Ok(())
+            }
+            .await;
+            match bump {
+                Ok(()) => {
+                    client.execute("COMMIT TRANSACTION", &[]).await?;
+                }
+                Err(e) => {
+                    let _ = client.execute("ROLLBACK TRANSACTION", &[]).await;
+                    return Err(e);
+                }
+            }
         }
     }
     Ok(())

@@ -1,5 +1,27 @@
-use super::{redact_target_url, validate_apply_blob};
+use super::{apply_rollback_note, redact_target_url, validate_apply_blob};
+use crate::db::StmtResult;
 use crate::dialect::Dialect;
+use std::time::Duration;
+
+fn stmt(error: Option<&str>, rolled_back: bool) -> StmtResult {
+    StmtResult {
+        sql: "SELECT 1".to_string(),
+        error: error.map(str::to_string),
+        duration: Duration::from_millis(1),
+        rolled_back,
+    }
+}
+
+#[test]
+fn apply_rollback_note_flags_rolled_back_batches_only() {
+    // Transactional (PostgreSQL) failure: results carry rolled_back -> note.
+    let rolled = [stmt(None, true), stmt(Some("boom"), true)];
+    assert!(apply_rollback_note(&rolled).contains("rolled back"));
+
+    // Non-transactional failure: earlier statements may have landed -> no note.
+    let partial = [stmt(None, false), stmt(Some("boom"), false)];
+    assert_eq!(apply_rollback_note(&partial), "");
+}
 
 #[test]
 fn test_redact_target_url_strips_password() {

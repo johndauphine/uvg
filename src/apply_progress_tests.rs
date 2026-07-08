@@ -5,6 +5,7 @@ fn r(sql: &str, ms: u64) -> StmtResult {
         sql: sql.to_string(),
         error: None,
         duration: Duration::from_millis(ms),
+        rolled_back: false,
     }
 }
 
@@ -84,6 +85,7 @@ fn stats_record_skips_failed_statements() {
         sql: "CREATE TABLE broken (".to_string(),
         error: Some("syntax error".to_string()),
         duration: Duration::from_millis(2),
+        rolled_back: false,
     });
     let s = stats.render_summary();
     assert!(s.starts_with("Applied 1 statement(s)"), "got: {s}");
