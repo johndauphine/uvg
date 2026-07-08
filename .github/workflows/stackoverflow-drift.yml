@@ -1,0 +1,186 @@
+name: Stack Overflow Drift E2E
+
+# Nightly real-schema drift validation for SQL Server StackOverflow2010
+# evolving into every supported target dialect. The workflow is intentionally
+# schedule/manual only: the backup is large and supplied through a repository
+# secret.
+
+on:
+  schedule:
+    - cron: '0 10 * * *'  # 10:00 UTC daily, after the CRM matrix
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  MSSQL_CONTAINER: mssql-test
+  PG_CONTAINER: pg-test
+  MYSQL_CONTAINER: mysql-test
+  STACKOVERFLOW2010_BAK_URL: ${{ secrets.STACKOVERFLOW2010_BAK_URL }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackoverflow-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: StackOverflow2010 drift matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require StackOverflow2010 backup secret
+        run: |
+          if [[ -z "$STACKOVERFLOW2010_BAK_URL" ]]; then
+            echo "::error::Set repository secret STACKOVERFLOW2010_BAK_URL to a downloadable SQL Server .bak file."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install SQLite CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build uvg (release)
+        run: cargo build --release
+
+      - name: Start MSSQL container
+        run: |
+          docker run -d --name "$MSSQL_CONTAINER" \
+            -e ACCEPT_EULA=Y \
+            -e MSSQL_SA_PASSWORD=TestPass2024 \
+            -e MSSQL_PID=Developer \
+            -p 1433:1433 \
+            mcr.microsoft.com/mssql/server:2022-latest
+
+      - name: Start PostgreSQL container
+        run: |
+          docker run -d --name "$PG_CONTAINER" \
+            -e POSTGRES_PASSWORD=TestPass2024 \
+            -p 5432:5432 \
+            postgres:16-alpine
+
+      - name: Start MySQL container
+        run: |
+          docker run -d --name "$MYSQL_CONTAINER" \
+            -e MYSQL_ROOT_PASSWORD=TestPass2024 \
+            -p 3306:3306 \
+            mysql:8.0
+
+      - name: Install sqlcmd shim
+        run: |
+          sudo install -m 0755 testdata/crm/sqlcmd-shim.sh /usr/local/bin/sqlcmd
+          sqlcmd -? 2>/dev/null | head -1 || true
+
+      - name: Wait for containers to accept connections
+        run: |
+          set -e
+          wait_for() {
+            local name=$1 attempts=$2 check_cmd=$3 logs_container=$4
+            echo "Waiting for $name (up to $((attempts * 2))s)..."
+            for i in $(seq 1 "$attempts"); do
+              if eval "$check_cmd" >/dev/null 2>&1; then
+                echo "$name ready after $((i * 2))s."
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$name never became ready; recent logs:" >&2
+            docker logs --tail 120 "$logs_container" >&2 || true
+            return 1
+          }
+          wait_for "PostgreSQL" 30 \
+            'docker exec "$PG_CONTAINER" pg_isready -U postgres -h localhost' \
+            "$PG_CONTAINER"
+          wait_for "MySQL" 60 \
+            'docker exec "$MYSQL_CONTAINER" mysql -h 127.0.0.1 -uroot -pTestPass2024 -e "SELECT 1"' \
+            "$MYSQL_CONTAINER"
+          wait_for "MSSQL" 90 \
+            'sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -Q "SELECT 1"' \
+            "$MSSQL_CONTAINER"
+          echo "Containers ready."
+
+      - name: Download StackOverflow2010 backup
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/uvg-stackoverflow-backup
+          curl --fail --location --show-error --silent --retry 3 \
+            "$STACKOVERFLOW2010_BAK_URL" \
+            --output /tmp/uvg-stackoverflow-backup/StackOverflow2010.bak
+          docker exec "$MSSQL_CONTAINER" mkdir -p /var/opt/mssql/backup
+          docker cp /tmp/uvg-stackoverflow-backup/StackOverflow2010.bak \
+            "$MSSQL_CONTAINER":/var/opt/mssql/backup/StackOverflow2010.bak
+
+      - name: Restore StackOverflow2010 source database
+        run: |
+          set -euo pipefail
+          backup_path="/var/opt/mssql/backup/StackOverflow2010.bak"
+          filelist=$(sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C \
+            -h -1 -W -s '|' \
+            -Q "RESTORE FILELISTONLY FROM DISK = N'${backup_path}';")
+          data_logical=$(awk -F'|' '$3 == "D" {gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1; exit}' <<< "$filelist")
+          log_logical=$(awk -F'|' '$3 == "L" {gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1; exit}' <<< "$filelist")
+          if [[ -z "$data_logical" || -z "$log_logical" ]]; then
+            echo "::error::Could not discover logical data/log file names from backup." >&2
+            printf '%s\n' "$filelist" >&2
+            exit 1
+          fi
+          data_logical=${data_logical//\'/\'\'}
+          log_logical=${log_logical//\'/\'\'}
+          sqlcmd -S localhost,1433 -U sa -P TestPass2024 -C -b -Q "
+            IF DB_ID(N'StackOverflow2010') IS NOT NULL
+            BEGIN
+              ALTER DATABASE [StackOverflow2010] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+              DROP DATABASE [StackOverflow2010];
+            END;
+            RESTORE DATABASE [StackOverflow2010]
+            FROM DISK = N'${backup_path}'
+            WITH
+              MOVE N'${data_logical}' TO N'/var/opt/mssql/data/StackOverflow2010.mdf',
+              MOVE N'${log_logical}' TO N'/var/opt/mssql/data/StackOverflow2010_log.ldf',
+              REPLACE,
+              RECOVERY,
+              STATS = 10;"
+
+      - name: Run Stack Overflow drift harness
+        run: bash testdata/stackoverflow-drift/run_drift.sh
+
+      - name: Upload drift results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackoverflow-drift-results
+          path: /tmp/uvg-stackoverflow-drift/
+          if-no-files-found: warn
+
+      - name: Open issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -e
+          existing=$(gh issue list --label nightly-stackoverflow-drift-failure --state open --json number --jq '.[0].number // empty')
+          today=$(date -u +%Y-%m-%d)
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "Nightly Stack Overflow drift matrix failed again on $today: $RUN_URL"
+          else
+            gh label create nightly-stackoverflow-drift-failure --color FF0000 --description "Auto-opened by Stack Overflow Drift E2E workflow on a failing nightly run" 2>/dev/null || true
+            gh issue create \
+              --title "Nightly Stack Overflow drift matrix failure ($today)" \
+              --label nightly-stackoverflow-drift-failure \
+              --body "The nightly Stack Overflow drift matrix failed. Run: $RUN_URL. This issue auto-opens when the scheduled Stack Overflow Drift E2E workflow fails; subsequent failures will comment here rather than opening new issues. Close once the nightly drift workflow is green again."
+          fi

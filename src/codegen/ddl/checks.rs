@@ -17,7 +17,11 @@ use crate::dialect::Dialect;
 ///
 /// Heuristic by token search; misclassifies if a string literal happens to
 /// contain `~` or `ARRAY[`, but that's rare in CHECK predicates.
-pub(super) fn check_predicate_is_portable(expr: &str, source: Dialect, target: Dialect) -> bool {
+pub(in crate::codegen) fn check_predicate_is_portable(
+    expr: &str,
+    source: Dialect,
+    target: Dialect,
+) -> bool {
     if source == target {
         return true;
     }
@@ -71,7 +75,11 @@ pub(super) fn check_predicate_is_portable(expr: &str, source: Dialect, target: D
 /// operators, function-call differences) are out of scope — the predicate
 /// would need AST-level translation to handle those, which is a separate
 /// effort. See #35.
-pub(super) fn translate_check_predicate(expr: &str, source: Dialect, target: Dialect) -> String {
+pub(in crate::codegen) fn translate_check_predicate(
+    expr: &str,
+    source: Dialect,
+    target: Dialect,
+) -> String {
     if source == target {
         return expr.to_string();
     }
@@ -83,12 +91,64 @@ pub(super) fn translate_check_predicate(expr: &str, source: Dialect, target: Dia
     }
 }
 
-/// Replace `[ident]` with `"ident"` in a MSSQL predicate. Doesn't try to
-/// parse — just swaps the bracket characters for double-quotes. Edge case:
-/// brackets inside a string literal would be miscounted, but real CHECK
-/// predicates don't typically embed `[` in strings.
+/// Replace `[ident]` with `"ident"` in a MSSQL predicate and strip the
+/// `N` prefix from Unicode string literals. Doesn't try to parse — just
+/// handles the syntax SQL Server commonly stores in CHECK predicates.
+/// Edge case: brackets inside a string literal would be miscounted, but
+/// real CHECK predicates don't typically embed `[` in strings.
 fn translate_mssql_check_predicate(expr: &str) -> String {
-    expr.replace(['[', ']'], "\"")
+    let quoted = expr.replace(['[', ']'], "\"");
+    strip_mssql_unicode_literal_prefixes(&quoted)
+}
+
+fn strip_mssql_unicode_literal_prefixes(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut in_string = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            out.push('\'');
+            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                out.push('\'');
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+
+        if !in_string
+            && i + 1 < bytes.len()
+            && matches!(bytes[i], b'N' | b'n')
+            && bytes[i + 1] == b'\''
+            && has_literal_prefix_boundary(bytes, i)
+        {
+            out.push('\'');
+            in_string = true;
+            i += 2;
+            continue;
+        }
+
+        let ch = expr[i..]
+            .chars()
+            .next()
+            .expect("index is always on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn has_literal_prefix_boundary(bytes: &[u8], prefix_index: usize) -> bool {
+    if prefix_index == 0 {
+        return true;
+    }
+    let prev = bytes[prefix_index - 1];
+    !(prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b'\'' | b'"'))
 }
 
 /// Strip PG `::type` and `::type(N)` cast suffixes from a predicate. PG's

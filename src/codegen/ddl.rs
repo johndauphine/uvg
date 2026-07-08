@@ -15,7 +15,8 @@ use crate::dialect::Dialect;
 use crate::schema::{IntrospectedSchema, TableInfo, TableType};
 
 #[cfg(test)]
-use checks::{check_predicate_is_portable, strip_pg_casts_in_predicate, translate_check_predicate};
+use checks::strip_pg_casts_in_predicate;
+pub(super) use checks::{check_predicate_is_portable, translate_check_predicate};
 pub(super) use column::generate_column_def;
 use comments::generate_comments;
 pub(super) use create_table::generate_create_table;

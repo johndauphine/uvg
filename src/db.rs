@@ -231,15 +231,15 @@ pub(crate) struct ParseError {
 }
 
 /// `true` when the dialect supports a per-statement parse probe that
-/// won't commit. PG (`BEGIN`/`ROLLBACK`) and MSSQL (`SET PARSEONLY ON`)
-/// both qualify. MySQL has no clean parse-only mode (DDL auto-commits
-/// and there's no equivalent of `SET PARSEONLY`), and SQLite's
-/// `EXPLAIN` doesn't cover most DDL — both skip silently per #44.
+/// won't commit. PG (`BEGIN`/`ROLLBACK`) qualifies. MSSQL's `SET
+/// PARSEONLY ON` is intentionally not exposed here: it is syntax-only,
+/// does not catch catalog errors, and proved unsafe in the Tiberius
+/// apply path during real-schema validation. MySQL has no clean
+/// parse-only mode (DDL auto-commits and there's no equivalent of
+/// `SET PARSEONLY`), and SQLite's `EXPLAIN` doesn't cover most DDL —
+/// those dialects skip silently per #44.
 pub(crate) fn supports_parse_check(config: &ConnectionConfig) -> bool {
-    matches!(
-        config,
-        ConnectionConfig::Postgres(_) | ConnectionConfig::Mssql { .. }
-    )
+    matches!(config, ConnectionConfig::Postgres(_))
 }
 
 /// Pre-validate every DDL statement by running it through the target

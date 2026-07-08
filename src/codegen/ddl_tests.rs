@@ -78,6 +78,10 @@ fn test_translate_default_now_extended() {
         "now()"
     );
     assert_eq!(
+        translate_default_function("SYSUTCDATETIME()", Dialect::Postgres),
+        "now()"
+    );
+    assert_eq!(
         translate_default_function("LOCALTIMESTAMP", Dialect::Mysql),
         "CURRENT_TIMESTAMP"
     );
@@ -99,11 +103,17 @@ fn test_translate_default_now_extended() {
 #[test]
 fn test_translate_check_predicate_mssql_brackets() {
     // MSSQL→non-MSSQL: square-bracket identifiers must become
-    // double-quotes (which PG and MySQL accept).
-    let mssql = "([code]=upper([code]))";
+    // double-quotes (which PG and MySQL accept), and Unicode string
+    // literal prefixes must be stripped for PG.
+    let mssql = "([code]=upper([code]) AND [state] IN (N'open', N'closed'))";
     assert_eq!(
         translate_check_predicate(mssql, Dialect::Mssql, Dialect::Postgres),
-        "(\"code\"=upper(\"code\"))"
+        "(\"code\"=upper(\"code\") AND \"state\" IN ('open', 'closed'))"
+    );
+    let mssql_like = "([state] LIKE N'op%')";
+    assert_eq!(
+        translate_check_predicate(mssql_like, Dialect::Mssql, Dialect::Postgres),
+        "(\"state\" LIKE 'op%')"
     );
     // MSSQL→MSSQL: brackets pass through.
     assert_eq!(

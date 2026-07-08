@@ -101,7 +101,7 @@ workflows whenever possible.
 | --- | --- |
 | Introspection and model generation | Connect to the database and read catalog metadata for the selected schemas/tables. PostgreSQL uses `information_schema` and `pg_catalog`; grant `CONNECT`, schema `USAGE`, and privileges that make the target objects visible. MySQL uses `information_schema`; grant visibility to the target database objects, commonly `SELECT` and `SHOW VIEW` where views are included. MSSQL uses `INFORMATION_SCHEMA` and `sys.*`; grant `CONNECT` and `VIEW DEFINITION` for reliable metadata visibility. SQLite requires read access to the file. |
 | Diff generation without apply | Introspection privileges on both source and target. No DDL is executed. |
-| Parse checks | PostgreSQL runs statements inside a rolled-back transaction with savepoints, so the role still needs the DDL privileges those statements require. MSSQL uses `SET PARSEONLY ON`, which catches syntax errors but defers name resolution to execution. MySQL and SQLite skip parse checks because they do not expose a safe parse-only DDL mode for this use. |
+| Parse checks | PostgreSQL runs statements inside a rolled-back transaction with savepoints, so the role still needs the DDL privileges those statements require. MSSQL, MySQL, and SQLite skip parse checks because they do not expose a safe parse-only DDL mode for UVG's apply path. |
 | `--apply`, TUI apply, `upgrade`, and `downgrade` | The DDL privileges required by the emitted statements: typically `CREATE`, `ALTER`, `DROP`, index creation, foreign-key/reference permissions, and comment privileges if comments are emitted. Versioned migrations also need to create, read, update, and delete rows in `uvg_version`. SQLite requires write access to the database file and directory. |
 | `current`, `history <target-url>`, and `stamp` | `current` and target-aware `history` read `uvg_version`. `stamp` creates or updates `uvg_version` without running migration SQL and should only be used after independently verifying the schema already matches the requested revision. |
 
@@ -125,6 +125,5 @@ Use UVG as a review-first tool in production:
 
 Remember that apply is statement-by-statement, not one cross-dialect
 transaction. PostgreSQL parse checks reduce risk but still require privileges
-and are not a substitute for review and staging. MySQL and SQLite skip parse
-checks; MSSQL parse checks catch syntax but not missing objects or other
-catalog-level failures.
+and are not a substitute for review and staging. MSSQL, MySQL, and SQLite skip
+parse checks.

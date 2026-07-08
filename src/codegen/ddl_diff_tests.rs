@@ -1,6 +1,6 @@
 use super::*;
 use crate::cli::DdlOptions;
-use crate::testutil::{col, schema_mssql, schema_pg, table};
+use crate::testutil::{col, schema_mssql, schema_mysql, schema_pg, schema_sqlite, table};
 
 fn default_options(target: Dialect) -> DdlOptions {
     DdlOptions {
@@ -131,6 +131,205 @@ fn test_diff_pg_serial_with_divergent_sequences_still_drifts() {
     assert!(
         ddl.contains("SET DEFAULT") || ddl.contains("DROP DEFAULT"),
         "Same-dialect divergent sequences should drift, got: {ddl}"
+    );
+}
+
+#[test]
+fn test_diff_existing_table_constraints_indexes_and_mssql_literals() {
+    let source = schema_mssql(vec![table("Users")
+        .schema("dbo")
+        .column(col("Id").udt("int").identity().build())
+        .column(col("status").udt("nvarchar").max_length(40).build())
+        .column(
+            col("UpdatedAt")
+                .udt("datetime2")
+                .default_val("SYSUTCDATETIME()")
+                .build(),
+        )
+        .pk("PK_Users", &["Id"])
+        .unique("UQ_Users_status", &["status"])
+        .check(
+            "CK_Users_status",
+            "([status]=N'open' OR [status]=N'closed')",
+        )
+        .index("IX_Users_status", &["status"], false)
+        .build()]);
+    let target = schema_pg(vec![table("Users")
+        .column(
+            col("Id")
+                .udt("int4")
+                .default_val("nextval('\"Users_Id_seq\"'::regclass)")
+                .build(),
+        )
+        .column(col("status").udt("varchar").max_length(20).build())
+        .pk("PK_Users", &["Id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+
+    assert!(
+        ddl.contains("ALTER TABLE \"Users\" ALTER COLUMN \"status\" TYPE VARCHAR(40);"),
+        "changed existing column length should be emitted: {ddl}"
+    );
+    assert!(
+        ddl.contains(
+            "ALTER TABLE \"Users\" ADD COLUMN \"UpdatedAt\" TIMESTAMP NOT NULL DEFAULT now();"
+        ),
+        "MSSQL SYSUTCDATETIME default should translate for new columns: {ddl}"
+    );
+    assert!(
+        ddl.contains(
+            "ALTER TABLE \"Users\" ADD CONSTRAINT \"UQ_Users_status\" UNIQUE (\"status\");"
+        ),
+        "new unique constraint on existing table should be emitted: {ddl}"
+    );
+    assert!(
+        ddl.contains(
+            "ALTER TABLE \"Users\" ADD CONSTRAINT \"CK_Users_status\" CHECK ((\"status\"='open' OR \"status\"='closed'));"
+        ),
+        "MSSQL brackets and N-prefixed string literals should translate in CHECKs: {ddl}"
+    );
+    assert!(
+        ddl.contains("CREATE INDEX \"IX_Users_status\" ON \"Users\" (\"status\");"),
+        "new index on existing table should be emitted: {ddl}"
+    );
+}
+
+#[test]
+fn test_diff_dropped_existing_table_constraints_indexes() {
+    let source = schema_mssql(vec![table("Users")
+        .schema("dbo")
+        .column(col("Id").udt("int").identity().build())
+        .column(col("status").udt("nvarchar").max_length(40).build())
+        .pk("PK_Users", &["Id"])
+        .build()]);
+    let target = schema_pg(vec![table("Users")
+        .column(
+            col("Id")
+                .udt("int4")
+                .default_val("nextval('\"Users_Id_seq\"'::regclass)")
+                .build(),
+        )
+        .column(col("status").udt("varchar").max_length(40).build())
+        .pk("PK_Users", &["Id"])
+        .unique("UQ_Users_status", &["status"])
+        .check("CK_Users_status", "(\"status\" = 'open'::text)")
+        .index("IX_Users_status", &["status"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+
+    assert!(
+        ddl.contains("ALTER TABLE \"Users\" DROP CONSTRAINT IF EXISTS \"UQ_Users_status\";"),
+        "dropped unique constraint on existing table should be emitted: {ddl}"
+    );
+    assert!(
+        ddl.contains("ALTER TABLE \"Users\" DROP CONSTRAINT IF EXISTS \"CK_Users_status\";"),
+        "dropped check constraint on existing table should be emitted: {ddl}"
+    );
+    assert!(
+        ddl.contains("DROP INDEX IF EXISTS \"IX_Users_status\";"),
+        "dropped index on existing table should be emitted: {ddl}"
+    );
+}
+
+#[test]
+fn test_diff_target_pk_index_and_name_difference_do_not_drift() {
+    let source = schema_mssql(vec![table("Badges")
+        .schema("dbo")
+        .column(col("Id").udt("int").identity().build())
+        .pk("PK_Badges", &["Id"])
+        .build()]);
+    let target = schema_pg(vec![table("Badges")
+        .column(
+            col("Id")
+                .udt("int4")
+                .default_val("nextval('\"Badges_Id_seq\"'::regclass)")
+                .build(),
+        )
+        .pk("Badges_pkey", &["Id"])
+        .index("Badges_pkey", &["Id"], true)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("No schema changes detected"),
+        "target-side PK names and backing indexes should not drift when columns match: {ddl}"
+    );
+}
+
+#[test]
+fn test_diff_mssql_identity_to_sqlite_autoincrement_converges() {
+    let source = schema_mssql(vec![table("Badges")
+        .schema("dbo")
+        .column(col("Id").udt("int").identity().build())
+        .pk("PK_Badges", &["Id"])
+        .build()]);
+    let target = schema_sqlite(vec![table("Badges")
+        .schema("main")
+        .column(col("Id").udt("integer").nullable().autoincrement().build())
+        .pk("PK_Badges", &["Id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Sqlite));
+    assert!(
+        ddl.contains("No schema changes detected"),
+        "MSSQL IDENTITY -> SQLite INTEGER PRIMARY KEY AUTOINCREMENT should round-trip without nullable drift, got: {ddl}"
+    );
+}
+
+#[test]
+fn test_diff_target_fk_backing_index_does_not_drift() {
+    let source = schema_mssql(vec![
+        table("Users")
+            .schema("dbo")
+            .column(col("Id").udt("int").identity().build())
+            .pk("PK_Users", &["Id"])
+            .build(),
+        table("Events")
+            .schema("dbo")
+            .column(col("Id").udt("int").identity().build())
+            .column(col("UserId").udt("int").build())
+            .pk("PK_Events", &["Id"])
+            .fk_full(
+                "FK_Events_Users",
+                &["UserId"],
+                "dbo",
+                "Users",
+                &["Id"],
+                "NO ACTION",
+                "NO ACTION",
+            )
+            .build(),
+    ]);
+    let target = schema_mysql(vec![
+        table("Users")
+            .schema("uvg")
+            .column(col("Id").udt("int").autoincrement().build())
+            .pk("PK_Users", &["Id"])
+            .build(),
+        table("Events")
+            .schema("uvg")
+            .column(col("Id").udt("int").autoincrement().build())
+            .column(col("UserId").udt("int").build())
+            .pk("PK_Events", &["Id"])
+            .fk_full(
+                "FK_Events_Users",
+                &["UserId"],
+                "uvg",
+                "Users",
+                &["Id"],
+                "NO ACTION",
+                "NO ACTION",
+            )
+            .index("FK_Events_Users", &["UserId"], false)
+            .build(),
+    ]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        ddl.contains("No schema changes detected"),
+        "target-side FK backing indexes should not drift: {ddl}"
     );
 }
 

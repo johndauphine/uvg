@@ -60,6 +60,8 @@ For each release:
 Prepare the release in a normal pull request:
 
 - Confirm `master` is green for `Test`, `cargo deny`, and `CRM 9-pair matrix`.
+- Confirm the scheduled StackOverflow2010 drift workflow is green when the
+  release includes DDL diff/apply or migration behavior changes.
 - Pick the next version from the versioning policy.
 - Update `Cargo.toml`.
 - Run `cargo check` once if needed to refresh the root package version in
@@ -67,6 +69,9 @@ Prepare the release in a normal pull request:
 - Update `CHANGELOG.md`.
 - Review user-facing docs for version-specific examples.
 - Run the validation commands below.
+- For beta, release-candidate, or stable releases, complete the real-schema
+  validation gate in [`docs/beta-validation.md`](beta-validation.md) or document
+  why the release is still intentionally pre-stable.
 - Merge the release-prep PR into `master`.
 
 Validation commands:
@@ -81,12 +86,27 @@ cargo package --locked
 cargo publish --locked --dry-run
 ```
 
+For beta/RC validation against authorized real schemas, start with:
+
+```bash
+cargo build --release
+scripts/beta_validate_schema.sh --help
+```
+
 Run the CRM matrix locally when the release includes dialect, DDL, migration, or
 introspection changes and the database containers are available:
 
 ```bash
 cargo build --release
 ./testdata/crm/run_matrix.sh --strict
+```
+
+Run the StackOverflow2010 drift harness locally when changing schema diff/apply
+or migration behavior and the restored source database is available:
+
+```bash
+cargo build --release
+testdata/stackoverflow-drift/run_drift.sh
 ```
 
 ## Cutting The Release

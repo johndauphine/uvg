@@ -124,6 +124,7 @@ pub(super) fn translate_default_function(expr: &str, target: Dialect) -> String 
             | "localtimestamp()"
             | "getdate()"
             | "getutcdate()"
+            | "sysutcdatetime()"
             | "sysdatetime()"
             | "sysdatetimeoffset()"
     );
