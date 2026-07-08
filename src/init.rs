@@ -117,12 +117,13 @@ fn print_report(report: &InitReport) {
     }
     eprintln!("Next steps:");
     eprintln!(
-        "  - Edit the profiles file to set your source/target URLs under the `{SAMPLE_PROFILE_NAME}` profile."
+        "  - Edit the profiles file and set the `{SAMPLE_PROFILE_NAME}` profile's source/target URLs."
     );
     eprintln!(
-        "  - Run `uvg --profile {SAMPLE_PROFILE_NAME} revision --message <name>`, or pass URLs directly:"
+        "  - `--profile {SAMPLE_PROFILE_NAME}` then supplies those as defaults, e.g. `uvg --profile {SAMPLE_PROFILE_NAME}`."
     );
-    eprintln!("    `uvg revision <src> <tgt> --message <name>`.");
+    eprintln!("  - To author a versioned migration, pass the URLs explicitly:");
+    eprintln!("      `uvg revision <source-url> <target-url> --message <name>`.");
 }
 
 fn baseline_sql() -> String {
