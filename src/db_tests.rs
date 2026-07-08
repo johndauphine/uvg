@@ -479,3 +479,39 @@ async fn sqlx_ddl_helper_invokes_callbacks_and_stops_after_failure() {
         ]
     );
 }
+
+// ---- transaction-control guard for PG transactional apply (#109) ----
+
+#[test]
+fn transaction_control_keyword_flags_tx_statements() {
+    for (sql, expected) in [
+        ("BEGIN", Some("BEGIN")),
+        ("begin transaction", Some("BEGIN")),
+        ("COMMIT", Some("COMMIT")),
+        ("commit;", Some("COMMIT")),
+        ("ROLLBACK", Some("ROLLBACK")),
+        ("END", Some("END")),
+        ("ABORT", Some("ABORT")),
+        ("START TRANSACTION", Some("START")),
+        ("SAVEPOINT sp1", Some("SAVEPOINT")),
+        ("RELEASE SAVEPOINT sp1", Some("RELEASE")),
+        ("PREPARE TRANSACTION 'gid'", Some("PREPARE TRANSACTION")),
+    ] {
+        assert_eq!(transaction_control_keyword(sql), expected, "sql: {sql}");
+    }
+}
+
+#[test]
+fn transaction_control_keyword_ignores_ordinary_ddl() {
+    for sql in [
+        "CREATE TABLE t (id INT)",
+        "ALTER TABLE t ADD COLUMN c INT",
+        "DROP TABLE t",
+        // A bare PREPARE (prepared statement) is not transaction control.
+        "PREPARE plan AS SELECT 1",
+        // Identifiers that merely start with a control word are fine.
+        "CREATE TABLE beginnings (id INT)",
+    ] {
+        assert_eq!(transaction_control_keyword(sql), None, "sql: {sql}");
+    }
+}

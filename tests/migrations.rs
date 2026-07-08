@@ -368,6 +368,76 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
+    async fn test_postgres_apply_refuses_embedded_transaction_control() {
+        // #109: a migration that embeds its own COMMIT would subvert the
+        // atomicity wrapper. uvg must refuse before executing anything.
+        let url =
+            std::env::var("UVG_DISPOSABLE_PG_URL").expect("UVG_DISPOSABLE_PG_URL must be set");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres connect");
+        for stmt in [
+            "DROP TABLE IF EXISTS uvg_tc_probe",
+            "DROP TABLE IF EXISTS uvg_version",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect("cleanup");
+        }
+        pool.close().await;
+
+        let dir = tmpdir("pg-tx-control");
+        let migrations = dir.join("migrations");
+        std::fs::create_dir_all(&migrations).unwrap();
+        std::fs::write(
+            migrations.join("20260101_000000_tc.sql"),
+            "-- uvg revision: 20260101_000000\n\
+             -- parent:\n\
+             -- description: embeds COMMIT\n\n\
+             -- UP\n\
+             CREATE TABLE uvg_tc_probe(id integer);\n\
+             COMMIT;\n\n\
+             -- DOWN\n\
+             DROP TABLE IF EXISTS uvg_tc_probe;\n",
+        )
+        .unwrap();
+        let migrations_arg = migrations.display().to_string();
+
+        let out = run_uvg(&[
+            "--no-parse-check",
+            "upgrade",
+            &url,
+            "--migrations-dir",
+            &migrations_arg,
+        ]);
+        assert!(!out.status.success(), "must refuse embedded COMMIT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("transaction-control statement"),
+            "should name the refusal reason: {stderr}"
+        );
+        // Nothing ran, so the CREATE from before the COMMIT must not exist.
+        assert!(
+            !postgres_table_exists(&url, "uvg_tc_probe").await,
+            "refusal must execute nothing"
+        );
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres reconnect");
+        sqlx::query("DROP TABLE IF EXISTS uvg_tc_probe")
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+        pool.close().await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_versioned_merge_writes_multi_parent_revision_cli() {
         let dir = tmpdir("versioned-merge");

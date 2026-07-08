@@ -682,6 +682,35 @@ where
     F: FnMut(&StmtResult, usize, usize),
 {
     let total = statements.len();
+
+    // A transaction-control statement in the batch (BEGIN/COMMIT/ROLLBACK/
+    // SAVEPOINT/...) would subvert the atomicity wrapper: an embedded COMMIT
+    // ends our transaction and persists earlier statements, after which the
+    // rollback claim would be false. uvg's own generator never emits these,
+    // but hand-authored migration files can — refuse before executing anything
+    // so the target is genuinely untouched.
+    if let Some((i, stmt)) = statements
+        .iter()
+        .enumerate()
+        .find(|(_, s)| transaction_control_keyword(s).is_some())
+    {
+        let kw = transaction_control_keyword(stmt).unwrap();
+        let result = StmtResult {
+            sql: stmt.clone(),
+            error: Some(format!(
+                "refusing to apply: statement {} is a transaction-control statement (`{}`), \
+                 which is incompatible with uvg's single-transaction apply on PostgreSQL. \
+                 Nothing was executed; remove it or split the migration.",
+                i + 1,
+                kw
+            )),
+            duration: Duration::from_secs(0),
+            rolled_back: true,
+        };
+        on_statement(&result, i + 1, total);
+        return vec![result];
+    }
+
     let mut attempt = 0u8;
     loop {
         let (results, retryable) = run_pg_ddl_batch_once(pool, statements).await;
@@ -779,6 +808,41 @@ async fn run_pg_ddl_batch_once(
     }
 
     (results, retryable)
+}
+
+/// If `stmt` begins with a PostgreSQL transaction-control command, return its
+/// canonical keyword; otherwise `None`. Statements arrive already stripped of
+/// leading comments and the trailing `;`, so the first token is the command.
+/// Used to guard the transactional apply wrapper (#109) — these statements
+/// would end the wrapper transaction and break its all-or-nothing guarantee.
+fn transaction_control_keyword(stmt: &str) -> Option<&'static str> {
+    let mut words = stmt.split_whitespace();
+    let first = words.next()?.trim_end_matches(';').to_ascii_uppercase();
+    let kw = match first.as_str() {
+        "BEGIN" => "BEGIN",
+        "START" => "START",
+        "COMMIT" => "COMMIT",
+        "END" => "END",
+        "ROLLBACK" => "ROLLBACK",
+        "ABORT" => "ABORT",
+        "SAVEPOINT" => "SAVEPOINT",
+        "RELEASE" => "RELEASE",
+        // `PREPARE TRANSACTION` is transaction control; a bare `PREPARE name AS
+        // ...` is an ordinary prepared statement and is left alone.
+        "PREPARE" => {
+            let second = words.next().unwrap_or("");
+            if second
+                .trim_end_matches(';')
+                .eq_ignore_ascii_case("transaction")
+            {
+                "PREPARE TRANSACTION"
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(kw)
 }
 
 /// Internal: retry an async DDL action up to `max_retries` times when
