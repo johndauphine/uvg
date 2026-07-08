@@ -85,14 +85,18 @@ pub(crate) fn apply_requested_profile(cli: &mut Cli, matches: &ArgMatches) -> Re
     apply_requested_profile_from_path(cli, &sources, &path)
 }
 
-fn default_profiles_path() -> Result<PathBuf> {
+/// Resolve the path to the user's profiles file: `$XDG_CONFIG_HOME/uvg/
+/// profiles.yaml`, falling back to `~/.config/uvg/profiles.yaml`. Shared by
+/// the profile loader and `uvg init` so the file `init` scaffolds is exactly
+/// the file `--profile` reads.
+pub(crate) fn default_profiles_path() -> Result<PathBuf> {
     if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(config_home).join("uvg").join("profiles.yaml"));
     }
 
-    let home = std::env::var_os("HOME").map(PathBuf::from).context(
-        "UVG_PROFILE was set, but HOME is not available to locate ~/.config/uvg/profiles.yaml",
-    )?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not available to locate ~/.config/uvg/profiles.yaml")?;
     Ok(home.join(".config").join("uvg").join("profiles.yaml"))
 }
 

@@ -94,7 +94,8 @@ The target dialect is inferred from the target URL scheme. Same-dialect migratio
 For Alembic-style workflows, UVg can write timestamped revision files and track the target database's current revision in a `uvg_version` table.
 
 ```bash
-# Scaffold migrations/ and uvg.toml
+# Scaffold migrations/ (baseline + meta.yaml) and a profiles.yaml stub
+# at ~/.config/uvg/profiles.yaml that `--profile` reads
 uvg init
 
 # Write migrations/<revision>_add-users-email.sql

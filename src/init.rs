@@ -10,6 +10,9 @@ const BASELINE_REVISION: &str = "00000000_000000";
 const BASELINE_DESCRIPTION: &str = "initial baseline";
 const BASELINE_FILENAME: &str = ".uvg-revision-00000000_000000_initial.sql";
 const META_FILENAME: &str = "meta.yaml";
+/// Sample profile name scaffolded into `profiles.yaml`. Kept in sync with the
+/// profile-loader contract test in `profile_tests.rs`.
+pub(crate) const SAMPLE_PROFILE_NAME: &str = "dev";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct InitReport {
@@ -49,9 +52,18 @@ pub(crate) fn init_project(args: &InitCommand) -> Result<InitReport> {
         &args.migrations_dir.join(META_FILENAME),
         meta_yaml().as_bytes(),
     )?);
+
+    // Scaffold the profiles file that `--profile` actually reads. Defaults to
+    // the user profiles path; `--config` overrides it (used by tests). This
+    // is written outside the project on purpose: the loader reads the
+    // XDG/global path, so a project-local file would be ignored (#112).
+    let profiles_path = match &args.config {
+        Some(path) => path.clone(),
+        None => crate::profile::default_profiles_path()?,
+    };
     report.record(create_file_if_missing(
-        &args.config,
-        config_toml(&args.migrations_dir).as_bytes(),
+        &profiles_path,
+        profiles_yaml_stub().as_bytes(),
     )?);
 
     Ok(report)
@@ -104,8 +116,13 @@ fn print_report(report: &InitReport) {
         );
     }
     eprintln!("Next steps:");
-    eprintln!("  - Edit the config file to set source/target URLs.");
-    eprintln!("  - Run `uvg revision <src> <tgt> --message <name>`.");
+    eprintln!(
+        "  - Edit the profiles file to set your source/target URLs under the `{SAMPLE_PROFILE_NAME}` profile."
+    );
+    eprintln!(
+        "  - Run `uvg --profile {SAMPLE_PROFILE_NAME} revision --message <name>`, or pass URLs directly:"
+    );
+    eprintln!("    `uvg revision <src> <tgt> --message <name>`.");
 }
 
 fn baseline_sql() -> String {
@@ -131,16 +148,21 @@ revisions:\n\
     )
 }
 
-fn config_toml(migrations_dir: &Path) -> String {
-    let dir = migrations_dir.to_string_lossy();
+/// A ready-to-edit `profiles.yaml` stub in the exact schema the profile
+/// loader deserializes (`profiles:` map of named [`ProfileDefaults`]). A
+/// contract test parses this through the real loader so it can never drift
+/// from what `--profile` accepts.
+pub(crate) fn profiles_yaml_stub() -> String {
     format!(
-        "[migrations]\n\
-         directory = \"{dir}\"\n\
-         version_table = \"uvg_version\"\n\
-         version_schema = \"\"\n\n\
-         [default-profile]\n\
-         source = \"postgresql://localhost/dev\"\n\
-         target = \"postgresql://localhost/staging\"\n"
+        "# uvg profiles. Activate one with `uvg --profile <name>`.\n\
+         # Explicit CLI flags always override values from the active profile.\n\
+         profiles:\n\
+         \x20 {SAMPLE_PROFILE_NAME}:\n\
+         \x20   source: postgresql://localhost/dev\n\
+         \x20   target: postgresql://localhost/staging\n\
+         \x20   # generator: ddl\n\
+         \x20   # target_dialect: postgres\n\
+         \x20   # schemas: [public]\n"
     )
 }
 

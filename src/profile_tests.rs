@@ -46,6 +46,23 @@ fn write_profile(contents: &str) -> PathBuf {
 }
 
 #[test]
+fn generated_init_stub_loads_as_a_profile() {
+    // Contract for #112: the profiles.yaml that `uvg init` scaffolds must be
+    // consumable by `--profile` through the real loader -- restoring a config
+    // that is actually read, unlike the old inert uvg.toml.
+    let path = write_profile(&crate::init::profiles_yaml_stub());
+    let mut cli = default_cli(crate::init::SAMPLE_PROFILE_NAME);
+
+    apply_requested_profile_from_path(&mut cli, &ProfileValueSources::default(), &path).unwrap();
+
+    assert_eq!(cli.url.as_deref(), Some("postgresql://localhost/dev"));
+    assert_eq!(
+        cli.target_url.as_deref(),
+        Some("postgresql://localhost/staging")
+    );
+}
+
+#[test]
 fn profile_fills_empty_cli_fields() {
     let path = write_profile(
         r#"
