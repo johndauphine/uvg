@@ -502,6 +502,28 @@ fn transaction_control_keyword_flags_tx_statements() {
 }
 
 #[test]
+fn transaction_control_keyword_sees_through_leading_comments() {
+    // PostgreSQL ignores leading comments, so the guard must too, or a
+    // `/* x */ COMMIT` slips through and ends the wrapper transaction.
+    assert_eq!(
+        transaction_control_keyword("/* end */ COMMIT"),
+        Some("COMMIT")
+    );
+    assert_eq!(
+        transaction_control_keyword("-- note\nROLLBACK"),
+        Some("ROLLBACK")
+    );
+    assert_eq!(
+        transaction_control_keyword("/* a /* nested */ b */ BEGIN"),
+        Some("BEGIN")
+    );
+    assert_eq!(
+        transaction_control_keyword("  /* c1 */  /* c2 */  COMMIT ;"),
+        Some("COMMIT")
+    );
+}
+
+#[test]
 fn transaction_control_keyword_ignores_ordinary_ddl() {
     for sql in [
         "CREATE TABLE t (id INT)",

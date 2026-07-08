@@ -4,6 +4,18 @@ mod common;
 mod tests {
     use super::common::{run_uvg, tmpdir};
     use std::path::Path;
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
+
+    /// The live-PostgreSQL tests all share the single global `uvg_version`
+    /// table (and run `upgrade`/`downgrade` against one database), so they must
+    /// not run concurrently. Serialize them with a process-wide async lock (an
+    /// async mutex is safe to hold across `.await`). `--test-threads=1` would
+    /// also work but can't be enforced from inside the test.
+    fn live_pg_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     async fn sqlite_table_exists(db_path: &Path, table: &str) -> bool {
         let url = format!("sqlite:///{}", db_path.display());
@@ -159,6 +171,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
     async fn test_versioned_migration_live_postgres_workflow_cli() {
+        let _serial = live_pg_lock().lock().await;
         let url =
             std::env::var("UVG_DISPOSABLE_PG_URL").expect("UVG_DISPOSABLE_PG_URL must be set");
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -287,6 +300,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
     async fn test_postgres_apply_is_atomic_on_failure() {
+        let _serial = live_pg_lock().lock().await;
         // #109: a migration UP section whose second statement fails must roll
         // the whole section back on PostgreSQL — the table the first statement
         // created must NOT survive, and uvg_version must stay at base.
@@ -371,6 +385,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
     async fn test_postgres_apply_refuses_embedded_transaction_control() {
+        let _serial = live_pg_lock().lock().await;
         // #109: a migration that embeds its own COMMIT would subvert the
         // atomicity wrapper. uvg must refuse before executing anything.
         let url =

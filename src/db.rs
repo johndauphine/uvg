@@ -792,11 +792,26 @@ async fn run_pg_ddl_batch_once(
     }
 
     if let Err(e) = tx.commit().await {
-        // Commit itself failed. The outcome is UNKNOWN, not rolled back:
-        // PostgreSQL may have committed server-side even if the client never
-        // received the acknowledgement (e.g. a dropped connection). So we must
-        // NOT claim rollback and must NOT auto-retry — a blind retry could
-        // double-apply. Surface the uncertainty and let the operator verify.
+        if matches!(e, sqlx::Error::Database(_)) {
+            // The server rejected the COMMIT (e.g. a class-40 serialization
+            // failure, or a deferred-constraint violation). PostgreSQL rolled
+            // the transaction back — the outcome is KNOWN: nothing persisted.
+            // Classify so a class-40 commit abort still consumes the retry
+            // budget like an in-batch abort.
+            let commit_retryable = is_retryable_sqlx_pg_error(&e);
+            for r in results.iter_mut() {
+                r.rolled_back = true;
+            }
+            if let Some(last) = results.last_mut() {
+                last.error = Some(format!("commit failed; transaction rolled back ({e})"));
+            }
+            return (results, commit_retryable);
+        }
+        // A transport/acknowledgement failure (dropped connection, I/O): the
+        // outcome is UNKNOWN — PostgreSQL may have committed server-side even
+        // though the client never saw the ack. Do NOT claim rollback and do
+        // NOT auto-retry (a blind retry could double-apply); make the operator
+        // verify.
         if let Some(last) = results.last_mut() {
             last.error = Some(format!(
                 "commit failed; the transaction outcome is unknown — the changes may or may \
@@ -810,13 +825,53 @@ async fn run_pg_ddl_batch_once(
     (results, retryable)
 }
 
+/// Return `stmt` with leading whitespace and SQL comments removed — line
+/// comments (`-- ...`) and block comments (`/* ... */`, nested as PostgreSQL
+/// allows) — so the first remaining token is the actual command word.
+fn skip_leading_sql_comments(stmt: &str) -> &str {
+    let bytes = stmt.as_bytes();
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let mut depth = 1u32;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    &stmt[i..]
+}
+
 /// If `stmt` begins with a PostgreSQL transaction-control command, return its
-/// canonical keyword; otherwise `None`. Statements arrive already stripped of
-/// leading comments and the trailing `;`, so the first token is the command.
-/// Used to guard the transactional apply wrapper (#109) — these statements
-/// would end the wrapper transaction and break its all-or-nothing guarantee.
+/// canonical keyword; otherwise `None`. Used to guard the transactional apply
+/// wrapper (#109) — these statements would end the wrapper transaction and
+/// break its all-or-nothing guarantee.
 fn transaction_control_keyword(stmt: &str) -> Option<&'static str> {
-    let mut words = stmt.split_whitespace();
+    // PostgreSQL ignores leading comments, so a statement like `/* x */ COMMIT`
+    // executes the COMMIT. Strip leading comments/whitespace before reading the
+    // command word, or the guard is trivially bypassed.
+    let mut words = skip_leading_sql_comments(stmt).split_whitespace();
     let first = words.next()?.trim_end_matches(';').to_ascii_uppercase();
     let kw = match first.as_str() {
         "BEGIN" => "BEGIN",
