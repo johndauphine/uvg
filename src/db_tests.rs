@@ -1,9 +1,10 @@
 use super::*;
+use crate::dialect::Dialect;
 
 #[test]
 fn test_basic_split() {
     let ddl = "CREATE TABLE a (id INT); CREATE TABLE b (id INT);";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert_eq!(stmts[0], "CREATE TABLE a (id INT)");
     assert_eq!(stmts[1], "CREATE TABLE b (id INT)");
@@ -12,7 +13,7 @@ fn test_basic_split() {
 #[test]
 fn test_semicolon_in_single_quotes() {
     let ddl = "COMMENT ON TABLE foo IS 'has; semicolons; inside';\nCREATE TABLE bar (id INT);";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert_eq!(
         stmts[0],
@@ -24,7 +25,7 @@ fn test_semicolon_in_single_quotes() {
 #[test]
 fn test_escaped_single_quotes() {
     let ddl = "COMMENT ON TABLE foo IS 'it''s a test; with quotes';\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert_eq!(
         stmts[0],
@@ -36,7 +37,7 @@ fn test_escaped_single_quotes() {
 #[test]
 fn test_dollar_quoting() {
     let ddl = "CREATE FUNCTION f() RETURNS void AS $$ BEGIN; END; $$ LANGUAGE plpgsql;\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert!(stmts[0].contains("BEGIN; END;"));
     assert_eq!(stmts[1], "SELECT 1");
@@ -45,7 +46,7 @@ fn test_dollar_quoting() {
 #[test]
 fn test_named_dollar_quoting() {
     let ddl = "CREATE FUNCTION f() AS $body$ x; y; $body$ LANGUAGE sql;\nSELECT 2;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert!(stmts[0].contains("x; y;"));
 }
@@ -53,7 +54,7 @@ fn test_named_dollar_quoting() {
 #[test]
 fn test_line_comments_skipped() {
     let ddl = "-- header comment\n-- another\nCREATE TABLE a (id INT);";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 1);
     assert_eq!(stmts[0], "CREATE TABLE a (id INT)");
 }
@@ -61,7 +62,7 @@ fn test_line_comments_skipped() {
 #[test]
 fn test_risk_comments_skipped() {
     let ddl = "-- RISK: blocking\nALTER TABLE users ADD COLUMN email TEXT;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 1);
     assert_eq!(stmts[0], "ALTER TABLE users ADD COLUMN email TEXT");
 }
@@ -69,7 +70,7 @@ fn test_risk_comments_skipped() {
 #[test]
 fn test_semicolon_in_line_comment() {
     let ddl = "-- this; has; semicolons\nCREATE TABLE a (id INT);";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 1);
     assert_eq!(stmts[0], "CREATE TABLE a (id INT)");
 }
@@ -77,23 +78,23 @@ fn test_semicolon_in_line_comment() {
 #[test]
 fn test_comment_only_blocks_stripped() {
     let ddl = "-- just a comment;\n-- nothing here;\n";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 0);
 }
 
 #[test]
 fn test_trailing_content_without_semicolon() {
     let ddl = "CREATE TABLE a (id INT)";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 1);
     assert_eq!(stmts[0], "CREATE TABLE a (id INT)");
 }
 
 #[test]
 fn test_empty_input() {
-    assert_eq!(split_statements("").len(), 0);
-    assert_eq!(split_statements("  \n  ").len(), 0);
-    assert_eq!(split_statements(";;;").len(), 0);
+    assert_eq!(split_statements("", Dialect::Postgres).len(), 0);
+    assert_eq!(split_statements("  \n  ", Dialect::Postgres).len(), 0);
+    assert_eq!(split_statements(";;;", Dialect::Postgres).len(), 0);
 }
 
 // ---- quoted-identifier / block-comment hardening (#110) ----
@@ -106,7 +107,7 @@ fn test_empty_input() {
 fn test_semicolon_in_double_quoted_identifier() {
     // PG/SQLite: `"..."`, `;` inside must not terminate the statement.
     let ddl = "CREATE TABLE \"we;ird\" (id INT);\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert_eq!(stmts[0], "CREATE TABLE \"we;ird\" (id INT)");
     assert_eq!(stmts[1], "SELECT 1");
@@ -117,7 +118,7 @@ fn test_single_quote_and_dashes_in_double_quoted_identifier() {
     // A `'` inside `"..."` must not open a string, and `--` must not open a
     // line comment -- both would swallow the real terminator.
     let ddl = "CREATE TABLE \"a'b--c;d\" (x INT);\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert_eq!(stmts[0], "CREATE TABLE \"a'b--c;d\" (x INT)");
     assert_eq!(stmts[1], "SELECT 1");
@@ -128,7 +129,7 @@ fn test_escaped_double_quote_in_identifier() {
     // `""` is an escaped quote, so the identifier keeps scanning past it and
     // the `;c` stays inside the quotes.
     let ddl = "CREATE TABLE \"a\"\"b;c\" (x INT);\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert_eq!(stmts[0], "CREATE TABLE \"a\"\"b;c\" (x INT)");
     assert_eq!(stmts[1], "SELECT 1");
@@ -138,7 +139,7 @@ fn test_escaped_double_quote_in_identifier() {
 fn test_semicolon_in_backtick_identifier() {
     // MySQL: `` `...` `` with ``` `` ``` escape.
     let ddl = "CREATE TABLE `a``b;c` (id INT);\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Mysql);
     assert_eq!(stmts.len(), 2);
     assert_eq!(stmts[0], "CREATE TABLE `a``b;c` (id INT)");
     assert_eq!(stmts[1], "SELECT 1");
@@ -148,28 +149,49 @@ fn test_semicolon_in_backtick_identifier() {
 fn test_semicolon_in_bracket_identifier() {
     // MSSQL: `[...]` where only `]` is special and `]]` escapes it.
     let ddl = "CREATE TABLE [a]]b;c] (id INT);\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Mssql);
     assert_eq!(stmts.len(), 2);
     assert_eq!(stmts[0], "CREATE TABLE [a]]b;c] (id INT)");
     assert_eq!(stmts[1], "SELECT 1");
 }
 
 #[test]
-fn test_pg_array_brackets_do_not_swallow_terminator() {
-    // Regression guard: `[` starts a bracket identifier, but empty `[]` array
-    // types on PG contain no `;`, so the statement terminator still lands.
+fn test_pg_array_type_brackets_are_not_identifiers() {
+    // Under Postgres `[` is array syntax, not a bracket identifier, so
+    // `integer[]` is ordinary text and the terminator still lands.
     let ddl = "CREATE TABLE \"t\" (\"a\" integer[]);\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert_eq!(stmts[0], "CREATE TABLE \"t\" (\"a\" integer[])");
     assert_eq!(stmts[1], "SELECT 1");
 }
 
 #[test]
+fn test_pg_array_constructor_adjacent_brackets_do_not_merge_statements() {
+    // Regression for the bug an earlier dialect-blind version introduced:
+    // a PG array constructor ending in `]]` (e.g. `ARRAY[[1,2],[3,4]]`) was
+    // misread as an escaped MSSQL bracket, keeping the scanner "inside" a
+    // bracket identifier and swallowing the following statement terminator.
+    // With dialect-aware scanning, `[`/`]` are plain text under Postgres.
+    let ddl = "CREATE TABLE t (a integer[] DEFAULT ARRAY[[1,2],[3,4]]);\nCREATE INDEX i ON t (a);";
+    let stmts = split_statements(ddl, Dialect::Postgres);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "array constructor must not merge statements"
+    );
+    assert_eq!(
+        stmts[0],
+        "CREATE TABLE t (a integer[] DEFAULT ARRAY[[1,2],[3,4]])"
+    );
+    assert_eq!(stmts[1], "CREATE INDEX i ON t (a)");
+}
+
+#[test]
 fn test_semicolon_in_block_comment() {
     // `/* ... */` block comments may contain `;` without terminating.
     let ddl = "CREATE TABLE a (id INT) /* note; with; semis */;\nSELECT 1;";
-    let stmts = split_statements(ddl);
+    let stmts = split_statements(ddl, Dialect::Postgres);
     assert_eq!(stmts.len(), 2);
     assert!(stmts[0].contains("CREATE TABLE a (id INT)"));
     assert_eq!(stmts[1], "SELECT 1");
@@ -177,33 +199,51 @@ fn test_semicolon_in_block_comment() {
 
 /// Round-trip contract: statements joined the way the apply path joins them
 /// (`collect_apply_sql` / `render_up_sql` use `"\n\n"`) must split back into
-/// exactly the original statements. Exercises every quote style with an
-/// identifier that embeds `;`, `'`, `--`, and the style's escape sequence --
-/// the payloads that would fracture a naive splitter.
+/// exactly the original statements. Each dialect is exercised with its own
+/// identifier quote style embedding `;`, `'`, `--`, and the style's escape
+/// sequence -- the payloads that would fracture a naive splitter. A single
+/// DDL blob is always single-dialect in practice, so each case uses one.
 #[test]
-fn test_split_render_round_trip_across_quote_styles() {
-    // Statements as the generator would emit them (each terminated by `;`),
-    // with hostile but legal quoted identifiers.
-    let statements = vec![
-        "CREATE TABLE \"pg;'--\"\"weird\" (\"c\" integer[])".to_string(),
-        "CREATE TABLE `my;'--``weird` (id INT)".to_string(),
-        "CREATE TABLE [ms;'--]]weird] (id INT)".to_string(),
-        "COMMENT ON TABLE plain IS 'a; b; c'".to_string(),
-        "CREATE INDEX ix ON plain (id)".to_string(),
+fn test_split_render_round_trip_per_dialect() {
+    let cases: Vec<(Dialect, Vec<String>)> = vec![
+        (
+            Dialect::Postgres,
+            vec![
+                "CREATE TABLE \"pg;'--\"\"weird\" (\"c\" integer[] DEFAULT ARRAY[[1,2],[3,4]])"
+                    .to_string(),
+                "COMMENT ON TABLE plain IS 'a; b; c'".to_string(),
+                "CREATE INDEX ix ON plain (id)".to_string(),
+            ],
+        ),
+        (
+            Dialect::Mysql,
+            vec![
+                "CREATE TABLE `my;'--``weird` (id INT)".to_string(),
+                "INSERT INTO t VALUES ('a; b')".to_string(),
+            ],
+        ),
+        (
+            Dialect::Mssql,
+            vec![
+                "CREATE TABLE [ms;'--]]weird] (id INT)".to_string(),
+                "INSERT INTO t VALUES ('a; b')".to_string(),
+            ],
+        ),
     ];
 
-    // Mirror the apply path: each statement ends with `;`, joined by "\n\n".
-    let blob = statements
-        .iter()
-        .map(|s| format!("{s};"))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    let split = split_statements(&blob);
-    assert_eq!(
-        split, statements,
-        "split(render(statements)) must recover the original statements"
-    );
+    for (dialect, statements) in cases {
+        // Mirror the apply path: each statement ends with `;`, joined by "\n\n".
+        let blob = statements
+            .iter()
+            .map(|s| format!("{s};"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let split = split_statements(&blob, dialect);
+        assert_eq!(
+            split, statements,
+            "split(render(statements)) must recover the originals for {dialect:?}"
+        );
+    }
 }
 
 // ---- retry primitive (#43) ----

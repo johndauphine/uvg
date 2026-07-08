@@ -1,4 +1,5 @@
 use super::{redact_target_url, validate_apply_blob};
+use crate::dialect::Dialect;
 
 #[test]
 fn test_redact_target_url_strips_password() {
@@ -47,12 +48,17 @@ fn test_redact_target_url_preserves_query_and_path() {
 
 #[test]
 fn validate_apply_blob_allows_executable_sql() {
-    validate_apply_blob("CREATE TABLE users(id INTEGER PRIMARY KEY);", "test").unwrap();
+    validate_apply_blob(
+        "CREATE TABLE users(id INTEGER PRIMARY KEY);",
+        "test",
+        Dialect::Postgres,
+    )
+    .unwrap();
 }
 
 #[test]
 fn validate_apply_blob_allows_noop_sentinel() {
-    validate_apply_blob("-- No schema changes detected.", "test").unwrap();
+    validate_apply_blob("-- No schema changes detected.", "test", Dialect::Postgres).unwrap();
 }
 
 #[test]
@@ -61,6 +67,7 @@ fn validate_apply_blob_rejects_unappliable_marker() {
         "-- WARNING: SQLite does not support ALTER COLUMN. Table recreation required.\n\
          -- ALTER TABLE users ALTER COLUMN email TYPE TEXT;",
         "test",
+        Dialect::Postgres,
     )
     .unwrap_err()
     .to_string();
@@ -74,6 +81,7 @@ fn validate_apply_blob_rejects_mixed_marker_and_sql() {
         "ALTER TABLE users ADD COLUMN phone TEXT;\n\
          -- WARNING: SQLite does not support ALTER COLUMN. Table recreation required.",
         "test",
+        Dialect::Postgres,
     )
     .unwrap_err()
     .to_string();
@@ -83,7 +91,7 @@ fn validate_apply_blob_rejects_mixed_marker_and_sql() {
 
 #[test]
 fn validate_apply_blob_rejects_comment_only_diff() {
-    let err = validate_apply_blob("-- manual follow-up required", "test")
+    let err = validate_apply_blob("-- manual follow-up required", "test", Dialect::Postgres)
         .unwrap_err()
         .to_string();
     assert!(err.contains("non-executable text"));

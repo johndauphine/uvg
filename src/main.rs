@@ -32,6 +32,7 @@ use crate::codegen::ddl_diff::{compute_changes, render_changes};
 use crate::codegen::declarative::DeclarativeGenerator;
 use crate::codegen::tables::TablesGenerator;
 use crate::codegen::Generator;
+use crate::dialect::Dialect;
 use crate::output::{apply_order, write_split_changes, Manifest, OutputContext};
 use crate::schema::{IntrospectedSchema, TableType};
 use crate::table_filter::TableFilter;
@@ -444,7 +445,7 @@ const UNAPPLIABLE_MARKERS: &[&str] = &[
     "-- DROPPED CHECK ",
 ];
 
-fn validate_apply_blob(sql: &str, source_label: &str) -> Result<()> {
+fn validate_apply_blob(sql: &str, source_label: &str, dialect: Dialect) -> Result<()> {
     if let Some(marker) = UNAPPLIABLE_MARKERS
         .iter()
         .find(|marker| sql.contains(*marker))
@@ -456,7 +457,7 @@ fn validate_apply_blob(sql: &str, source_label: &str) -> Result<()> {
         ));
     }
 
-    let statements = db::split_statements(sql);
+    let statements = db::split_statements(sql, dialect);
     if statements.is_empty() {
         let trimmed = sql.trim();
         let is_noop_sentinel =
@@ -485,7 +486,7 @@ async fn apply_inline(
     max_retries: u8,
     parse_check: bool,
 ) -> Result<()> {
-    validate_apply_blob(content, "inline ddl")?;
+    validate_apply_blob(content, "inline ddl", config.dialect())?;
     if parse_check {
         run_parse_check(config, content).await?;
     }
@@ -543,7 +544,7 @@ async fn apply_manifest(
         .map(|path| fs::read_to_string(path).map(|content| (path.clone(), content)))
         .collect::<std::io::Result<Vec<_>>>()?;
     for (path, content) in &contents {
-        validate_apply_blob(content, &path.display().to_string())?;
+        validate_apply_blob(content, &path.display().to_string(), config.dialect())?;
     }
 
     let mut total_applied = 0usize;

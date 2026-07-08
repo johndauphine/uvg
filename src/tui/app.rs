@@ -131,7 +131,8 @@ impl App {
     }
 
     pub(super) fn refresh_executable_statement_count(&mut self) {
-        self.executable_statement_count = count_checked_statements(&self.nodes);
+        let dialect = crate::cli::dialect_from_url(&self.target_url);
+        self.executable_statement_count = count_checked_statements(&self.nodes, dialect);
     }
 }
 
@@ -175,11 +176,11 @@ pub(super) fn node_detail_line_count(node: &TreeNode) -> u16 {
     lines.min(u16::MAX as usize) as u16
 }
 
-fn count_checked_statements(nodes: &[TreeNode]) -> usize {
+fn count_checked_statements(nodes: &[TreeNode], dialect: crate::dialect::Dialect) -> usize {
     nodes
         .iter()
         .filter(|node| node.checked)
         .flat_map(|node| &node.changes)
-        .map(|change| db::split_statements(&change.sql).len())
+        .map(|change| db::split_statements(&change.sql, dialect).len())
         .sum()
 }

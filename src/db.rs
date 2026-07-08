@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::cli::{ConnectionConfig, GeneratorOptions};
+use crate::dialect::Dialect;
 use crate::introspect;
 use crate::schema::IntrospectedSchema;
 use crate::table_filter::TableFilter;
@@ -99,23 +100,33 @@ pub(crate) struct StmtResult {
 ///
 /// - single-quoted string literals `'...'` (with `''` escape),
 /// - dollar-quoted strings (PostgreSQL `$$...$$` / `$tag$...$tag$`),
-/// - double-quoted identifiers `"..."` (PG/SQLite, with `""` escape),
-/// - backtick identifiers `` `...` `` (MySQL, with ``` `` ``` escape),
-/// - bracket identifiers `[...]` (MSSQL, with `]]` escape),
+/// - the target dialect's quoted identifier (see below),
 /// - line comments `-- ...` and block comments `/* ... */`.
 ///
 /// This matters because the generator quotes arbitrary introspected
 /// identifiers (see `quote_identifier`), and a name legally containing `;`,
 /// `'`, or `--` would otherwise fracture a statement mid-way and execute
-/// garbage against a live database. The identifier quote styles are tracked
-/// unconditionally rather than per-dialect: each dialect's generated DDL only
-/// uses its own quote character for identifiers, and the other quote
-/// characters appear only in already-safe positions (e.g. `int[]` array
-/// types on PostgreSQL contain no `;`).
+/// garbage against a live database.
+///
+/// The identifier quote style is chosen by `dialect`, matching what the
+/// generator emits: `"..."` (`""` escape) for PostgreSQL/SQLite,
+/// `` `...` `` (``` `` ``` escape) for MySQL, `[...]` (`]]` escape) for MSSQL.
+/// This is deliberately *not* dialect-blind: `[` delimits an identifier only
+/// in MSSQL, whereas in PostgreSQL it opens array syntax (`integer[]`,
+/// `ARRAY[[1,2],[3,4]]`) whose trailing `]]` would otherwise be misread as an
+/// escaped bracket and swallow the following statement terminator.
 ///
 /// Leading comment-only/blank lines are stripped from each statement chunk so
 /// header comments don't become empty executions.
-pub(crate) fn split_statements(ddl: &str) -> Vec<String> {
+pub(crate) fn split_statements(ddl: &str, dialect: Dialect) -> Vec<String> {
+    // Only the active dialect's identifier quote style is tracked; the other
+    // quote characters are ordinary text (e.g. `[` in PostgreSQL arrays).
+    let (double_quote_ident, backtick_ident, bracket_ident) = match dialect {
+        Dialect::Postgres | Dialect::Sqlite => (true, false, false),
+        Dialect::Mysql => (false, true, false),
+        Dialect::Mssql => (false, false, true),
+    };
+
     let bytes = ddl.as_bytes();
     let mut statements = Vec::new();
     let mut start = 0usize;
@@ -226,15 +237,15 @@ pub(crate) fn split_statements(ddl: &str) -> Vec<String> {
                 in_single_quote = true;
                 i += 1;
             }
-            b'"' => {
+            b'"' if double_quote_ident => {
                 in_double_quote = true;
                 i += 1;
             }
-            b'`' => {
+            b'`' if backtick_ident => {
                 in_backtick = true;
                 i += 1;
             }
-            b'[' => {
+            b'[' if bracket_ident => {
                 in_bracket = true;
                 i += 1;
             }
@@ -349,7 +360,7 @@ pub(crate) async fn parse_check_ddl(
     config: &ConnectionConfig,
     ddl: &str,
 ) -> Result<Vec<ParseError>> {
-    let statements = split_statements(ddl);
+    let statements = split_statements(ddl, config.dialect());
     let mut errors = Vec::new();
 
     match config {
@@ -483,7 +494,7 @@ pub(crate) async fn execute_ddl<F>(
 where
     F: FnMut(&StmtResult, usize, usize),
 {
-    let statements = split_statements(ddl);
+    let statements = split_statements(ddl, config.dialect());
     let total = statements.len();
     let mut results = Vec::new();
 
