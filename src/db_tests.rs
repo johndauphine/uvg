@@ -246,16 +246,15 @@ async fn retry_helper_does_not_retry_non_retryable() {
 }
 
 #[test]
-fn supports_parse_check_only_pg_and_mssql() {
-    // PG (BEGIN/ROLLBACK) and MSSQL (SET PARSEONLY ON) both have
-    // server-side parse-only modes uvg can use. MySQL DDL
-    // auto-commits with no PARSEONLY equivalent; SQLite's EXPLAIN
-    // doesn't cover most DDL. Caller is expected to skip silently
-    // on the latter two.
+fn supports_parse_check_only_pg() {
+    // PG (BEGIN/ROLLBACK) has a server-side parse-check mode uvg can
+    // safely use. MSSQL PARSEONLY is syntax-only and is not safe in
+    // the Tiberius apply path, so it joins MySQL/SQLite in the
+    // skipped dialect set.
     assert!(supports_parse_check(&ConnectionConfig::Postgres(
         "postgres://x".to_string()
     )));
-    assert!(supports_parse_check(&ConnectionConfig::Mssql {
+    assert!(!supports_parse_check(&ConnectionConfig::Mssql {
         host: "x".to_string(),
         port: 1433,
         database: "x".to_string(),

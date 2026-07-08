@@ -142,7 +142,7 @@ Branched histories are supported through explicit merge revisions. When `uvg his
 
 #### Migration safety model
 
-`uvg upgrade` and `uvg downgrade` parse-check migration SQL before applying it when the target dialect has a reliable parse-only mode. PostgreSQL uses a savepoint per statement inside one rolled-back transaction, so it catches syntax and catalog errors. SQL Server uses `SET PARSEONLY ON`, which catches syntax errors but still defers name resolution to execution. MySQL and SQLite do not expose a safe parse-only DDL mode, so UVg prints a one-line skip note and continues. Pass `--no-parse-check` before the subcommand to disable this phase explicitly.
+`uvg upgrade` and `uvg downgrade` parse-check migration SQL before applying it when the target dialect has a reliable parse-only mode. PostgreSQL uses a savepoint per statement inside one rolled-back transaction, so it catches syntax and catalog errors. SQL Server, MySQL, and SQLite do not expose a safe parse-only DDL mode for UVG's apply path, so UVG prints a one-line skip note and continues. Pass `--no-parse-check` before the subcommand to disable this phase explicitly.
 
 Migration DDL is applied statement-by-statement, not as one cross-dialect transaction. On failure, UVg stops at the first failed statement and prints the migration revision, section, statement number, dialect error, and failed SQL without printing the target URL. Earlier statements in the same migration may already be applied. `uvg_version` is advanced only after all `-- PRE`, `-- UP`, and `-- POST` SQL succeeds; downgrades move or clear `uvg_version` only after all down SQL succeeds.
 
@@ -399,6 +399,27 @@ for setup and expected counts.
 cargo build --release
 ./testdata/crm/run_matrix.sh
 ```
+
+### Beta/RC real-schema validation
+
+Before calling a release stable, maintainers run UVG against authorized
+real-world schemas and record the outcome in
+[`docs/beta-validation.md`](docs/beta-validation.md). The helper below creates
+a private validation bundle with generated models, DDL, optional diff/apply
+logs, and optional versioned migration logs:
+
+```bash
+cargo build --release
+scripts/beta_validate_schema.sh --help
+```
+
+For production-sized schema-evolution coverage, maintainers also run the
+StackOverflow2010 drift matrix in
+[`testdata/stackoverflow-drift/`](testdata/stackoverflow-drift/). The optional
+GitHub Actions workflow (run manually via `workflow_dispatch`) restores the SQL
+Server source database from `STACKOVERFLOW2010_BAK_URL`, applies committed drift
+packs, and requires SQL Server, PostgreSQL, MySQL, and SQLite targets to converge
+after every applicable pack.
 
 ## Release process
 

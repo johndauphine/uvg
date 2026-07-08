@@ -6,15 +6,18 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::cli::DdlOptions;
-use crate::codegen::{is_auto_increment_column, topo_sort_tables};
+use crate::codegen::{is_auto_increment_column, is_unique_constraint_index, topo_sort_tables};
 use crate::ddl_typemap;
 use crate::dialect::Dialect;
 use crate::output::Change;
-use crate::schema::{ColumnInfo, IntrospectedSchema, TableInfo, TableType};
+use crate::schema::{
+    ColumnInfo, ConstraintInfo, ConstraintType, IndexInfo, IntrospectedSchema, TableInfo, TableType,
+};
 
 use super::ddl::{
-    format_ddl_default_typed, generate_column_def, generate_create_table, generate_indexes,
-    qualified_table_name, quote_identifier,
+    check_predicate_is_portable, format_ddl_default_typed, generate_column_def,
+    generate_create_table, generate_indexes, qualified_table_name, quote_identifier,
+    translate_check_predicate,
 };
 
 /// Compute the schema diff as a stream of tagged `Change` records.
@@ -105,7 +108,32 @@ pub fn compute_changes(
         if let Some(target_table) = target_map.get(&key) {
             let schema = normalize_schema(&table.schema, &mysql_defaults).to_string();
             let name = table.name.clone();
-            for sql in diff_table_columns(table, target_table, source_dialect, target_dialect) {
+            // Target-side constraint/index drops must precede column changes:
+            // MSSQL rejects DROP COLUMN while a dependent index or constraint
+            // exists, and MySQL can auto-drop an index with its column and
+            // then fail on the later explicit DROP INDEX. Adds stay after
+            // column changes so they can reference newly added columns.
+            let (constraint_drops, constraint_adds) = if options.noconstraints {
+                (Vec::new(), Vec::new())
+            } else {
+                diff_table_constraints(table, target_table, source_dialect, target_dialect)
+            };
+            let (index_drops, index_adds) = if options.noindexes {
+                (Vec::new(), Vec::new())
+            } else {
+                diff_table_indexes(table, target_table, source_dialect, target_dialect)
+            };
+            let mut table_sql = constraint_drops;
+            table_sql.extend(index_drops);
+            table_sql.extend(diff_table_columns(
+                table,
+                target_table,
+                source_dialect,
+                target_dialect,
+            ));
+            table_sql.extend(constraint_adds);
+            table_sql.extend(index_adds);
+            for sql in table_sql {
                 changes.push(Change {
                     table_schema: schema.clone(),
                     table_name: Some(name.clone()),
@@ -273,6 +301,263 @@ fn diff_table_columns(
     stmts
 }
 
+/// Returns (drops, adds) separately so the caller can order target-side
+/// drops before column changes — see the ordering note in compute_changes.
+fn diff_table_constraints(
+    source: &TableInfo,
+    target: &TableInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> (Vec<String>, Vec<String>) {
+    if target_dialect == Dialect::Sqlite {
+        return (Vec::new(), Vec::new());
+    }
+
+    let target_names: HashSet<&str> = target.constraints.iter().map(|c| c.name.as_str()).collect();
+    let mut drops = Vec::new();
+    let mut adds = Vec::new();
+
+    for constraint in &target.constraints {
+        if source
+            .constraints
+            .iter()
+            .any(|source_constraint| source_constraint.name == constraint.name)
+        {
+            continue;
+        }
+        if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
+            && source.constraints.iter().any(|source_constraint| {
+                matches!(
+                    source_constraint.constraint_type,
+                    ConstraintType::PrimaryKey
+                ) && source_constraint.columns == constraint.columns
+            })
+        {
+            continue;
+        }
+        drops.push(render_dropped_constraint(
+            source,
+            constraint,
+            source_dialect,
+            target_dialect,
+        ));
+    }
+
+    for constraint in &source.constraints {
+        if target_names.contains(constraint.name.as_str()) {
+            continue;
+        }
+        if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
+            && target.constraints.iter().any(|target_constraint| {
+                matches!(
+                    target_constraint.constraint_type,
+                    ConstraintType::PrimaryKey
+                ) && target_constraint.columns == constraint.columns
+            })
+        {
+            continue;
+        }
+        if let Some(sql) =
+            render_added_constraint(source, constraint, source_dialect, target_dialect)
+        {
+            adds.push(sql);
+        }
+    }
+
+    (drops, adds)
+}
+
+fn render_dropped_constraint(
+    table: &TableInfo,
+    constraint: &ConstraintInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> String {
+    let tname = qualified_table_name(&table.schema, &table.name, source_dialect, target_dialect);
+    let cname = quote_identifier(&constraint.name, target_dialect);
+
+    let sql = match target_dialect {
+        Dialect::Postgres => format!("ALTER TABLE {tname} DROP CONSTRAINT IF EXISTS {cname};"),
+        Dialect::Mssql => format!("ALTER TABLE {tname} DROP CONSTRAINT {cname};"),
+        Dialect::Mysql => match constraint.constraint_type {
+            ConstraintType::ForeignKey => format!("ALTER TABLE {tname} DROP FOREIGN KEY {cname};"),
+            ConstraintType::PrimaryKey => format!("ALTER TABLE {tname} DROP PRIMARY KEY;"),
+            ConstraintType::Unique => format!("ALTER TABLE {tname} DROP INDEX {cname};"),
+            ConstraintType::Check => format!("ALTER TABLE {tname} DROP CHECK {cname};"),
+        },
+        Dialect::Sqlite => format!(
+            "-- WARNING: SQLite cannot drop constraint {} without rebuilding table {}",
+            constraint.name, table.name
+        ),
+    };
+    if matches!(target_dialect, Dialect::Sqlite) {
+        sql
+    } else {
+        format!("-- WARNING: destructive operation\n{sql}")
+    }
+}
+
+fn render_added_constraint(
+    table: &TableInfo,
+    constraint: &ConstraintInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> Option<String> {
+    let tname = qualified_table_name(&table.schema, &table.name, source_dialect, target_dialect);
+    let cname = quote_identifier(&constraint.name, target_dialect);
+    let cols: Vec<String> = constraint
+        .columns
+        .iter()
+        .map(|col| quote_identifier(col, target_dialect))
+        .collect();
+
+    match constraint.constraint_type {
+        ConstraintType::PrimaryKey => Some(format!(
+            "ALTER TABLE {tname} ADD CONSTRAINT {cname} PRIMARY KEY ({});",
+            cols.join(", ")
+        )),
+        ConstraintType::Unique => Some(format!(
+            "ALTER TABLE {tname} ADD CONSTRAINT {cname} UNIQUE ({});",
+            cols.join(", ")
+        )),
+        ConstraintType::ForeignKey => {
+            let fk = constraint.foreign_key.as_ref()?;
+            let ref_table = qualified_table_name(
+                &fk.ref_schema,
+                &fk.ref_table,
+                source_dialect,
+                target_dialect,
+            );
+            let ref_cols: Vec<String> = fk
+                .ref_columns
+                .iter()
+                .map(|col| quote_identifier(col, target_dialect))
+                .collect();
+            let mut sql = format!(
+                "ALTER TABLE {tname} ADD CONSTRAINT {cname} FOREIGN KEY ({}) REFERENCES {ref_table} ({});",
+                cols.join(", "),
+                ref_cols.join(", ")
+            );
+            if fk.delete_rule != "NO ACTION" {
+                sql.insert_str(sql.len() - 1, &format!(" ON DELETE {}", fk.delete_rule));
+            }
+            if fk.update_rule != "NO ACTION" {
+                sql.insert_str(sql.len() - 1, &format!(" ON UPDATE {}", fk.update_rule));
+            }
+            Some(sql)
+        }
+        ConstraintType::Check => {
+            let expr = constraint.check_expression.as_ref()?;
+            if source_dialect != target_dialect
+                && !check_predicate_is_portable(expr, source_dialect, target_dialect)
+            {
+                return Some(format!(
+                    "-- DROPPED CHECK {}: predicate uses non-portable syntax\n--   source: {}",
+                    constraint.name,
+                    expr.replace('\n', " ")
+                ));
+            }
+            let translated = translate_check_predicate(expr, source_dialect, target_dialect);
+            Some(format!(
+                "ALTER TABLE {tname} ADD CONSTRAINT {cname} CHECK ({translated});"
+            ))
+        }
+    }
+}
+
+/// Returns (drops, adds) separately so the caller can order target-side
+/// drops before column changes — see the ordering note in compute_changes.
+fn diff_table_indexes(
+    source: &TableInfo,
+    target: &TableInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> (Vec<String>, Vec<String>) {
+    let target_names: HashSet<&str> = target.indexes.iter().map(|idx| idx.name.as_str()).collect();
+    let source_names: HashSet<&str> = source.indexes.iter().map(|idx| idx.name.as_str()).collect();
+    let drops: Vec<String> = target
+        .indexes
+        .iter()
+        .filter(|idx| !source_names.contains(idx.name.as_str()))
+        .filter(|idx| !is_constraint_backing_index(idx, &target.constraints, target_dialect))
+        .map(|idx| render_dropped_index(source, idx, source_dialect, target_dialect))
+        .collect();
+
+    let adds: Vec<String> = source
+        .indexes
+        .iter()
+        .filter(|idx| !target_names.contains(idx.name.as_str()))
+        .filter(|idx| !is_unique_constraint_index(idx, &source.constraints))
+        .map(|idx| render_added_index(source, idx, source_dialect, target_dialect))
+        .collect();
+    (drops, adds)
+}
+
+fn is_constraint_backing_index(
+    index: &IndexInfo,
+    constraints: &[ConstraintInfo],
+    target_dialect: Dialect,
+) -> bool {
+    if is_unique_constraint_index(index, constraints) {
+        return true;
+    }
+    if index.is_unique
+        && constraints.iter().any(|constraint| {
+            matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
+                && constraint.columns == index.columns
+        })
+    {
+        return true;
+    }
+    // Only MySQL/InnoDB auto-creates FK backing indexes (and refuses to drop
+    // them while the FK exists). On PG/MSSQL an index on FK columns is always
+    // user-created and must participate in drift, or a target-only index
+    // would falsely converge.
+    target_dialect == Dialect::Mysql
+        && constraints.iter().any(|constraint| {
+            matches!(constraint.constraint_type, ConstraintType::ForeignKey)
+                && constraint.columns == index.columns
+        })
+}
+
+fn render_dropped_index(
+    table: &TableInfo,
+    index: &IndexInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> String {
+    let tname = qualified_table_name(&table.schema, &table.name, source_dialect, target_dialect);
+    let iname = quote_identifier(&index.name, target_dialect);
+    match target_dialect {
+        Dialect::Postgres | Dialect::Sqlite => {
+            let qname =
+                qualified_table_name(&table.schema, &index.name, source_dialect, target_dialect);
+            format!("DROP INDEX IF EXISTS {qname};")
+        }
+        Dialect::Mssql | Dialect::Mysql => format!("DROP INDEX {iname} ON {tname};"),
+    }
+}
+
+fn render_added_index(
+    table: &TableInfo,
+    index: &IndexInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> String {
+    let tname = qualified_table_name(&table.schema, &table.name, source_dialect, target_dialect);
+    let unique = if index.is_unique { "UNIQUE " } else { "" };
+    let cols: Vec<String> = index
+        .columns
+        .iter()
+        .map(|col| quote_identifier(col, target_dialect))
+        .collect();
+    format!(
+        "CREATE {unique}INDEX {} ON {tname} ({});",
+        quote_identifier(&index.name, target_dialect),
+        cols.join(", ")
+    )
+}
+
 /// Compare a single column and emit ALTER statements if different.
 /// Compares type, nullability, and default values.
 fn diff_column(
@@ -291,7 +576,13 @@ fn diff_column(
     let target_type = ddl_typemap::map_ddl_type(target, target_dialect, target_dialect);
 
     let type_changed = source_type.sql_type != target_type.sql_type;
-    let nullable_changed = source.is_nullable != target.is_nullable;
+    let source_auto = is_auto_increment_column(source, source_dialect);
+    let target_auto = is_auto_increment_column(target, target_dialect);
+    let nullable_changed = if source_dialect != target_dialect && source_auto && target_auto {
+        false
+    } else {
+        source.is_nullable != target.is_nullable
+    };
 
     // Compare defaults with boolean-aware normalization
     let canonical = ddl_typemap::to_canonical(source, source_dialect);
@@ -310,8 +601,6 @@ fn diff_column(
     // both sides are auto-increment. Same-dialect diffs keep the literal
     // comparison so divergent sequences (e.g. nextval('a') vs nextval('b'))
     // still surface as real drift.
-    let source_auto = is_auto_increment_column(source, source_dialect);
-    let target_auto = is_auto_increment_column(target, target_dialect);
     let default_changed = if source_auto && target_auto && source_dialect != target_dialect {
         false
     } else {
