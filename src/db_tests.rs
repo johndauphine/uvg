@@ -96,6 +96,116 @@ fn test_empty_input() {
     assert_eq!(split_statements(";;;").len(), 0);
 }
 
+// ---- quoted-identifier / block-comment hardening (#110) ----
+//
+// The generator quotes arbitrary introspected identifiers, so a name legally
+// containing `;`, `'`, or `--` must not fracture the surrounding statement.
+// One case per quote style, plus its dialect-specific escape sequence.
+
+#[test]
+fn test_semicolon_in_double_quoted_identifier() {
+    // PG/SQLite: `"..."`, `;` inside must not terminate the statement.
+    let ddl = "CREATE TABLE \"we;ird\" (id INT);\nSELECT 1;";
+    let stmts = split_statements(ddl);
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[0], "CREATE TABLE \"we;ird\" (id INT)");
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_single_quote_and_dashes_in_double_quoted_identifier() {
+    // A `'` inside `"..."` must not open a string, and `--` must not open a
+    // line comment -- both would swallow the real terminator.
+    let ddl = "CREATE TABLE \"a'b--c;d\" (x INT);\nSELECT 1;";
+    let stmts = split_statements(ddl);
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[0], "CREATE TABLE \"a'b--c;d\" (x INT)");
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_escaped_double_quote_in_identifier() {
+    // `""` is an escaped quote, so the identifier keeps scanning past it and
+    // the `;c` stays inside the quotes.
+    let ddl = "CREATE TABLE \"a\"\"b;c\" (x INT);\nSELECT 1;";
+    let stmts = split_statements(ddl);
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[0], "CREATE TABLE \"a\"\"b;c\" (x INT)");
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_semicolon_in_backtick_identifier() {
+    // MySQL: `` `...` `` with ``` `` ``` escape.
+    let ddl = "CREATE TABLE `a``b;c` (id INT);\nSELECT 1;";
+    let stmts = split_statements(ddl);
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[0], "CREATE TABLE `a``b;c` (id INT)");
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_semicolon_in_bracket_identifier() {
+    // MSSQL: `[...]` where only `]` is special and `]]` escapes it.
+    let ddl = "CREATE TABLE [a]]b;c] (id INT);\nSELECT 1;";
+    let stmts = split_statements(ddl);
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[0], "CREATE TABLE [a]]b;c] (id INT)");
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_pg_array_brackets_do_not_swallow_terminator() {
+    // Regression guard: `[` starts a bracket identifier, but empty `[]` array
+    // types on PG contain no `;`, so the statement terminator still lands.
+    let ddl = "CREATE TABLE \"t\" (\"a\" integer[]);\nSELECT 1;";
+    let stmts = split_statements(ddl);
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[0], "CREATE TABLE \"t\" (\"a\" integer[])");
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_semicolon_in_block_comment() {
+    // `/* ... */` block comments may contain `;` without terminating.
+    let ddl = "CREATE TABLE a (id INT) /* note; with; semis */;\nSELECT 1;";
+    let stmts = split_statements(ddl);
+    assert_eq!(stmts.len(), 2);
+    assert!(stmts[0].contains("CREATE TABLE a (id INT)"));
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+/// Round-trip contract: statements joined the way the apply path joins them
+/// (`collect_apply_sql` / `render_up_sql` use `"\n\n"`) must split back into
+/// exactly the original statements. Exercises every quote style with an
+/// identifier that embeds `;`, `'`, `--`, and the style's escape sequence --
+/// the payloads that would fracture a naive splitter.
+#[test]
+fn test_split_render_round_trip_across_quote_styles() {
+    // Statements as the generator would emit them (each terminated by `;`),
+    // with hostile but legal quoted identifiers.
+    let statements = vec![
+        "CREATE TABLE \"pg;'--\"\"weird\" (\"c\" integer[])".to_string(),
+        "CREATE TABLE `my;'--``weird` (id INT)".to_string(),
+        "CREATE TABLE [ms;'--]]weird] (id INT)".to_string(),
+        "COMMENT ON TABLE plain IS 'a; b; c'".to_string(),
+        "CREATE INDEX ix ON plain (id)".to_string(),
+    ];
+
+    // Mirror the apply path: each statement ends with `;`, joined by "\n\n".
+    let blob = statements
+        .iter()
+        .map(|s| format!("{s};"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let split = split_statements(&blob);
+    assert_eq!(
+        split, statements,
+        "split(render(statements)) must recover the original statements"
+    );
+}
+
 // ---- retry primitive (#43) ----
 
 #[test]
