@@ -752,21 +752,30 @@ async fn run_pg_ddl_batch_once(
     }
 
     if failed {
+        // A statement failed mid-batch: the transaction is definitively rolled
+        // back, so nothing persisted. This is the retryable case (a class-40
+        // abort applies to the whole transaction).
         let _ = tx.rollback().await;
-    } else if let Err(e) = tx.commit().await {
-        // Commit itself failed: nothing persisted. Attribute the error to the
-        // last statement so the caller reports a failure and rolls back.
-        retryable = is_retryable_sqlx_pg_error(&e);
-        failed = true;
-        if let Some(last) = results.last_mut() {
-            last.error = Some(format!("commit failed: {e}"));
-        }
-    }
-
-    if failed {
         for r in results.iter_mut() {
             r.rolled_back = true;
         }
+        return (results, retryable);
+    }
+
+    if let Err(e) = tx.commit().await {
+        // Commit itself failed. The outcome is UNKNOWN, not rolled back:
+        // PostgreSQL may have committed server-side even if the client never
+        // received the acknowledgement (e.g. a dropped connection). So we must
+        // NOT claim rollback and must NOT auto-retry — a blind retry could
+        // double-apply. Surface the uncertainty and let the operator verify.
+        if let Some(last) = results.last_mut() {
+            last.error = Some(format!(
+                "commit failed; the transaction outcome is unknown — the changes may or may \
+                 not have been applied. Verify the target before retrying ({e})"
+            ));
+        }
+        // rolled_back stays false; not retryable.
+        return (results, false);
     }
 
     (results, retryable)

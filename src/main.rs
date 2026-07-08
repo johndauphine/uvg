@@ -595,18 +595,31 @@ async fn apply_manifest(
             db::execute_ddl(config, content, max_retries, observer).await?
         };
         let applied_here = results.iter().take_while(|r| r.error.is_none()).count();
-        total_applied += applied_here;
         if let Some(failed) = results.iter().find(|r| r.error.is_some()) {
+            // Each file is applied in its own transaction, so a rollback here
+            // only guarantees THIS file is unchanged — earlier files in the run
+            // may already have committed. Scope the note accordingly.
+            let note = if results.iter().any(|r| r.rolled_back) {
+                if total_applied > 0 {
+                    "\n(this file's transaction was rolled back, but earlier files in this run \
+                     were already applied — the target is partially migrated; verify before retrying)"
+                } else {
+                    "\n(the apply ran in a transaction and was rolled back; the target is unchanged)"
+                }
+            } else {
+                ""
+            };
             return Err(anyhow::anyhow!(
                 "uvg: apply failed in {} (statement {}/{}): {}{}\n--- SQL ---\n{}",
                 path.display(),
                 applied_here + 1,
                 results.len(),
                 failed.error.as_deref().unwrap_or(""),
-                apply_rollback_note(&results),
+                note,
                 failed.sql,
             ));
         }
+        total_applied += applied_here;
     }
     eprintln!(
         "uvg: applied {} statement(s) across {} file(s) to {}",
