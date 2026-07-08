@@ -85,15 +85,25 @@ pub(crate) fn apply_requested_profile(cli: &mut Cli, matches: &ArgMatches) -> Re
     apply_requested_profile_from_path(cli, &sources, &path)
 }
 
-fn default_profiles_path() -> Result<PathBuf> {
+/// Resolve the path to the user's profiles file, in order:
+/// `$XDG_CONFIG_HOME/uvg/`, `$HOME/.config/uvg/` (Unix), then `%APPDATA%\uvg\`
+/// (Windows, where `HOME` is usually unset). Shared by the profile loader and
+/// `uvg init` so the file `init` scaffolds is exactly the file `--profile`
+/// reads — on every supported platform.
+pub(crate) fn default_profiles_path() -> Result<PathBuf> {
     if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(config_home).join("uvg").join("profiles.yaml"));
     }
-
-    let home = std::env::var_os("HOME").map(PathBuf::from).context(
-        "UVG_PROFILE was set, but HOME is not available to locate ~/.config/uvg/profiles.yaml",
-    )?;
-    Ok(home.join(".config").join("uvg").join("profiles.yaml"))
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home)
+            .join(".config")
+            .join("uvg")
+            .join("profiles.yaml"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return Ok(PathBuf::from(appdata).join("uvg").join("profiles.yaml"));
+    }
+    bail!("cannot locate a config directory: set XDG_CONFIG_HOME, HOME, or APPDATA")
 }
 
 fn apply_requested_profile_from_path(

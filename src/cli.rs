@@ -162,9 +162,11 @@ pub struct InitCommand {
     #[arg(long, default_value = "./migrations")]
     pub migrations_dir: PathBuf,
 
-    /// Project-local config file to create
-    #[arg(long, default_value = "./uvg.toml")]
-    pub config: PathBuf,
+    /// Path to the profiles file to scaffold. Defaults to the user profiles
+    /// path that `--profile` reads (`$XDG_CONFIG_HOME/uvg/profiles.yaml`, or
+    /// `~/.config/uvg/profiles.yaml`). An existing file is left untouched.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
