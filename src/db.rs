@@ -1017,10 +1017,10 @@ fn command_prefix_has_keyword(s: &str, target: &str) -> bool {
 /// them outright, so a batch containing one is applied statement-by-statement
 /// (non-atomic) instead.
 ///
-/// Detection is command-aware: `CONCURRENTLY` only makes an INDEX/REINDEX
-/// command non-transactional, and only as the unquoted keyword before the
-/// column list — so an ordinary statement that merely mentions a
-/// `"concurrently"` identifier or literal stays on the atomic path.
+/// Detection is command-aware: for CREATE/DROP INDEX, `CONCURRENTLY` counts
+/// only as the unquoted keyword before the column list — so an ordinary
+/// statement that merely mentions a `"concurrently"` identifier or literal
+/// stays on the atomic path. VACUUM and REINDEX are matched by command word.
 fn is_non_transactional_pg_statement(stmt: &str) -> bool {
     let cleaned = skip_leading_sql_comments(stmt);
     let (w1, rest) = next_command_word(cleaned);
@@ -1029,7 +1029,13 @@ fn is_non_transactional_pg_statement(stmt: &str) -> bool {
         .0
         .to_ascii_uppercase();
 
-    if first == "VACUUM" {
+    // VACUUM never runs in a transaction. REINDEX is treated as
+    // non-transactional wholesale: its DATABASE/SYSTEM/SCHEMA and CONCURRENTLY
+    // forms are rejected inside a transaction, and the transactional-only forms
+    // (REINDEX INDEX/TABLE) are single maintenance statements where atomic vs.
+    // statement-by-statement is indistinguishable — so this avoids parsing
+    // REINDEX's option/target grammar without any real loss.
+    if first == "VACUUM" || first == "REINDEX" {
         return true;
     }
     if first == "ALTER" && second == "SYSTEM" {
@@ -1041,10 +1047,9 @@ fn is_non_transactional_pg_statement(stmt: &str) -> bool {
         return true;
     }
 
-    // `CONCURRENTLY` variants: CREATE [UNIQUE] INDEX ... CONCURRENTLY,
-    // DROP INDEX ... CONCURRENTLY, REINDEX ... CONCURRENTLY.
-    let is_index_command = first == "REINDEX"
-        || (first == "CREATE" && (second == "INDEX" || second == "UNIQUE"))
+    // `CONCURRENTLY` makes an index build/drop non-transactional: CREATE
+    // [UNIQUE] INDEX ... CONCURRENTLY, DROP INDEX ... CONCURRENTLY.
+    let is_index_command = (first == "CREATE" && (second == "INDEX" || second == "UNIQUE"))
         || (first == "DROP" && second == "INDEX");
     is_index_command && command_prefix_has_keyword(cleaned, "CONCURRENTLY")
 }
