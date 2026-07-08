@@ -304,6 +304,25 @@ pub enum ConnectionConfig {
     Sqlite(String),
 }
 
+/// Best-effort dialect inference from a connection URL's scheme, for
+/// display-only paths (e.g. the TUI statement counter) that hold a raw URL
+/// rather than a parsed [`ConnectionConfig`]. Mirrors the scheme prefixes
+/// accepted by [`Cli::parse_connection`]; defaults to Postgres for
+/// unrecognized or empty input. Not for correctness-critical paths — those
+/// use [`ConnectionConfig::dialect`] on the already-parsed config.
+pub(crate) fn dialect_from_url(url: &str) -> Dialect {
+    let u = url.trim();
+    if u.starts_with("mysql") || u.starts_with("mariadb") {
+        Dialect::Mysql
+    } else if u.starts_with("mssql") || u.starts_with("sqlserver") {
+        Dialect::Mssql
+    } else if u.starts_with("sqlite") {
+        Dialect::Sqlite
+    } else {
+        Dialect::Postgres
+    }
+}
+
 impl ConnectionConfig {
     pub fn dialect(&self) -> Dialect {
         match self {

@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::cli::{ConnectionConfig, GeneratorOptions};
+use crate::dialect::Dialect;
 use crate::introspect;
 use crate::schema::IntrospectedSchema;
 use crate::table_filter::TableFilter;
@@ -93,17 +94,49 @@ pub(crate) struct StmtResult {
 }
 
 /// Split DDL output into individual statements using a SQL-aware splitter.
-/// Handles semicolons inside single-quoted strings (with `''` escape),
-/// dollar-quoted strings (PostgreSQL `$$...$$` / `$tag$...$tag$`), and
-/// line comments (`--`). Strips leading comment-only/blank lines from each
-/// statement chunk so header comments don't become empty executions.
-pub(crate) fn split_statements(ddl: &str) -> Vec<String> {
+///
+/// A `;` only terminates a statement when it sits in ordinary SQL text, so
+/// the scanner tracks every construct a `;` can legally hide inside:
+///
+/// - single-quoted string literals `'...'` (with `''` escape),
+/// - dollar-quoted strings (PostgreSQL `$$...$$` / `$tag$...$tag$`),
+/// - the target dialect's quoted identifier (see below),
+/// - line comments `-- ...` and block comments `/* ... */`.
+///
+/// This matters because the generator quotes arbitrary introspected
+/// identifiers (see `quote_identifier`), and a name legally containing `;`,
+/// `'`, or `--` would otherwise fracture a statement mid-way and execute
+/// garbage against a live database.
+///
+/// The identifier quote style is chosen by `dialect`, matching what the
+/// generator emits: `"..."` (`""` escape) for PostgreSQL/SQLite,
+/// `` `...` `` (``` `` ``` escape) for MySQL, `[...]` (`]]` escape) for MSSQL.
+/// This is deliberately *not* dialect-blind: `[` delimits an identifier only
+/// in MSSQL, whereas in PostgreSQL it opens array syntax (`integer[]`,
+/// `ARRAY[[1,2],[3,4]]`) whose trailing `]]` would otherwise be misread as an
+/// escaped bracket and swallow the following statement terminator.
+///
+/// Leading comment-only/blank lines are stripped from each statement chunk so
+/// header comments don't become empty executions.
+pub(crate) fn split_statements(ddl: &str, dialect: Dialect) -> Vec<String> {
+    // Only the active dialect's identifier quote style is tracked; the other
+    // quote characters are ordinary text (e.g. `[` in PostgreSQL arrays).
+    let (double_quote_ident, backtick_ident, bracket_ident) = match dialect {
+        Dialect::Postgres | Dialect::Sqlite => (true, false, false),
+        Dialect::Mysql => (false, true, false),
+        Dialect::Mssql => (false, false, true),
+    };
+
     let bytes = ddl.as_bytes();
     let mut statements = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
     let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
     let mut in_line_comment = false;
+    let mut in_block_comment = false;
     let mut dollar_tag: Option<String> = None;
 
     while i < bytes.len() {
@@ -112,6 +145,17 @@ pub(crate) fn split_statements(ddl: &str) -> Vec<String> {
             if ddl[i..].starts_with(tag.as_str()) {
                 i += tag.len();
                 dollar_tag = None;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Inside a block comment: skip until the closing `*/`
+        if in_block_comment {
+            if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
             } else {
                 i += 1;
             }
@@ -143,13 +187,74 @@ pub(crate) fn split_statements(ddl: &str) -> Vec<String> {
             continue;
         }
 
+        // Inside a double-quoted identifier (PG/SQLite; "" escapes a quote)
+        if in_double_quote {
+            if bytes[i] == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                } else {
+                    in_double_quote = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Inside a backtick identifier (MySQL; `` escapes a backtick)
+        if in_backtick {
+            if bytes[i] == b'`' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
+                    i += 2;
+                } else {
+                    in_backtick = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Inside a bracket identifier (MSSQL; only `]` is special, `]]` escapes it)
+        if in_bracket {
+            if bytes[i] == b']' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                    i += 2;
+                } else {
+                    in_bracket = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
         match bytes[i] {
             b'\'' => {
                 in_single_quote = true;
                 i += 1;
             }
+            b'"' if double_quote_ident => {
+                in_double_quote = true;
+                i += 1;
+            }
+            b'`' if backtick_ident => {
+                in_backtick = true;
+                i += 1;
+            }
+            b'[' if bracket_ident => {
+                in_bracket = true;
+                i += 1;
+            }
             b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
                 in_line_comment = true;
+                i += 2;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                in_block_comment = true;
                 i += 2;
             }
             b'$' => {
@@ -255,7 +360,7 @@ pub(crate) async fn parse_check_ddl(
     config: &ConnectionConfig,
     ddl: &str,
 ) -> Result<Vec<ParseError>> {
-    let statements = split_statements(ddl);
+    let statements = split_statements(ddl, config.dialect());
     let mut errors = Vec::new();
 
     match config {
@@ -389,7 +494,7 @@ pub(crate) async fn execute_ddl<F>(
 where
     F: FnMut(&StmtResult, usize, usize),
 {
-    let statements = split_statements(ddl);
+    let statements = split_statements(ddl, config.dialect());
     let total = statements.len();
     let mut results = Vec::new();
 

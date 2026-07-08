@@ -246,7 +246,7 @@ fn test_comment_only_changes_have_zero_executable_statements() {
     let sql = collect_apply_sql(&nodes);
     assert!(!sql.is_empty(), "comment SQL is non-empty as text");
     assert_eq!(
-        count_statements(&sql),
+        count_statements(&sql, crate::dialect::Dialect::Sqlite),
         0,
         "but it must split into zero executable statements; sql was: {sql}"
     );

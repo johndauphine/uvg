@@ -126,6 +126,6 @@ fn make_cli(url: &str, trust_cert: bool) -> Cli {
 }
 
 #[cfg(test)]
-pub(super) fn count_statements(ddl: &str) -> usize {
-    db::split_statements(ddl).len()
+pub(super) fn count_statements(ddl: &str, dialect: crate::dialect::Dialect) -> usize {
+    db::split_statements(ddl, dialect).len()
 }
