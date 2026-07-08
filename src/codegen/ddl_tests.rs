@@ -102,9 +102,8 @@ fn test_translate_default_now_extended() {
 
 #[test]
 fn test_translate_check_predicate_mssql_brackets() {
-    // MSSQL→non-MSSQL: square-bracket identifiers must become
-    // double-quotes (which PG and MySQL accept), and Unicode string
-    // literal prefixes must be stripped for PG.
+    // MSSQL→PG: square-bracket identifiers become double-quotes and
+    // Unicode string literal prefixes are stripped.
     let mssql = "([code]=upper([code]) AND [state] IN (N'open', N'closed'))";
     assert_eq!(
         translate_check_predicate(mssql, Dialect::Mssql, Dialect::Postgres),
@@ -115,10 +114,57 @@ fn test_translate_check_predicate_mssql_brackets() {
         translate_check_predicate(mssql_like, Dialect::Mssql, Dialect::Postgres),
         "(\"state\" LIKE 'op%')"
     );
+    // MSSQL→MySQL: identifiers must be backtick-quoted — MySQL's default
+    // sql_mode reads "..." as a string literal, so a double-quoted
+    // identifier would turn the CHECK into a constant expression and
+    // silently stop validating the column.
+    assert_eq!(
+        translate_check_predicate(mssql, Dialect::Mssql, Dialect::Mysql),
+        "(`code`=upper(`code`) AND `state` IN ('open', 'closed'))"
+    );
+    assert_eq!(
+        translate_check_predicate("([ProfileScore]>=(0))", Dialect::Mssql, Dialect::Mysql),
+        "(`ProfileScore`>=(0))"
+    );
     // MSSQL→MSSQL: brackets pass through.
     assert_eq!(
         translate_check_predicate(mssql, Dialect::Mssql, Dialect::Mssql),
         mssql
+    );
+}
+
+#[test]
+fn test_translate_default_now_mssql_target_preserves_native_variants() {
+    // MSSQL-native now-family functions must survive an MSSQL target
+    // unchanged (modulo casing): collapsing SYSUTCDATETIME()/GETUTCDATE()
+    // to GETDATE() would silently change a UTC default to server-local
+    // time in same-dialect clone/migration output.
+    assert_eq!(
+        translate_default_function("sysutcdatetime()", Dialect::Mssql),
+        "SYSUTCDATETIME()"
+    );
+    assert_eq!(
+        translate_default_function("getutcdate()", Dialect::Mssql),
+        "GETUTCDATE()"
+    );
+    assert_eq!(
+        translate_default_function("SYSDATETIMEOFFSET()", Dialect::Mssql),
+        "SYSDATETIMEOFFSET()"
+    );
+    assert_eq!(
+        translate_default_function("getdate()", Dialect::Mssql),
+        "GETDATE()"
+    );
+    // Foreign now-functions still translate to the MSSQL idiom.
+    assert_eq!(
+        translate_default_function("now()", Dialect::Mssql),
+        "GETDATE()"
+    );
+    // Cross-dialect collapse is unchanged: UTC-ness is not preserved on
+    // non-MSSQL targets (see the comment on translate_default_function).
+    assert_eq!(
+        translate_default_function("sysutcdatetime()", Dialect::Postgres),
+        "now()"
     );
 }
 

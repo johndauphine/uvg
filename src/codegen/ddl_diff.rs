@@ -108,24 +108,31 @@ pub fn compute_changes(
         if let Some(target_table) = target_map.get(&key) {
             let schema = normalize_schema(&table.schema, &mysql_defaults).to_string();
             let name = table.name.clone();
-            let mut table_sql =
-                diff_table_columns(table, target_table, source_dialect, target_dialect);
-            if !options.noconstraints {
-                table_sql.extend(diff_table_constraints(
-                    table,
-                    target_table,
-                    source_dialect,
-                    target_dialect,
-                ));
-            }
-            if !options.noindexes {
-                table_sql.extend(diff_table_indexes(
-                    table,
-                    target_table,
-                    source_dialect,
-                    target_dialect,
-                ));
-            }
+            // Target-side constraint/index drops must precede column changes:
+            // MSSQL rejects DROP COLUMN while a dependent index or constraint
+            // exists, and MySQL can auto-drop an index with its column and
+            // then fail on the later explicit DROP INDEX. Adds stay after
+            // column changes so they can reference newly added columns.
+            let (constraint_drops, constraint_adds) = if options.noconstraints {
+                (Vec::new(), Vec::new())
+            } else {
+                diff_table_constraints(table, target_table, source_dialect, target_dialect)
+            };
+            let (index_drops, index_adds) = if options.noindexes {
+                (Vec::new(), Vec::new())
+            } else {
+                diff_table_indexes(table, target_table, source_dialect, target_dialect)
+            };
+            let mut table_sql = constraint_drops;
+            table_sql.extend(index_drops);
+            table_sql.extend(diff_table_columns(
+                table,
+                target_table,
+                source_dialect,
+                target_dialect,
+            ));
+            table_sql.extend(constraint_adds);
+            table_sql.extend(index_adds);
             for sql in table_sql {
                 changes.push(Change {
                     table_schema: schema.clone(),
@@ -294,18 +301,21 @@ fn diff_table_columns(
     stmts
 }
 
+/// Returns (drops, adds) separately so the caller can order target-side
+/// drops before column changes — see the ordering note in compute_changes.
 fn diff_table_constraints(
     source: &TableInfo,
     target: &TableInfo,
     source_dialect: Dialect,
     target_dialect: Dialect,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     if target_dialect == Dialect::Sqlite {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let target_names: HashSet<&str> = target.constraints.iter().map(|c| c.name.as_str()).collect();
-    let mut stmts = Vec::new();
+    let mut drops = Vec::new();
+    let mut adds = Vec::new();
 
     for constraint in &target.constraints {
         if source
@@ -325,7 +335,7 @@ fn diff_table_constraints(
         {
             continue;
         }
-        stmts.push(render_dropped_constraint(
+        drops.push(render_dropped_constraint(
             source,
             constraint,
             source_dialect,
@@ -350,11 +360,11 @@ fn diff_table_constraints(
         if let Some(sql) =
             render_added_constraint(source, constraint, source_dialect, target_dialect)
         {
-            stmts.push(sql);
+            adds.push(sql);
         }
     }
 
-    stmts
+    (drops, adds)
 }
 
 fn render_dropped_constraint(
@@ -455,44 +465,56 @@ fn render_added_constraint(
     }
 }
 
+/// Returns (drops, adds) separately so the caller can order target-side
+/// drops before column changes — see the ordering note in compute_changes.
 fn diff_table_indexes(
     source: &TableInfo,
     target: &TableInfo,
     source_dialect: Dialect,
     target_dialect: Dialect,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let target_names: HashSet<&str> = target.indexes.iter().map(|idx| idx.name.as_str()).collect();
     let source_names: HashSet<&str> = source.indexes.iter().map(|idx| idx.name.as_str()).collect();
-    let mut stmts: Vec<String> = target
+    let drops: Vec<String> = target
         .indexes
         .iter()
         .filter(|idx| !source_names.contains(idx.name.as_str()))
-        .filter(|idx| !is_constraint_backing_index(idx, &target.constraints))
+        .filter(|idx| !is_constraint_backing_index(idx, &target.constraints, target_dialect))
         .map(|idx| render_dropped_index(source, idx, source_dialect, target_dialect))
         .collect();
 
-    stmts.extend(
-        source
-            .indexes
-            .iter()
-            .filter(|idx| !target_names.contains(idx.name.as_str()))
-            .filter(|idx| !is_unique_constraint_index(idx, &source.constraints))
-            .map(|idx| render_added_index(source, idx, source_dialect, target_dialect))
-            .collect::<Vec<_>>(),
-    );
-    stmts
+    let adds: Vec<String> = source
+        .indexes
+        .iter()
+        .filter(|idx| !target_names.contains(idx.name.as_str()))
+        .filter(|idx| !is_unique_constraint_index(idx, &source.constraints))
+        .map(|idx| render_added_index(source, idx, source_dialect, target_dialect))
+        .collect();
+    (drops, adds)
 }
 
-fn is_constraint_backing_index(index: &IndexInfo, constraints: &[ConstraintInfo]) -> bool {
+fn is_constraint_backing_index(
+    index: &IndexInfo,
+    constraints: &[ConstraintInfo],
+    target_dialect: Dialect,
+) -> bool {
     if is_unique_constraint_index(index, constraints) {
         return true;
     }
-    index.is_unique
+    if index.is_unique
         && constraints.iter().any(|constraint| {
             matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
                 && constraint.columns == index.columns
         })
-        || constraints.iter().any(|constraint| {
+    {
+        return true;
+    }
+    // Only MySQL/InnoDB auto-creates FK backing indexes (and refuses to drop
+    // them while the FK exists). On PG/MSSQL an index on FK columns is always
+    // user-created and must participate in drift, or a target-only index
+    // would falsely converge.
+    target_dialect == Dialect::Mysql
+        && constraints.iter().any(|constraint| {
             matches!(constraint.constraint_type, ConstraintType::ForeignKey)
                 && constraint.columns == index.columns
         })

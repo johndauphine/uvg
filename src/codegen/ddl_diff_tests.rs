@@ -334,6 +334,140 @@ fn test_diff_target_fk_backing_index_does_not_drift() {
 }
 
 #[test]
+fn test_diff_target_user_fk_index_drops_on_non_mysql_target() {
+    // The FK backing-index exemption is MySQL-only: PG never auto-creates
+    // an index for a FK, so a target-only index on FK columns is
+    // user-created and must be dropped or the diff falsely converges.
+    let source = schema_mssql(vec![
+        table("Users")
+            .schema("dbo")
+            .column(col("Id").udt("int").identity().build())
+            .pk("PK_Users", &["Id"])
+            .build(),
+        table("Events")
+            .schema("dbo")
+            .column(col("Id").udt("int").identity().build())
+            .column(col("UserId").udt("int").build())
+            .pk("PK_Events", &["Id"])
+            .fk_full(
+                "FK_Events_Users",
+                &["UserId"],
+                "dbo",
+                "Users",
+                &["Id"],
+                "NO ACTION",
+                "NO ACTION",
+            )
+            .build(),
+    ]);
+    let target = schema_pg(vec![
+        table("Users")
+            .column(
+                col("Id")
+                    .udt("int4")
+                    .default_val("nextval('\"Users_Id_seq\"'::regclass)")
+                    .build(),
+            )
+            .pk("PK_Users", &["Id"])
+            .build(),
+        table("Events")
+            .column(
+                col("Id")
+                    .udt("int4")
+                    .default_val("nextval('\"Events_Id_seq\"'::regclass)")
+                    .build(),
+            )
+            .column(col("UserId").udt("int4").build())
+            .pk("PK_Events", &["Id"])
+            .fk_full(
+                "FK_Events_Users",
+                &["UserId"],
+                "",
+                "Users",
+                &["Id"],
+                "NO ACTION",
+                "NO ACTION",
+            )
+            .index("IX_Events_UserId", &["UserId"], false)
+            .build(),
+    ]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP INDEX IF EXISTS \"IX_Events_UserId\";"),
+        "user-created index on FK columns must drop on PG targets: {ddl}"
+    );
+}
+
+#[test]
+fn test_diff_added_check_mysql_target_uses_backticks() {
+    // MSSQL→MySQL: bracket identifiers in an added CHECK must become
+    // backticks. MySQL's default sql_mode reads "..." as a string
+    // literal, so double-quoted identifiers would make the predicate a
+    // constant expression — the constraint applies but validates nothing.
+    let source = schema_mssql(vec![table("Users")
+        .schema("dbo")
+        .column(col("Id").udt("int").identity().build())
+        .column(col("ProfileScore").udt("int").build())
+        .pk("PK_Users", &["Id"])
+        .check("CK_Users_ProfileScore", "([ProfileScore]>=(0))")
+        .build()]);
+    let target = schema_mysql(vec![table("Users")
+        .schema("uvg")
+        .column(col("Id").udt("int").autoincrement().build())
+        .column(col("ProfileScore").udt("int").build())
+        .pk("PK_Users", &["Id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        ddl.contains("ADD CONSTRAINT `CK_Users_ProfileScore` CHECK ((`ProfileScore`>=(0)));"),
+        "MSSQL bracket identifiers must translate to backticks for MySQL CHECKs: {ddl}"
+    );
+}
+
+#[test]
+fn test_diff_drops_dependent_objects_before_column_drop() {
+    // A dropped column's target-side index and check constraint must be
+    // dropped first: MSSQL rejects DROP COLUMN while a dependent index or
+    // constraint exists, and MySQL can auto-drop the index with the
+    // column and then fail on the later explicit DROP INDEX.
+    let source = schema_mssql(vec![table("Users")
+        .schema("dbo")
+        .column(col("Id").udt("int").identity().build())
+        .pk("PK_Users", &["Id"])
+        .build()]);
+    let target = schema_mssql(vec![table("Users")
+        .schema("dbo")
+        .column(col("Id").udt("int").identity().build())
+        .column(col("LastSeenAt").udt("datetime2").nullable().build())
+        .pk("PK_Users", &["Id"])
+        .check("CK_Users_LastSeenAt", "([LastSeenAt] IS NOT NULL)")
+        .index("IX_Users_LastSeenAt", &["LastSeenAt"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mssql));
+
+    let col_drop = ddl
+        .find("DROP COLUMN [LastSeenAt];")
+        .expect("column drop should be emitted");
+    let constraint_drop = ddl
+        .find("DROP CONSTRAINT [CK_Users_LastSeenAt];")
+        .expect("dependent check drop should be emitted");
+    let index_drop = ddl
+        .find("DROP INDEX [IX_Users_LastSeenAt] ON")
+        .expect("dependent index drop should be emitted");
+    assert!(
+        constraint_drop < col_drop,
+        "dependent constraint must drop before the column: {ddl}"
+    );
+    assert!(
+        index_drop < col_drop,
+        "dependent index must drop before the column: {ddl}"
+    );
+}
+
+#[test]
 fn test_diff_multi_schema_preserved() {
     let source = schema_pg(vec![table("users")
         .schema("schema_a")

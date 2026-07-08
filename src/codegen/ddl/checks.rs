@@ -85,19 +85,24 @@ pub(in crate::codegen) fn translate_check_predicate(
     }
     match source {
         Dialect::Mysql => expr.replace('`', "\""),
-        Dialect::Mssql => translate_mssql_check_predicate(expr),
+        Dialect::Mssql => translate_mssql_check_predicate(expr, target),
         Dialect::Postgres => strip_pg_casts_in_predicate(expr),
         Dialect::Sqlite => expr.to_string(),
     }
 }
 
-/// Replace `[ident]` with `"ident"` in a MSSQL predicate and strip the
-/// `N` prefix from Unicode string literals. Doesn't try to parse — just
-/// handles the syntax SQL Server commonly stores in CHECK predicates.
-/// Edge case: brackets inside a string literal would be miscounted, but
-/// real CHECK predicates don't typically embed `[` in strings.
-fn translate_mssql_check_predicate(expr: &str) -> String {
-    let quoted = expr.replace(['[', ']'], "\"");
+/// Replace `[ident]` with the target's identifier quote in a MSSQL
+/// predicate and strip the `N` prefix from Unicode string literals.
+/// MySQL's default sql_mode reads `"..."` as a string literal, so bracket
+/// identifiers must become backticks there — `CHECK ("col" >= 0)` would
+/// compare a constant string, silently neutering the constraint. Doesn't
+/// try to parse — just handles the syntax SQL Server commonly stores in
+/// CHECK predicates. Edge case: brackets inside a string literal would be
+/// miscounted, but real CHECK predicates don't typically embed `[` in
+/// strings.
+fn translate_mssql_check_predicate(expr: &str, target: Dialect) -> String {
+    let quote = if target == Dialect::Mysql { "`" } else { "\"" };
+    let quoted = expr.replace(['[', ']'], quote);
     strip_mssql_unicode_literal_prefixes(&quoted)
 }
 

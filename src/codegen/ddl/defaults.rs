@@ -109,8 +109,8 @@ pub(super) fn translate_default_function(expr: &str, target: Dialect) -> String 
 
     // Normalize common "now-style" functions returning a full date+time.
     // Includes MSSQL variants that #32 was missing: GETUTCDATE, SYSDATETIME,
-    // SYSDATETIMEOFFSET, plus PG/SQL standard LOCALTIMESTAMP. None of these
-    // are TZ-class load-bearing here — the column's TZ is preserved by the
+    // SYSDATETIMEOFFSET, plus PG/SQL standard LOCALTIMESTAMP. Cross-dialect,
+    // TZ-class is not load-bearing here — the column's TZ is preserved by the
     // type-mapping path; this function just picks a target-dialect-idiomatic
     // "now" function so the apply step doesn't fail with "function does not
     // exist" on PG/MySQL.
@@ -132,7 +132,18 @@ pub(super) fn translate_default_function(expr: &str, target: Dialect) -> String 
         return match target {
             Dialect::Postgres => "now()".to_string(),
             Dialect::Mysql | Dialect::Sqlite => "CURRENT_TIMESTAMP".to_string(),
-            Dialect::Mssql => "GETDATE()".to_string(),
+            // On MSSQL targets the source function may itself be MSSQL-native;
+            // collapsing SYSUTCDATETIME()/GETUTCDATE() to GETDATE() would
+            // silently change a UTC default to server-local time. Preserve
+            // MSSQL-native variants and only translate foreign ones.
+            Dialect::Mssql => match base.as_str() {
+                "getdate()"
+                | "getutcdate()"
+                | "sysdatetime()"
+                | "sysutcdatetime()"
+                | "sysdatetimeoffset()" => base.to_uppercase(),
+                _ => "GETDATE()".to_string(),
+            },
         };
     }
 
