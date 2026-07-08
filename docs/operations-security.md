@@ -127,7 +127,12 @@ Apply atomicity is per-dialect. On **PostgreSQL**, each apply (and each
 per-file apply under `--out-dir`) runs inside a single transaction: it either
 commits in full or rolls back completely, so a mid-batch failure leaves the
 target unchanged. A retryable failure (serialization/deadlock, SQLSTATE class
-40) retries the whole transaction. On **MySQL, MSSQL, and SQLite**, DDL
+40) retries the whole transaction. Two exceptions: a batch containing a
+transaction-control statement (`COMMIT`/`ROLLBACK`/`SAVEPOINT`/...) is refused,
+and a batch containing a statement that cannot run inside a transaction block
+(`CREATE INDEX CONCURRENTLY`, `VACUUM`, `CREATE DATABASE`, ...) falls back to
+statement-by-statement apply (non-atomic, since those statements are inherently
+non-atomic). On **MySQL, MSSQL, and SQLite**, DDL
 implicitly commits, so apply is statement-by-statement and partial-on-failure —
 step 8 above applies: verify what landed before rerunning. The `uvg_version`
 bump is a transactional DELETE+INSERT on every backend, so it can never be left

@@ -549,3 +549,38 @@ fn transaction_control_keyword_ignores_ordinary_ddl() {
         assert_eq!(transaction_control_keyword(sql), None, "sql: {sql}");
     }
 }
+
+// ---- non-transactional PG statements fall back to statement-by-statement (#109) ----
+
+#[test]
+fn detects_non_transactional_pg_statements() {
+    for sql in [
+        "CREATE INDEX CONCURRENTLY idx ON t (c)",
+        "create index concurrently idx on t (c)",
+        "DROP INDEX CONCURRENTLY idx",
+        "REINDEX INDEX CONCURRENTLY idx",
+        "VACUUM",
+        "VACUUM ANALYZE t",
+        "CREATE DATABASE foo",
+        "DROP DATABASE foo",
+        "CREATE TABLESPACE ts LOCATION '/x'",
+        "ALTER SYSTEM SET work_mem = '64MB'",
+        "/* c */ CREATE INDEX CONCURRENTLY idx ON t (c)",
+    ] {
+        assert!(is_non_transactional_pg_statement(sql), "sql: {sql}");
+    }
+}
+
+#[test]
+fn ordinary_ddl_is_transactional() {
+    for sql in [
+        "CREATE INDEX idx ON t (c)",
+        "CREATE TABLE t (id INT)",
+        "ALTER TABLE t ADD COLUMN c INT",
+        "DROP TABLE t",
+        // 'concurrently' only as part of another identifier must not trip it.
+        "CREATE TABLE concurrently_log (id INT)",
+    ] {
+        assert!(!is_non_transactional_pg_statement(sql), "sql: {sql}");
+    }
+}

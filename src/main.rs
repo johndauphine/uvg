@@ -517,15 +517,7 @@ async fn apply_inline(
             failed.sql,
         ));
     }
-    let atomic = if config.dialect().supports_transactional_ddl() {
-        " atomically"
-    } else {
-        ""
-    };
-    eprintln!(
-        "uvg: applied {} statement(s){} to {}",
-        applied, atomic, label
-    );
+    eprintln!("uvg: applied {} statement(s) to {}", applied, label);
     if progress_enabled {
         eprintln!("{}", stats.render_summary());
     }

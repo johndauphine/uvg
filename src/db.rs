@@ -524,12 +524,38 @@ where
                 .max_connections(1)
                 .connect(url)
                 .await?;
-            // PostgreSQL supports transactional DDL: run the whole batch in a
-            // single transaction so any failure rolls back and leaves the
-            // target unchanged (#109), instead of partial-on-failure.
-            results =
-                execute_pg_ddl_transactional(&pool, &statements, max_retries, &mut on_statement)
-                    .await;
+            if let Some(idx) = first_non_transactional_pg_statement(&statements) {
+                // Some valid PostgreSQL DDL cannot run inside a transaction
+                // block (CREATE INDEX CONCURRENTLY, VACUUM, CREATE DATABASE,
+                // ...). Wrapping it would make PostgreSQL reject it, so this
+                // batch is applied statement-by-statement (non-atomic) — the
+                // same behavior as before #109. These statements are inherently
+                // non-atomic anyway.
+                tracing::warn!(
+                    "uvg: applying to PostgreSQL statement-by-statement (non-atomic): \
+                     statement {} cannot run inside a transaction block",
+                    idx + 1
+                );
+                results = execute_sqlx_ddl_statements(
+                    &pool,
+                    &statements,
+                    max_retries,
+                    &mut on_statement,
+                    is_retryable_sqlx_pg_error,
+                )
+                .await;
+            } else {
+                // PostgreSQL supports transactional DDL: run the whole batch in
+                // a single transaction so any failure rolls back and leaves the
+                // target unchanged (#109), instead of partial-on-failure.
+                results = execute_pg_ddl_transactional(
+                    &pool,
+                    &statements,
+                    max_retries,
+                    &mut on_statement,
+                )
+                .await;
+            }
             pool.close().await;
         }
         ConnectionConfig::Mysql(url) => {
@@ -946,6 +972,41 @@ fn transaction_control_rejection(index: usize, keyword: &str) -> String {
         index + 1,
         keyword
     )
+}
+
+/// `true` if `stmt` is a PostgreSQL command that cannot run inside a
+/// transaction block (e.g. `CREATE INDEX CONCURRENTLY`, `VACUUM`,
+/// `CREATE DATABASE`). uvg's generator never emits these, but hand-authored
+/// migrations can — and wrapping them in a transaction makes PostgreSQL reject
+/// them outright, so a batch containing one is applied statement-by-statement
+/// (non-atomic) instead. Detection is intentionally conservative: it keys off
+/// leading command words plus the `CONCURRENTLY` marker.
+fn is_non_transactional_pg_statement(stmt: &str) -> bool {
+    let cleaned = skip_leading_sql_comments(stmt);
+    // `CONCURRENTLY` appears in CREATE/DROP INDEX ... CONCURRENTLY and REINDEX
+    // ... CONCURRENTLY. Match it as a standalone word anywhere in the statement.
+    let has_concurrently = cleaned
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| w.eq_ignore_ascii_case("concurrently"));
+    if has_concurrently {
+        return true;
+    }
+    let (w1, rest) = next_command_word(cleaned);
+    let first = w1.to_ascii_uppercase();
+    let second = next_command_word(skip_leading_sql_comments(rest))
+        .0
+        .to_ascii_uppercase();
+    matches!(first.as_str(), "VACUUM" | "REINDEX")
+        || (first == "ALTER" && second == "SYSTEM")
+        || (matches!(first.as_str(), "CREATE" | "DROP")
+            && matches!(second.as_str(), "DATABASE" | "TABLESPACE"))
+}
+
+/// The first non-transactional statement in `statements` as `(index, keyword)`.
+fn first_non_transactional_pg_statement(statements: &[String]) -> Option<usize> {
+    statements
+        .iter()
+        .position(|s| is_non_transactional_pg_statement(s))
 }
 
 /// Internal: retry an async DDL action up to `max_retries` times when

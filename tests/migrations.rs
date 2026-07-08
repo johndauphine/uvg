@@ -465,6 +465,79 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
+    async fn test_postgres_apply_falls_back_for_non_transactional_ddl() {
+        // #109: CREATE INDEX CONCURRENTLY cannot run inside a transaction, so
+        // the apply must fall back to statement-by-statement and still run it.
+        let _serial = live_pg_lock().lock().await;
+        let url =
+            std::env::var("UVG_DISPOSABLE_PG_URL").expect("UVG_DISPOSABLE_PG_URL must be set");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres connect");
+        for stmt in [
+            "DROP TABLE IF EXISTS uvg_cc",
+            "DROP TABLE IF EXISTS uvg_version",
+            "CREATE TABLE uvg_cc(id integer)",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect("setup");
+        }
+        pool.close().await;
+
+        let dir = tmpdir("pg-concurrently");
+        let migrations = dir.join("migrations");
+        std::fs::create_dir_all(&migrations).unwrap();
+        std::fs::write(
+            migrations.join("20260101_000000_cc.sql"),
+            "-- uvg revision: 20260101_000000\n\
+             -- parent:\n\
+             -- description: concurrent index\n\n\
+             -- UP\n\
+             CREATE INDEX CONCURRENTLY uvg_cc_idx ON uvg_cc (id);\n\n\
+             -- DOWN\n\
+             DROP INDEX CONCURRENTLY IF EXISTS uvg_cc_idx;\n",
+        )
+        .unwrap();
+        let migrations_arg = migrations.display().to_string();
+
+        // parse-check can't validate CONCURRENTLY (it runs in a transaction),
+        // so use --no-parse-check, matching real zero-downtime index workflows.
+        let out = run_uvg(&[
+            "--no-parse-check",
+            "upgrade",
+            &url,
+            "--migrations-dir",
+            &migrations_arg,
+        ]);
+        assert!(
+            out.status.success(),
+            "CONCURRENTLY apply should succeed via fallback: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            postgres_table_exists(&url, "uvg_cc_idx").await,
+            "the concurrent index should have been created"
+        );
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres reconnect");
+        for stmt in [
+            "DROP TABLE IF EXISTS uvg_cc",
+            "DROP TABLE IF EXISTS uvg_version",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect("cleanup");
+        }
+        pool.close().await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_versioned_merge_writes_multi_parent_revision_cli() {
         let dir = tmpdir("versioned-merge");
