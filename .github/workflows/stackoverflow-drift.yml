@@ -1,13 +1,14 @@
 name: Stack Overflow Drift E2E
 
-# Nightly real-schema drift validation for SQL Server StackOverflow2010
-# evolving into every supported target dialect. The workflow is intentionally
-# schedule/manual only: the backup is large and supplied through a repository
-# secret.
+# On-demand real-schema drift validation for SQL Server StackOverflow2010
+# evolving into every supported target dialect. The nightly schedule is disabled:
+# the backup is large and supplied through a repository secret, so this runs
+# manually via workflow_dispatch when STACKOVERFLOW2010_BAK_URL is configured.
 
 on:
-  schedule:
-    - cron: '0 10 * * *'  # 10:00 UTC daily, after the CRM matrix
+  # Nightly schedule disabled — run manually via workflow_dispatch instead.
+  # schedule:
+  #   - cron: '0 10 * * *'  # 10:00 UTC daily, after the CRM matrix
   workflow_dispatch:
 
 env:
