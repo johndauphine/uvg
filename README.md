@@ -415,10 +415,11 @@ scripts/beta_validate_schema.sh --help
 
 For production-sized schema-evolution coverage, maintainers also run the
 StackOverflow2010 drift matrix in
-[`testdata/stackoverflow-drift/`](testdata/stackoverflow-drift/). The nightly
-workflow restores the SQL Server source database from `STACKOVERFLOW2010_BAK_URL`,
-applies committed drift packs, and requires SQL Server, PostgreSQL, MySQL, and
-SQLite targets to converge after every applicable pack.
+[`testdata/stackoverflow-drift/`](testdata/stackoverflow-drift/). The optional
+GitHub Actions workflow (run manually via `workflow_dispatch`) restores the SQL
+Server source database from `STACKOVERFLOW2010_BAK_URL`, applies committed drift
+packs, and requires SQL Server, PostgreSQL, MySQL, and SQLite targets to converge
+after every applicable pack.
 
 ## Release process
 

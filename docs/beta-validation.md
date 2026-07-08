@@ -116,10 +116,11 @@ cargo build --release
 testdata/stackoverflow-drift/run_drift.sh
 ```
 
-The nightly GitHub Actions workflow `.github/workflows/stackoverflow-drift.yml`
-restores the source database from the repository secret
-`STACKOVERFLOW2010_BAK_URL`. That secret should point to a downloadable SQL
-Server `.bak` file authorized for CI use.
+The optional GitHub Actions workflow `.github/workflows/stackoverflow-drift.yml`
+runs the same matrix on demand via `workflow_dispatch` (its nightly schedule is
+disabled). It restores the source database from the repository secret
+`STACKOVERFLOW2010_BAK_URL`, which should point to a downloadable SQL Server
+`.bak` file authorized for CI use.
 
 ## Go/No-Go Criteria
 
@@ -153,7 +154,7 @@ A stable release can proceed only when:
 | --- | --- | --- | --- | --- | --- | --- |
 | 2026-05-20 | stackoverflow2010-mssql-to-postgres-default-schemas | SQL Server 2022 source to PostgreSQL 16.13 target | Public StackOverflow2010 database restored locally | Declarative, `Table()`, source DDL, snapshot, diff/apply, post-apply convergence, versioned migration, post-migration convergence | Pass | Bundle: `/tmp/uvg-beta-validation/20260520T095432Z_stackoverflow2010-mssql-to-postgres-default-schemas`; targets: `uvg_so2010_target`, `uvg_so2010_migration`. Need at least one additional independent schema before closing #86. |
 | 2026-05-20 | stackoverflow2010-mssql-to-postgres-delta | SQL Server 2022 source clone to PostgreSQL 16.13 target | Public StackOverflow2010 schema cloned to disposable SQL Server and mutated with additive table, column, constraint, and index changes | Diff/apply from changed SQL Server source into existing PostgreSQL target, direct catalog verification, post-apply convergence | Pass | Delta artifacts: `/tmp/uvg-so2010-delta/delta_fixed.sql`, `/tmp/uvg-so2010-delta/delta_apply_fixed.sql`, `/tmp/uvg-so2010-delta/post_delta_diff_final.sql`; target `uvg_so2010_delta_target` converged with `-- No schema changes detected.` Fixed blockers found during this run: unsafe MSSQL parse-check handling, MSSQL `SYSUTCDATETIME()` default translation, MSSQL Unicode CHECK literal translation, and added constraints/indexes on existing-table diffs. This strengthens the StackOverflow2010 result but does not count as an independent second schema. |
-| 2026-05-20 | stackoverflow2010-drift-matrix | SQL Server 2022 source clone to SQL Server 2022, PostgreSQL 16.13, MySQL 8.0, and SQLite targets | Public StackOverflow2010 schema cloned to disposable SQL Server and evolved through committed drift packs | Baseline convergence, additive drift, column evolution, added constraints/indexes, destructive table/column/index drift, dropped constraints where supported, direct catalog checks after every applicable pack | Pass | Bundle: `/tmp/uvg-stackoverflow-drift-full/20260520T104328Z`; workflow: `.github/workflows/stackoverflow-drift.yml`. SQLite skips table-rebuild-required packs. This is now the repeatable nightly drift gate once `STACKOVERFLOW2010_BAK_URL` is configured. |
+| 2026-05-20 | stackoverflow2010-drift-matrix | SQL Server 2022 source clone to SQL Server 2022, PostgreSQL 16.13, MySQL 8.0, and SQLite targets | Public StackOverflow2010 schema cloned to disposable SQL Server and evolved through committed drift packs | Baseline convergence, additive drift, column evolution, added constraints/indexes, destructive table/column/index drift, dropped constraints where supported, direct catalog checks after every applicable pack | Pass | Bundle: `/tmp/uvg-stackoverflow-drift-full/20260520T104328Z`; workflow: `.github/workflows/stackoverflow-drift.yml`. SQLite skips table-rebuild-required packs. This is the repeatable drift gate; the workflow runs on demand via `workflow_dispatch` once `STACKOVERFLOW2010_BAK_URL` is configured. |
 | 2026-05-20 | pending-additional-schema | TBD | Awaiting another authorized schema source | TBD | Blocked | Required to satisfy the stable-release gate's independent-schema criterion. |
 
 ## Issue Triage

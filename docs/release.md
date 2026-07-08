@@ -60,8 +60,10 @@ For each release:
 Prepare the release in a normal pull request:
 
 - Confirm `master` is green for `Test`, `cargo deny`, and `CRM 9-pair matrix`.
-- Confirm the scheduled StackOverflow2010 drift workflow is green when the
-  release includes DDL diff/apply or migration behavior changes.
+- Run the StackOverflow2010 drift matrix (the local harness in
+  `testdata/stackoverflow-drift/`, or the manual `workflow_dispatch` workflow if
+  the backup secret is configured) when the release includes DDL diff/apply or
+  migration behavior changes.
 - Pick the next version from the versioning policy.
 - Update `Cargo.toml`.
 - Run `cargo check` once if needed to refresh the root package version in

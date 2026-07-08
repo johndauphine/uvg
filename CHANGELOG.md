@@ -25,9 +25,9 @@ Suggested headings:
   artifact checksum policy, crates.io publishing process, and rollback plan.
 - Added a beta/RC real-schema validation runbook and helper script for
   collecting repeatable validation bundles before a stable release.
-- Added a StackOverflow2010 schema-drift fixture, local harness, and nightly
-  GitHub Actions workflow for SQL Server source drift into SQL Server,
-  PostgreSQL, MySQL, and SQLite targets.
+- Added a StackOverflow2010 schema-drift fixture, local harness, and an
+  on-demand (manual `workflow_dispatch`) GitHub Actions workflow for SQL Server
+  source drift into SQL Server, PostgreSQL, MySQL, and SQLite targets.
 
 ### Fixed
 
