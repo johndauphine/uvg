@@ -487,9 +487,20 @@ fn constraints_content_match(
                 return false;
             }
             if source_dialect == target_dialect
-                && (source_fk.ref_schema != target_fk.ref_schema
-                    || source_fk.update_rule != target_fk.update_rule
+                && (source_fk.update_rule != target_fk.update_rule
                     || source_fk.delete_rule != target_fk.delete_rule)
+            {
+                return false;
+            }
+            // ref_schema compares same-dialect only, and never on MySQL:
+            // there the "schema" is the database name (two databases being
+            // diffed always differ in it), and the emitted ADD CONSTRAINT
+            // references the table unqualified — a ref_schema difference
+            // could never be materialized by our own DDL, so comparing it
+            // would drop+add on every run without converging.
+            if source_dialect == target_dialect
+                && source_dialect != Dialect::Mysql
+                && source_fk.ref_schema != target_fk.ref_schema
             {
                 return false;
             }

@@ -934,3 +934,43 @@ fn test_lossy_type_fallback_still_converges_to_no_drift() {
         "lossy fallback that matches the target must not emit type drift: {ddl}"
     );
 }
+
+#[test]
+fn test_same_name_mysql_fk_across_database_names_is_not_drift() {
+    // MySQL's "schema" is the database name, so two databases under diff
+    // always disagree on ref_schema; the emitted FK references the table
+    // unqualified, so that difference could never converge. Identical FKs
+    // apart from the database name must not churn.
+    let source = schema_mysql(vec![table("orders")
+        .schema("sourcedb")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "sourcedb",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .schema("targetdb")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "targetdb",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        !ddl.contains("fk_orders_user"),
+        "database-name-only FK difference must not be drift: {ddl}"
+    );
+}
