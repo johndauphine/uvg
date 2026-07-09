@@ -974,3 +974,71 @@ fn test_same_name_mysql_fk_across_database_names_is_not_drift() {
         "database-name-only FK difference must not be drift: {ddl}"
     );
 }
+
+#[test]
+fn test_mysql_fk_restrict_no_action_spellings_not_drift() {
+    // InnoDB treats RESTRICT and NO ACTION as the same behavior and reports
+    // either spelling; our emitted ADD omits the clause for NO ACTION, so
+    // spelling drift could never converge.
+    let source = schema_mysql(vec![table("orders")
+        .schema("appdb")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "appdb",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .schema("appdb")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "appdb",
+            "users",
+            &["id"],
+            "RESTRICT",
+            "RESTRICT",
+        )
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        !ddl.contains("fk_orders_user"),
+        "RESTRICT vs NO ACTION on MySQL must not be drift: {ddl}"
+    );
+}
+
+#[test]
+fn test_mysql_stale_backing_index_kept_when_shared_by_another_fk() {
+    // A second FK on the same local columns shares the backing index;
+    // dropping it while that FK survives would make the apply fail.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .fk("fk_orders_audit", &["user_id"], "audit_users", &["id"])
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .fk("fk_orders_audit", &["user_id"], "audit_users", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        ddl.contains("DROP FOREIGN KEY `fk_orders_owner`"),
+        "changed FK must still be replaced: {ddl}"
+    );
+    assert!(
+        !ddl.contains("DROP INDEX `fk_orders_owner`"),
+        "shared backing index must not be dropped while another FK uses it: {ddl}"
+    );
+}

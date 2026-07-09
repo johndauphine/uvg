@@ -385,6 +385,16 @@ fn diff_table_constraints(
                     .indexes
                     .iter()
                     .any(|idx| idx.name == constraint.name && idx.columns == constraint.columns)
+                // InnoDB shares one backing index between FKs on the same
+                // local columns; if another target FK still uses them, the
+                // DROP INDEX would be rejected while that FK exists. Leave
+                // the index alone then — a possibly-stale index is the
+                // lesser evil against a failing apply.
+                && !target.constraints.iter().any(|other| {
+                    other.name != constraint.name
+                        && matches!(other.constraint_type, ConstraintType::ForeignKey)
+                        && other.columns == constraint.columns
+                })
             {
                 let tname = qualified_table_name(
                     &source.schema,
@@ -487,8 +497,10 @@ fn constraints_content_match(
                 return false;
             }
             if source_dialect == target_dialect
-                && (source_fk.update_rule != target_fk.update_rule
-                    || source_fk.delete_rule != target_fk.delete_rule)
+                && (normalize_fk_rule(&source_fk.update_rule, source_dialect)
+                    != normalize_fk_rule(&target_fk.update_rule, source_dialect)
+                    || normalize_fk_rule(&source_fk.delete_rule, source_dialect)
+                        != normalize_fk_rule(&target_fk.delete_rule, source_dialect))
             {
                 return false;
             }
@@ -520,6 +532,19 @@ fn constraints_content_match(
         }
     }
     true
+}
+
+/// Normalize an FK referential action for same-dialect comparison. On
+/// MySQL/InnoDB, `RESTRICT` and `NO ACTION` are the same behavior and the
+/// server reports either spelling depending on how the FK was authored;
+/// our emitted ADD CONSTRAINT omits the clause for `NO ACTION`, so treating
+/// the spellings as drift would drop+add on every run without converging.
+fn normalize_fk_rule(rule: &str, dialect: Dialect) -> &str {
+    if dialect == Dialect::Mysql && rule.eq_ignore_ascii_case("RESTRICT") {
+        "NO ACTION"
+    } else {
+        rule
+    }
 }
 
 /// Normalize a stored CHECK predicate for same-dialect comparison.
