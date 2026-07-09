@@ -235,13 +235,13 @@ fn build_mysql_defaults(
     target_dialect: Dialect,
 ) -> HashSet<String> {
     let mut defaults = HashSet::new();
-    if source_dialect == Dialect::Mysql {
+    if source_dialect.schema_is_database() {
         let schemas: HashSet<&str> = source.tables.iter().map(|t| t.schema.as_str()).collect();
         if schemas.len() == 1 {
             defaults.insert(schemas.into_iter().next().unwrap().to_string());
         }
     }
-    if target_dialect == Dialect::Mysql {
+    if target_dialect.schema_is_database() {
         let schemas: HashSet<&str> = target.tables.iter().map(|t| t.schema.as_str()).collect();
         if schemas.len() == 1 {
             defaults.insert(schemas.into_iter().next().unwrap().to_string());
@@ -343,7 +343,7 @@ fn diff_table_constraints(
     target_dialect: Dialect,
     noindexes: bool,
 ) -> (Vec<(ChangeKind, String)>, Vec<String>) {
-    if target_dialect == Dialect::Sqlite {
+    if !target_dialect.supports_constraint_alteration() {
         return (Vec::new(), Vec::new());
     }
 
@@ -385,7 +385,7 @@ fn diff_table_constraints(
             // explicitly, right after the FK drop — InnoDB refuses to drop
             // it while the FK still exists.
             if !noindexes
-                && target_dialect == Dialect::Mysql
+                && target_dialect.auto_creates_fk_backing_indexes()
                 && matches!(constraint.constraint_type, ConstraintType::ForeignKey)
                 && source_constraint.columns != constraint.columns
                 && target
@@ -552,7 +552,7 @@ fn constraints_content_match(
             // could never be materialized by our own DDL, so comparing it
             // would drop+add on every run without converging.
             if source_dialect == target_dialect
-                && source_dialect != Dialect::Mysql
+                && !source_dialect.schema_is_database()
                 && source_fk.ref_schema != target_fk.ref_schema
             {
                 return false;
@@ -581,7 +581,7 @@ fn constraints_content_match(
 /// our emitted ADD CONSTRAINT omits the clause for `NO ACTION`, so treating
 /// the spellings as drift would drop+add on every run without converging.
 fn normalize_fk_rule(rule: &str, dialect: Dialect) -> &str {
-    if dialect == Dialect::Mysql && rule.eq_ignore_ascii_case("RESTRICT") {
+    if dialect.treats_restrict_as_no_action() && rule.eq_ignore_ascii_case("RESTRICT") {
         "NO ACTION"
     } else {
         rule
@@ -710,10 +710,10 @@ fn render_dropped_constraint(
             constraint.name, table.name
         ),
     };
-    if matches!(target_dialect, Dialect::Sqlite) {
-        sql
-    } else {
+    if target_dialect.supports_constraint_alteration() {
         format!("-- WARNING: destructive operation\n{sql}")
+    } else {
+        sql
     }
 }
 
@@ -833,7 +833,7 @@ fn is_constraint_backing_index(
     // them while the FK exists). On PG/MSSQL an index on FK columns is always
     // user-created and must participate in drift, or a target-only index
     // would falsely converge.
-    target_dialect == Dialect::Mysql
+    target_dialect.auto_creates_fk_backing_indexes()
         && constraints.iter().any(|constraint| {
             matches!(constraint.constraint_type, ConstraintType::ForeignKey)
                 && constraint.columns == index.columns
@@ -848,13 +848,12 @@ fn render_dropped_index(
 ) -> String {
     let tname = qualified_table_name(&table.schema, &table.name, source_dialect, target_dialect);
     let iname = quote_identifier(&index.name, target_dialect);
-    match target_dialect {
-        Dialect::Postgres | Dialect::Sqlite => {
-            let qname =
-                qualified_table_name(&table.schema, &index.name, source_dialect, target_dialect);
-            format!("DROP INDEX IF EXISTS {qname};")
-        }
-        Dialect::Mssql | Dialect::Mysql => format!("DROP INDEX {iname} ON {tname};"),
+    if target_dialect.drop_index_requires_table() {
+        format!("DROP INDEX {iname} ON {tname};")
+    } else {
+        let qname =
+            qualified_table_name(&table.schema, &index.name, source_dialect, target_dialect);
+        format!("DROP INDEX IF EXISTS {qname};")
     }
 }
 

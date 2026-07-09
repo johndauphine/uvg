@@ -8,7 +8,7 @@ pub(super) fn generate_enum_types(
     schema: &IntrospectedSchema,
     target_dialect: Dialect,
 ) -> Vec<String> {
-    if target_dialect != Dialect::Postgres || schema.enums.is_empty() {
+    if !target_dialect.supports_native_enums() || schema.enums.is_empty() {
         return vec![];
     }
 

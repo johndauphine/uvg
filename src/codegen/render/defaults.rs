@@ -19,25 +19,20 @@ pub(in crate::codegen) fn format_ddl_default_typed(
     // Step 2: Boolean literal translation (only when column is boolean)
     if is_boolean {
         let lower = cleaned.trim().to_lowercase();
-        if (lower == "1" || lower == "true")
-            && (target_dialect == Dialect::Postgres || target_dialect == Dialect::Sqlite)
-        {
-            return "true".to_string();
-        }
-        if (lower == "0" || lower == "false")
-            && (target_dialect == Dialect::Postgres || target_dialect == Dialect::Sqlite)
-        {
-            return "false".to_string();
-        }
-        if (lower == "true" || lower == "1")
-            && (target_dialect == Dialect::Mysql || target_dialect == Dialect::Mssql)
-        {
-            return "1".to_string();
-        }
-        if (lower == "false" || lower == "0")
-            && (target_dialect == Dialect::Mysql || target_dialect == Dialect::Mssql)
-        {
-            return "0".to_string();
+        if target_dialect.uses_boolean_literals() {
+            if lower == "1" || lower == "true" {
+                return "true".to_string();
+            }
+            if lower == "0" || lower == "false" {
+                return "false".to_string();
+            }
+        } else {
+            if lower == "true" || lower == "1" {
+                return "1".to_string();
+            }
+            if lower == "false" || lower == "0" {
+                return "0".to_string();
+            }
         }
     }
 

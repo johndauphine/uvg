@@ -10,7 +10,7 @@ pub(super) fn generate_comments(
     target_dialect: Dialect,
 ) -> Vec<String> {
     // Only PG uses separate COMMENT ON statements
-    if target_dialect != Dialect::Postgres {
+    if !target_dialect.supports_comment_on() {
         return vec![];
     }
 
