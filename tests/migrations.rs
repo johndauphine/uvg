@@ -4,6 +4,18 @@ mod common;
 mod tests {
     use super::common::{run_uvg, tmpdir};
     use std::path::Path;
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
+
+    /// The live-PostgreSQL tests all share the single global `uvg_version`
+    /// table (and run `upgrade`/`downgrade` against one database), so they must
+    /// not run concurrently. Serialize them with a process-wide async lock (an
+    /// async mutex is safe to hold across `.await`). `--test-threads=1` would
+    /// also work but can't be enforced from inside the test.
+    fn live_pg_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     async fn sqlite_table_exists(db_path: &Path, table: &str) -> bool {
         let url = format!("sqlite:///{}", db_path.display());
@@ -159,6 +171,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
     async fn test_versioned_migration_live_postgres_workflow_cli() {
+        let _serial = live_pg_lock().lock().await;
         let url =
             std::env::var("UVG_DISPOSABLE_PG_URL").expect("UVG_DISPOSABLE_PG_URL must be set");
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -279,6 +292,247 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup version table");
+        pool.close().await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
+    async fn test_postgres_apply_is_atomic_on_failure() {
+        let _serial = live_pg_lock().lock().await;
+        // #109: a migration UP section whose second statement fails must roll
+        // the whole section back on PostgreSQL — the table the first statement
+        // created must NOT survive, and uvg_version must stay at base.
+        let url =
+            std::env::var("UVG_DISPOSABLE_PG_URL").expect("UVG_DISPOSABLE_PG_URL must be set");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres connect");
+        for stmt in [
+            "DROP TABLE IF EXISTS uvg_rollback_probe",
+            "DROP TABLE IF EXISTS uvg_version",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect("cleanup");
+        }
+        pool.close().await;
+
+        let dir = tmpdir("pg-atomic-rollback");
+        let migrations = dir.join("migrations");
+        std::fs::create_dir_all(&migrations).unwrap();
+        // Second statement references a table that doesn't exist, so the
+        // section fails after the CREATE — which must be rolled back.
+        std::fs::write(
+            migrations.join("20260513_193000_atomic_probe.sql"),
+            "-- uvg revision: 20260513_193000\n\
+             -- parent:\n\
+             -- description: atomic probe\n\n\
+             -- UP\n\
+             CREATE TABLE uvg_rollback_probe(id integer PRIMARY KEY);\n\
+             INSERT INTO uvg_rollback_definitely_absent VALUES (1);\n\n\
+             -- DOWN\n\
+             DROP TABLE IF EXISTS uvg_rollback_probe;\n",
+        )
+        .unwrap();
+        let migrations_arg = migrations.display().to_string();
+
+        // `--no-parse-check` is a top-level flag and must precede the
+        // subcommand; without it the bad statement is caught at parse-check
+        // time, and we want to exercise the transactional apply/rollback path.
+        let out = run_uvg(&[
+            "--no-parse-check",
+            "upgrade",
+            &url,
+            "--migrations-dir",
+            &migrations_arg,
+        ]);
+        assert!(
+            !out.status.success(),
+            "upgrade should fail on the bad statement"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("rolled back"),
+            "failure should report the rollback: {stderr}"
+        );
+
+        // The atomic guarantee: the CREATE from the first statement was undone.
+        assert!(
+            !postgres_table_exists(&url, "uvg_rollback_probe").await,
+            "transaction must have rolled back the CREATE TABLE"
+        );
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres reconnect");
+        sqlx::query("DROP TABLE IF EXISTS uvg_rollback_probe")
+            .execute(&pool)
+            .await
+            .expect("cleanup probe table");
+        sqlx::query("DROP TABLE IF EXISTS uvg_version")
+            .execute(&pool)
+            .await
+            .expect("cleanup version table");
+        pool.close().await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
+    async fn test_postgres_apply_refuses_embedded_transaction_control() {
+        let _serial = live_pg_lock().lock().await;
+        // #109: a migration that embeds its own COMMIT would subvert the
+        // atomicity wrapper. uvg must refuse before executing anything.
+        let url =
+            std::env::var("UVG_DISPOSABLE_PG_URL").expect("UVG_DISPOSABLE_PG_URL must be set");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres connect");
+        for stmt in [
+            "DROP TABLE IF EXISTS uvg_tc_probe",
+            "DROP TABLE IF EXISTS uvg_version",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect("cleanup");
+        }
+        pool.close().await;
+
+        let dir = tmpdir("pg-tx-control");
+        let migrations = dir.join("migrations");
+        std::fs::create_dir_all(&migrations).unwrap();
+        std::fs::write(
+            migrations.join("20260101_000000_tc.sql"),
+            "-- uvg revision: 20260101_000000\n\
+             -- parent:\n\
+             -- description: embeds COMMIT\n\n\
+             -- UP\n\
+             CREATE TABLE uvg_tc_probe(id integer);\n\
+             COMMIT;\n\n\
+             -- DOWN\n\
+             DROP TABLE IF EXISTS uvg_tc_probe;\n",
+        )
+        .unwrap();
+        let migrations_arg = migrations.display().to_string();
+
+        // Both paths must refuse and leave nothing behind: the default
+        // (parse-check runs statements in a transaction an embedded COMMIT
+        // would commit) and --no-parse-check (straight to the apply wrapper).
+        for extra in [Vec::new(), vec!["--no-parse-check"]] {
+            let mut args: Vec<&str> = extra.clone();
+            args.push("upgrade");
+            args.push(url.as_str());
+            args.push("--migrations-dir");
+            args.push(migrations_arg.as_str());
+            let out = run_uvg(&args);
+            assert!(
+                !out.status.success(),
+                "must refuse embedded COMMIT (extra={extra:?})"
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("transaction-control statement"),
+                "should name the refusal reason (extra={extra:?}): {stderr}"
+            );
+            assert!(
+                !postgres_table_exists(&url, "uvg_tc_probe").await,
+                "refusal must execute nothing (extra={extra:?})"
+            );
+        }
+
+        // Nothing ran, so the CREATE from before the COMMIT must not exist.
+        assert!(
+            !postgres_table_exists(&url, "uvg_tc_probe").await,
+            "refusal must execute nothing"
+        );
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres reconnect");
+        sqlx::query("DROP TABLE IF EXISTS uvg_tc_probe")
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+        pool.close().await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UVG_DISPOSABLE_PG_URL pointing at a disposable PostgreSQL database"]
+    async fn test_postgres_apply_falls_back_for_non_transactional_ddl() {
+        // #109: CREATE INDEX CONCURRENTLY cannot run inside a transaction, so
+        // the apply must fall back to statement-by-statement and still run it.
+        let _serial = live_pg_lock().lock().await;
+        let url =
+            std::env::var("UVG_DISPOSABLE_PG_URL").expect("UVG_DISPOSABLE_PG_URL must be set");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres connect");
+        for stmt in [
+            "DROP TABLE IF EXISTS uvg_cc",
+            "DROP TABLE IF EXISTS uvg_version",
+            "CREATE TABLE uvg_cc(id integer)",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect("setup");
+        }
+        pool.close().await;
+
+        let dir = tmpdir("pg-concurrently");
+        let migrations = dir.join("migrations");
+        std::fs::create_dir_all(&migrations).unwrap();
+        std::fs::write(
+            migrations.join("20260101_000000_cc.sql"),
+            "-- uvg revision: 20260101_000000\n\
+             -- parent:\n\
+             -- description: concurrent index\n\n\
+             -- UP\n\
+             CREATE INDEX CONCURRENTLY uvg_cc_idx ON uvg_cc (id);\n\n\
+             -- DOWN\n\
+             DROP INDEX CONCURRENTLY IF EXISTS uvg_cc_idx;\n",
+        )
+        .unwrap();
+        let migrations_arg = migrations.display().to_string();
+
+        // parse-check can't validate CONCURRENTLY (it runs in a transaction),
+        // so use --no-parse-check, matching real zero-downtime index workflows.
+        let out = run_uvg(&[
+            "--no-parse-check",
+            "upgrade",
+            &url,
+            "--migrations-dir",
+            &migrations_arg,
+        ]);
+        assert!(
+            out.status.success(),
+            "CONCURRENTLY apply should succeed via fallback: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            postgres_table_exists(&url, "uvg_cc_idx").await,
+            "the concurrent index should have been created"
+        );
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("postgres reconnect");
+        for stmt in [
+            "DROP TABLE IF EXISTS uvg_cc",
+            "DROP TABLE IF EXISTS uvg_version",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect("cleanup");
+        }
         pool.close().await;
 
         std::fs::remove_dir_all(&dir).ok();

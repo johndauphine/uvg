@@ -25,6 +25,16 @@ impl Dialect {
             Dialect::Sqlite => "main",
         }
     }
+
+    /// Whether a batch of DDL statements can be wrapped in a single
+    /// all-or-nothing transaction on this backend. Only PostgreSQL supports
+    /// transactional DDL; MySQL and MSSQL implicitly commit on most DDL
+    /// (`CREATE`/`ALTER`/`DROP`), so an outer transaction can't roll them
+    /// back, and the SQLite apply path runs statement-by-statement against a
+    /// file we typically own exclusively.
+    pub fn supports_transactional_ddl(&self) -> bool {
+        matches!(self, Dialect::Postgres)
+    }
 }
 
 impl FromStr for Dialect {
@@ -50,6 +60,22 @@ impl fmt::Display for Dialect {
             Dialect::Mssql => write!(f, "mssql"),
             Dialect::Mysql => write!(f, "mysql"),
             Dialect::Sqlite => write!(f, "sqlite"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_postgres_supports_transactional_ddl() {
+        assert!(Dialect::Postgres.supports_transactional_ddl());
+        for d in [Dialect::Mysql, Dialect::Mssql, Dialect::Sqlite] {
+            assert!(
+                !d.supports_transactional_ddl(),
+                "{d} implicitly commits DDL and must not claim transactional apply"
+            );
         }
     }
 }

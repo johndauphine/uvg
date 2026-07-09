@@ -479,3 +479,78 @@ async fn sqlx_ddl_helper_invokes_callbacks_and_stops_after_failure() {
         ]
     );
 }
+
+// ---- transaction-control guard for PG transactional apply (#109) ----
+
+#[test]
+fn transaction_control_keyword_flags_tx_statements() {
+    for (sql, expected) in [
+        ("BEGIN", Some("BEGIN")),
+        ("begin transaction", Some("BEGIN")),
+        ("COMMIT", Some("COMMIT")),
+        ("commit;", Some("COMMIT")),
+        ("ROLLBACK", Some("ROLLBACK")),
+        ("END", Some("END")),
+        ("ABORT", Some("ABORT")),
+        ("START TRANSACTION", Some("START")),
+        ("SAVEPOINT sp1", Some("SAVEPOINT")),
+        ("RELEASE SAVEPOINT sp1", Some("RELEASE")),
+        ("PREPARE TRANSACTION 'gid'", Some("PREPARE TRANSACTION")),
+    ] {
+        assert_eq!(transaction_control_keyword(sql), expected, "sql: {sql}");
+    }
+}
+
+#[test]
+fn transaction_control_keyword_sees_through_leading_comments() {
+    // PostgreSQL ignores leading comments, so the guard must too, or a
+    // `/* x */ COMMIT` slips through and ends the wrapper transaction.
+    assert_eq!(
+        transaction_control_keyword("/* end */ COMMIT"),
+        Some("COMMIT")
+    );
+    assert_eq!(
+        transaction_control_keyword("-- note\nROLLBACK"),
+        Some("ROLLBACK")
+    );
+    assert_eq!(
+        transaction_control_keyword("/* a /* nested */ b */ BEGIN"),
+        Some("BEGIN")
+    );
+    assert_eq!(
+        transaction_control_keyword("  /* c1 */  /* c2 */  COMMIT ;"),
+        Some("COMMIT")
+    );
+}
+
+#[test]
+fn transaction_control_keyword_treats_attached_comments_as_separators() {
+    // PostgreSQL treats a comment as whitespace even with no space before it,
+    // so `COMMIT/*x*/` and `ROLLBACK--x` are still transaction control.
+    assert_eq!(transaction_control_keyword("COMMIT/*x*/"), Some("COMMIT"));
+    assert_eq!(transaction_control_keyword("ROLLBACK--x"), Some("ROLLBACK"));
+    assert_eq!(
+        transaction_control_keyword("PREPARE/*c*/TRANSACTION 'g'"),
+        Some("PREPARE TRANSACTION")
+    );
+}
+
+#[test]
+fn transaction_control_keyword_ignores_ordinary_ddl() {
+    for sql in [
+        "CREATE TABLE t (id INT)",
+        "ALTER TABLE t ADD COLUMN c INT",
+        "DROP TABLE t",
+        // A bare PREPARE (prepared statement) is not transaction control.
+        "PREPARE plan AS SELECT 1",
+        // Identifiers that merely start with a control word are fine.
+        "CREATE TABLE beginnings (id INT)",
+    ] {
+        assert_eq!(transaction_control_keyword(sql), None, "sql: {sql}");
+    }
+}
+
+// Non-transactional statements (CREATE INDEX CONCURRENTLY, VACUUM, CLUSTER,
+// REINDEX DATABASE, ...) are detected at runtime via SQLSTATE 25001 and routed
+// to the statement-by-statement fallback; that behavior is covered by the
+// ignored live-PostgreSQL test `test_postgres_apply_falls_back_for_non_transactional_ddl`.

@@ -91,6 +91,11 @@ pub(crate) struct StmtResult {
     /// Wall-clock time the statement took to execute on the target.
     /// Used by the per-statement progress reporter (#45).
     pub duration: Duration,
+    /// True when this statement ran inside a transactional apply that was
+    /// rolled back (PostgreSQL, #109). Its effects did NOT persist, whether
+    /// or not `error` is set. Non-transactional dialects leave this `false`
+    /// and are partial-on-failure as before.
+    pub rolled_back: bool,
 }
 
 /// Split DDL output into individual statements using a SQL-aware splitter.
@@ -363,6 +368,21 @@ pub(crate) async fn parse_check_ddl(
     let statements = split_statements(ddl, config.dialect());
     let mut errors = Vec::new();
 
+    // The PG parse-check itself runs statements inside a transaction it
+    // rolls back at the end. An embedded COMMIT would commit that transaction
+    // — persisting the statements probed so far — before the apply-path guard
+    // ever runs. Reject transaction-control statements here too, before
+    // touching the database, so the default (parse-checked) flow is safe.
+    if config.dialect().supports_transactional_ddl() {
+        if let Some((i, stmt, kw)) = first_transaction_control(&statements) {
+            errors.push(ParseError {
+                sql: stmt.to_string(),
+                error: transaction_control_rejection(i, kw),
+            });
+            return Ok(errors);
+        }
+    }
+
     match config {
         ConnectionConfig::Postgres(url) => {
             let pool = sqlx::postgres::PgPoolOptions::new()
@@ -504,14 +524,33 @@ where
                 .max_connections(1)
                 .connect(url)
                 .await?;
-            results = execute_sqlx_ddl_statements(
-                &pool,
-                &statements,
-                max_retries,
-                &mut on_statement,
-                is_retryable_sqlx_pg_error,
-            )
-            .await;
+            if let Some((i, stmt, kw)) = first_transaction_control(&statements) {
+                // Refuse transaction-control statements (an embedded COMMIT
+                // would subvert the wrapper, or defeat uvg's per-statement model
+                // in the fallback). Nothing is executed.
+                let result = StmtResult {
+                    sql: stmt.to_string(),
+                    error: Some(transaction_control_rejection(i, kw)),
+                    duration: Duration::from_secs(0),
+                    rolled_back: true,
+                };
+                on_statement(&result, i + 1, total);
+                results = vec![result];
+            } else {
+                // PostgreSQL supports transactional DDL: run the whole batch in
+                // a single transaction so any failure rolls back and leaves the
+                // target unchanged (#109), instead of partial-on-failure. A
+                // statement that cannot run in a transaction block makes this
+                // fall back to statement-by-statement internally (detected at
+                // runtime via SQLSTATE 25001).
+                results = execute_pg_ddl_transactional(
+                    &pool,
+                    &statements,
+                    max_retries,
+                    &mut on_statement,
+                )
+                .await;
+            }
             pool.close().await;
         }
         ConnectionConfig::Mysql(url) => {
@@ -545,6 +584,7 @@ where
                     sql: stmt.to_string(),
                     error: r.err().map(|e| e.to_string()),
                     duration: start.elapsed(),
+                    rolled_back: false,
                 };
                 on_statement(&result, i + 1, total);
                 let failed = result.error.is_some();
@@ -593,6 +633,7 @@ where
                     sql: stmt.to_string(),
                     error: error_msg,
                     duration: start.elapsed(),
+                    rolled_back: false,
                 };
                 on_statement(&result, i + 1, total);
                 let failed = result.error.is_some();
@@ -639,6 +680,7 @@ where
             sql: stmt.to_string(),
             error: result.error,
             duration: result.duration,
+            rolled_back: false,
         };
         on_statement(&result, i + 1, total);
         let failed = result.error.is_some();
@@ -649,6 +691,348 @@ where
     }
 
     results
+}
+
+/// Apply a DDL batch to PostgreSQL inside a single transaction (#109).
+///
+/// PostgreSQL supports transactional DDL, so the whole batch is atomic:
+/// either every statement commits, or the first failure rolls the entire
+/// batch back and the target is left unchanged. Because a failed statement
+/// poisons a PostgreSQL transaction (subsequent commands error with "current
+/// transaction is aborted"), per-statement retry is impossible here; instead
+/// a *retryable* failure (serialization/deadlock, SQLSTATE class 40) retries
+/// the **whole** transaction — which is exactly the unit a class-40 abort
+/// applies to, so retry is correct by construction.
+///
+/// `on_statement` is invoked once per statement, for the final attempt only,
+/// after the transaction has committed or rolled back — nothing in a
+/// transactional apply is durable until commit, so progress is reported when
+/// the outcome is known rather than streamed mid-transaction.
+async fn execute_pg_ddl_transactional<F>(
+    pool: &sqlx::PgPool,
+    statements: &[String],
+    max_retries: u8,
+    on_statement: &mut F,
+) -> Vec<StmtResult>
+where
+    F: FnMut(&StmtResult, usize, usize),
+{
+    let total = statements.len();
+
+    // A transaction-control statement in the batch (BEGIN/COMMIT/ROLLBACK/
+    // SAVEPOINT/...) would subvert the atomicity wrapper: an embedded COMMIT
+    // ends our transaction and persists earlier statements, after which the
+    // rollback claim would be false. uvg's own generator never emits these,
+    // but hand-authored migration files can — refuse before executing anything
+    // so the target is genuinely untouched. (The parse-check path rejects
+    // these too, so the default flow never reaches here with one.)
+    if let Some((i, stmt, kw)) = first_transaction_control(statements) {
+        let result = StmtResult {
+            sql: stmt.to_string(),
+            error: Some(transaction_control_rejection(i, kw)),
+            duration: Duration::from_secs(0),
+            rolled_back: true,
+        };
+        on_statement(&result, i + 1, total);
+        return vec![result];
+    }
+
+    let mut attempt = 0u8;
+    loop {
+        let batch = run_pg_ddl_batch_once(pool, statements).await;
+        if batch.non_transactional {
+            // A statement cannot run inside a transaction block (CREATE INDEX
+            // CONCURRENTLY, VACUUM, CLUSTER, REINDEX DATABASE, CREATE DATABASE,
+            // ...). The attempt rolled back, so nothing persisted; re-run the
+            // batch statement-by-statement (non-atomic) — the same behavior as
+            // before #109. Detecting this at runtime (SQLSTATE 25001) covers
+            // every such command without parsing their grammar, and never
+            // demotes a batch that would in fact run transactionally.
+            tracing::warn!(
+                "uvg: applying to PostgreSQL statement-by-statement (non-atomic): the batch \
+                 contains a statement that cannot run inside a transaction block"
+            );
+            return execute_sqlx_ddl_statements(
+                pool,
+                statements,
+                max_retries,
+                on_statement,
+                is_retryable_sqlx_pg_error,
+            )
+            .await;
+        }
+        let failed = batch.results.iter().any(|r| r.error.is_some());
+        if failed && batch.retryable && attempt < max_retries {
+            let delay = retry_delay_ms(attempt + 1);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            attempt += 1;
+            continue;
+        }
+        for (i, r) in batch.results.iter().enumerate() {
+            on_statement(r, i + 1, total);
+        }
+        return batch.results;
+    }
+}
+
+/// Outcome of one transactional PostgreSQL batch attempt.
+struct PgBatchAttempt {
+    results: Vec<StmtResult>,
+    /// The failure (if any) is transient and the whole transaction may be retried.
+    retryable: bool,
+    /// A statement was rejected because it cannot run inside a transaction
+    /// block (SQLSTATE 25001); the caller should re-run non-atomically.
+    non_transactional: bool,
+}
+
+/// Run one attempt of a transactional PostgreSQL DDL batch.
+///
+/// On success every result has `error: None, rolled_back: false`. On a
+/// statement failure the batch is rolled back and every result carries
+/// `rolled_back: true`, with the offending statement's `error` set (results
+/// stop at the first failure, matching the non-transactional reporting shape).
+async fn run_pg_ddl_batch_once(pool: &sqlx::PgPool, statements: &[String]) -> PgBatchAttempt {
+    let mut results: Vec<StmtResult> = Vec::new();
+
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            let retryable = is_retryable_sqlx_pg_error(&e);
+            results.push(StmtResult {
+                sql: statements.first().cloned().unwrap_or_default(),
+                error: Some(e.to_string()),
+                duration: Duration::from_secs(0),
+                rolled_back: true,
+            });
+            return PgBatchAttempt {
+                results,
+                retryable,
+                non_transactional: false,
+            };
+        }
+    };
+
+    let mut retryable = false;
+    let mut non_transactional = false;
+    let mut failed = false;
+    for stmt in statements {
+        let start = Instant::now();
+        match sqlx::query(stmt).execute(&mut *tx).await {
+            Ok(_) => results.push(StmtResult {
+                sql: stmt.clone(),
+                error: None,
+                duration: start.elapsed(),
+                rolled_back: false,
+            }),
+            Err(e) => {
+                retryable = is_retryable_sqlx_pg_error(&e);
+                non_transactional = needs_non_atomic_retry(&e);
+                results.push(StmtResult {
+                    sql: stmt.clone(),
+                    error: Some(e.to_string()),
+                    duration: start.elapsed(),
+                    rolled_back: true,
+                });
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    if failed {
+        // A statement failed mid-batch: the transaction is definitively rolled
+        // back, so nothing persisted. A class-40 abort is retryable; a 25001
+        // ("cannot run inside a transaction block") triggers the non-atomic
+        // re-run in the caller.
+        let _ = tx.rollback().await;
+        for r in results.iter_mut() {
+            r.rolled_back = true;
+        }
+        return PgBatchAttempt {
+            results,
+            retryable,
+            non_transactional,
+        };
+    }
+
+    if let Err(e) = tx.commit().await {
+        if matches!(e, sqlx::Error::Database(_)) {
+            // The server rejected the COMMIT (e.g. a class-40 serialization
+            // failure, or a deferred-constraint violation). PostgreSQL rolled
+            // the transaction back — the outcome is KNOWN: nothing persisted.
+            // Classify so a class-40 commit abort still consumes the retry
+            // budget like an in-batch abort.
+            let commit_retryable = is_retryable_sqlx_pg_error(&e);
+            for r in results.iter_mut() {
+                r.rolled_back = true;
+            }
+            if let Some(last) = results.last_mut() {
+                last.error = Some(format!("commit failed; transaction rolled back ({e})"));
+            }
+            return PgBatchAttempt {
+                results,
+                retryable: commit_retryable,
+                non_transactional: false,
+            };
+        }
+        // A transport/acknowledgement failure (dropped connection, I/O): the
+        // outcome is UNKNOWN — PostgreSQL may have committed server-side even
+        // though the client never saw the ack. Do NOT claim rollback and do
+        // NOT auto-retry (a blind retry could double-apply); make the operator
+        // verify.
+        if let Some(last) = results.last_mut() {
+            last.error = Some(format!(
+                "commit failed; the transaction outcome is unknown — the changes may or may \
+                 not have been applied. Verify the target before retrying ({e})"
+            ));
+        }
+        // rolled_back stays false; not retryable.
+        return PgBatchAttempt {
+            results,
+            retryable: false,
+            non_transactional: false,
+        };
+    }
+
+    PgBatchAttempt {
+        results,
+        retryable,
+        non_transactional: false,
+    }
+}
+
+/// `true` if `err` means the batch needs a commit boundary that a single
+/// wrapping transaction can't provide, so it should be re-run
+/// statement-by-statement (non-atomic). Detecting this at runtime — rather
+/// than parsing SQL — covers every such statement, current and future:
+///
+/// - `25001` "cannot run inside a transaction block": `CREATE INDEX
+///   CONCURRENTLY`, `VACUUM`, `CLUSTER`, `REINDEX DATABASE`, `CREATE DATABASE`.
+/// - `55P04` "unsafe use of new value of enum type": `ALTER TYPE ... ADD VALUE`
+///   followed by using that value in the same transaction.
+fn needs_non_atomic_retry(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|e| e.code())
+        .map(|c| c == "25001" || c == "55P04")
+        .unwrap_or(false)
+}
+
+/// Return `stmt` with leading whitespace and SQL comments removed — line
+/// comments (`-- ...`) and block comments (`/* ... */`, nested as PostgreSQL
+/// allows) — so the first remaining token is the actual command word.
+fn skip_leading_sql_comments(stmt: &str) -> &str {
+    let bytes = stmt.as_bytes();
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let mut depth = 1u32;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    &stmt[i..]
+}
+
+/// Read the next command word from `s` (which should already have leading
+/// comments stripped), returning `(word, rest)`. The word ends at whitespace,
+/// `;`, or the start of a comment (`--` or `/*`) — PostgreSQL treats comments
+/// as token separators, so `COMMIT/*x*/` and `ROLLBACK--x` are the commands
+/// `COMMIT` and `ROLLBACK`, not opaque tokens.
+fn next_command_word(s: &str) -> (&str, &str) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() || c == b';' {
+            break;
+        }
+        if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            break;
+        }
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            break;
+        }
+        i += 1;
+    }
+    (&s[..i], &s[i..])
+}
+
+/// If `stmt` begins with a PostgreSQL transaction-control command, return its
+/// canonical keyword; otherwise `None`. Used to guard the transactional apply
+/// wrapper AND the PG parse-check (#109) — these statements would end the
+/// wrapper/parse transaction and break its all-or-nothing guarantee.
+///
+/// Comments are treated as PostgreSQL treats them — as whitespace — both
+/// before the command (`/* x */ COMMIT`) and attached to it (`COMMIT/*x*/`),
+/// so the guard can't be sidestepped with comment placement.
+fn transaction_control_keyword(stmt: &str) -> Option<&'static str> {
+    let (first_raw, rest) = next_command_word(skip_leading_sql_comments(stmt));
+    let kw = match first_raw.to_ascii_uppercase().as_str() {
+        "BEGIN" => "BEGIN",
+        "START" => "START",
+        "COMMIT" => "COMMIT",
+        "END" => "END",
+        "ROLLBACK" => "ROLLBACK",
+        "ABORT" => "ABORT",
+        "SAVEPOINT" => "SAVEPOINT",
+        "RELEASE" => "RELEASE",
+        // `PREPARE TRANSACTION` is transaction control; a bare `PREPARE name AS
+        // ...` is an ordinary prepared statement and is left alone.
+        "PREPARE" => {
+            let (second, _) = next_command_word(skip_leading_sql_comments(rest));
+            if second.eq_ignore_ascii_case("transaction") {
+                "PREPARE TRANSACTION"
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(kw)
+}
+
+/// The first transaction-control statement in `statements` as
+/// `(index, statement, keyword)`, or `None`. Both the PG parse-check and the
+/// PG transactional apply reject on this, so an embedded `COMMIT` can't commit
+/// during parse-check (leaving changes behind) nor subvert the apply wrapper.
+fn first_transaction_control(statements: &[String]) -> Option<(usize, &str, &'static str)> {
+    statements
+        .iter()
+        .enumerate()
+        .find_map(|(i, s)| transaction_control_keyword(s).map(|kw| (i, s.as_str(), kw)))
+}
+
+/// Error message for a rejected transaction-control statement.
+fn transaction_control_rejection(index: usize, keyword: &str) -> String {
+    format!(
+        "refusing to apply: statement {} is a transaction-control statement (`{}`), which is \
+         incompatible with uvg's single-transaction apply on PostgreSQL. Nothing was executed; \
+         remove it or split the migration.",
+        index + 1,
+        keyword
+    )
 }
 
 /// Internal: retry an async DDL action up to `max_retries` times when
