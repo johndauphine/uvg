@@ -3,8 +3,18 @@ use crate::schema::ColumnInfo;
 use super::{CanonicalType, DdlType};
 
 /// Check if a MySQL tinyint column has display width 1 (boolean).
-fn is_tinyint_bool(col: &ColumnInfo) -> bool {
+/// Shared with the SQLAlchemy typemap (#114) so MySQL COLUMN_TYPE parsing
+/// lives in exactly one module.
+pub(crate) fn is_tinyint_bool(col: &ColumnInfo) -> bool {
     col.udt_name == "tinyint" && col.data_type.starts_with("tinyint(1)")
+}
+
+/// Check if a MySQL COLUMN_TYPE string carries the `unsigned` attribute.
+/// Canonical DDL translation drops unsignedness (no portable equivalent),
+/// but the SQLAlchemy typemap preserves it via dialect types (#114); this
+/// helper keeps that COLUMN_TYPE knowledge in the one MySQL parsing module.
+pub(crate) fn is_unsigned(col: &ColumnInfo) -> bool {
+    col.data_type.contains("unsigned")
 }
 
 /// Parse ENUM or SET values from a COLUMN_TYPE string like "enum('a','b','c')".

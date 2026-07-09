@@ -1,48 +1,40 @@
+use crate::ddl_typemap::{self, CanonicalType};
+use crate::dialect::Dialect;
 use crate::schema::ColumnInfo;
 
-use super::{simple, MappedType};
+use super::{canonical_sa, simple, MappedType};
 
-/// Map a PostgreSQL column keeping dialect-specific types.
-/// Used when keep_dialect_types option is set.
-pub fn map_column_type_dialect(col: &ColumnInfo) -> MappedType {
-    let udt = col.udt_name.as_str();
+const PG: &str = "sqlalchemy.dialects.postgresql";
 
-    if udt.is_empty() {
-        return MappedType {
-            sa_type: "NullType".to_string(),
-            python_type: "str".to_string(),
-            import_module: "sqlalchemy.sql.sqltypes".to_string(),
-            import_name: "NullType".to_string(),
-            element_import: None,
-        };
-    }
-
-    if let Some(element_udt) = udt.strip_prefix('_') {
-        let element = map_udt_scalar_dialect(element_udt, col);
-        return MappedType {
-            sa_type: format!("ARRAY({})", element.sa_type),
-            python_type: "list".to_string(),
-            import_module: "sqlalchemy".to_string(),
-            import_name: "ARRAY".to_string(),
-            element_import: Some((element.import_module, element.import_name)),
-        };
-    }
-
-    map_udt_scalar_dialect(udt, col)
+/// Map a PostgreSQL column to its SQLAlchemy type representation.
+///
+/// Parsing (array `_` prefix, lengths, precision/scale, udt normalization)
+/// happens once in `ddl_typemap::to_canonical`; the shared canonical→SA core
+/// covers PG entirely — PG's dialect types (UUID/JSON/JSONB/INET/CIDR) are
+/// resolved there from the canonical form.
+pub fn map_column_type(col: &ColumnInfo) -> MappedType {
+    let ct = ddl_typemap::to_canonical(col, Dialect::Postgres);
+    canonical_sa::generic(&ct, Dialect::Postgres)
 }
 
-/// Map PG scalar type keeping dialect-specific types.
-fn map_udt_scalar_dialect(udt: &str, col: &ColumnInfo) -> MappedType {
-    let pg = "sqlalchemy.dialects.postgresql";
-    match udt {
-        "bool" => simple("BOOLEAN", "bool", pg),
-        "int2" => simple("SMALLINT", "int", pg),
-        "int4" | "serial" => simple("INTEGER", "int", pg),
-        "int8" | "bigserial" => simple("BIGINT", "int", pg),
-        "float4" => simple("REAL", "float", pg),
-        "float8" => simple("DOUBLE_PRECISION", "float", pg),
-        "numeric" => {
-            let sa_type = match (col.numeric_precision, col.numeric_scale) {
+/// Map a PostgreSQL column keeping dialect-specific types
+/// (`keep_dialect_types` option): everything imports from
+/// `sqlalchemy.dialects.postgresql` under its native uppercase name.
+pub fn map_column_type_dialect(col: &ColumnInfo) -> MappedType {
+    let ct = ddl_typemap::to_canonical(col, Dialect::Postgres);
+    dialect_from_canonical(&ct)
+}
+
+fn dialect_from_canonical(ct: &CanonicalType) -> MappedType {
+    match ct {
+        CanonicalType::Boolean => simple("BOOLEAN", "bool", PG),
+        CanonicalType::SmallInt => simple("SMALLINT", "int", PG),
+        CanonicalType::Integer => simple("INTEGER", "int", PG),
+        CanonicalType::BigInt => simple("BIGINT", "int", PG),
+        CanonicalType::Float => simple("REAL", "float", PG),
+        CanonicalType::Double => simple("DOUBLE_PRECISION", "float", PG),
+        CanonicalType::Decimal { precision, scale } => {
+            let sa_type = match (precision, scale) {
                 (Some(p), Some(s)) => format!("NUMERIC({p}, {s})"),
                 (Some(p), None) => format!("NUMERIC({p})"),
                 _ => "NUMERIC".to_string(),
@@ -50,185 +42,76 @@ fn map_udt_scalar_dialect(udt: &str, col: &ColumnInfo) -> MappedType {
             MappedType {
                 sa_type,
                 python_type: "decimal.Decimal".to_string(),
-                import_module: pg.to_string(),
+                import_module: PG.to_string(),
                 import_name: "NUMERIC".to_string(),
                 element_import: None,
             }
         }
-        "text" => simple("TEXT", "str", pg),
-        "varchar" => {
-            let sa_type = match col.character_maximum_length {
-                Some(n) => format!("VARCHAR({n})"),
-                None => "VARCHAR".to_string(),
-            };
-            MappedType {
-                sa_type,
-                python_type: "str".to_string(),
-                import_module: pg.to_string(),
-                import_name: "VARCHAR".to_string(),
-                element_import: None,
-            }
-        }
-        "char" | "bpchar" => {
-            let sa_type = match col.character_maximum_length {
-                Some(n) => format!("CHAR({n})"),
-                None => "CHAR".to_string(),
-            };
-            MappedType {
-                sa_type,
-                python_type: "str".to_string(),
-                import_module: pg.to_string(),
-                import_name: "CHAR".to_string(),
-                element_import: None,
-            }
-        }
-        "bytea" => simple("BYTEA", "bytes", pg),
-        "timestamp" => simple("TIMESTAMP", "datetime.datetime", pg),
-        "timestamptz" => MappedType {
-            sa_type: "TIMESTAMP(timezone=True)".to_string(),
-            python_type: "datetime.datetime".to_string(),
-            import_module: pg.to_string(),
-            import_name: "TIMESTAMP".to_string(),
-            element_import: None,
-        },
-        "date" => simple("DATE", "datetime.date", pg),
-        "time" => simple("TIME", "datetime.time", pg),
-        "timetz" => MappedType {
+        CanonicalType::Varchar { length } => sized("VARCHAR", *length, "str"),
+        CanonicalType::Char { length } => sized("CHAR", *length, "str"),
+        CanonicalType::Text => simple("TEXT", "str", PG),
+        CanonicalType::Bytes { .. } => simple("BYTEA", "bytes", PG),
+        CanonicalType::Date => simple("DATE", "datetime.date", PG),
+        CanonicalType::Time { with_tz: false, .. } => simple("TIME", "datetime.time", PG),
+        CanonicalType::Time { with_tz: true, .. } => MappedType {
             sa_type: "TIME(timezone=True)".to_string(),
             python_type: "datetime.time".to_string(),
-            import_module: pg.to_string(),
+            import_module: PG.to_string(),
             import_name: "TIME".to_string(),
             element_import: None,
         },
-        "interval" => simple("INTERVAL", "datetime.timedelta", pg),
-        // These are already dialect-specific — same as regular mapping
-        "uuid" => simple("UUID", "uuid.UUID", pg),
-        "json" => simple("JSON", "dict", pg),
-        "jsonb" => simple("JSONB", "dict", pg),
-        "inet" => simple("INET", "str", pg),
-        "cidr" => simple("CIDR", "str", pg),
-        // Fallback: use sqlalchemy (not dialect module) to avoid invalid imports
-        other => MappedType {
-            sa_type: other.to_uppercase(),
-            python_type: "str".to_string(),
-            import_module: "sqlalchemy".to_string(),
-            import_name: other.to_uppercase(),
-            element_import: None,
-        },
-    }
-}
-
-/// Map a PostgreSQL column to its SQLAlchemy type representation.
-pub fn map_column_type(col: &ColumnInfo) -> MappedType {
-    let udt = col.udt_name.as_str();
-
-    // Handle null/unknown types
-    if udt.is_empty() {
-        return MappedType {
-            sa_type: "NullType".to_string(),
-            python_type: "str".to_string(),
-            import_module: "sqlalchemy.sql.sqltypes".to_string(),
-            import_name: "NullType".to_string(),
-            element_import: None,
-        };
-    }
-
-    // Handle array types (udt_name starts with underscore)
-    if let Some(element_udt) = udt.strip_prefix('_') {
-        let element = map_udt_scalar(element_udt, col);
-        return MappedType {
-            sa_type: format!("ARRAY({})", element.sa_type),
-            python_type: "list".to_string(),
-            import_module: "sqlalchemy".to_string(),
-            import_name: "ARRAY".to_string(),
-            element_import: Some((element.import_module, element.import_name)),
-        };
-    }
-
-    map_udt_scalar(udt, col)
-}
-
-fn map_udt_scalar(udt: &str, col: &ColumnInfo) -> MappedType {
-    match udt {
-        "bool" => simple("Boolean", "bool", "sqlalchemy"),
-        "int2" => simple("SmallInteger", "int", "sqlalchemy"),
-        "int4" | "serial" => simple("Integer", "int", "sqlalchemy"),
-        "int8" | "bigserial" => simple("BigInteger", "int", "sqlalchemy"),
-        "float4" => simple("Float", "float", "sqlalchemy"),
-        "float8" => simple("Double", "float", "sqlalchemy"),
-        "numeric" => {
-            let sa_type = match (col.numeric_precision, col.numeric_scale) {
-                (Some(p), Some(s)) => format!("Numeric({p}, {s})"),
-                (Some(p), None) => format!("Numeric({p})"),
-                _ => "Numeric".to_string(),
-            };
-            MappedType {
-                sa_type,
-                python_type: "decimal.Decimal".to_string(),
-                import_module: "sqlalchemy".to_string(),
-                import_name: "Numeric".to_string(),
-                element_import: None,
-            }
+        CanonicalType::Timestamp { with_tz: false, .. } => {
+            simple("TIMESTAMP", "datetime.datetime", PG)
         }
-        "text" => simple("Text", "str", "sqlalchemy"),
-        "varchar" => {
-            let sa_type = match col.character_maximum_length {
-                Some(n) => format!("String({n})"),
-                None => "String".to_string(),
-            };
-            MappedType {
-                sa_type,
-                python_type: "str".to_string(),
-                import_module: "sqlalchemy".to_string(),
-                import_name: "String".to_string(),
-                element_import: None,
-            }
-        }
-        "char" | "bpchar" => {
-            let sa_type = match col.character_maximum_length {
-                Some(n) => format!("String({n})"),
-                None => "String".to_string(),
-            };
-            MappedType {
-                sa_type,
-                python_type: "str".to_string(),
-                import_module: "sqlalchemy".to_string(),
-                import_name: "String".to_string(),
-                element_import: None,
-            }
-        }
-        "bytea" => simple("LargeBinary", "bytes", "sqlalchemy"),
-        "timestamp" => simple("DateTime", "datetime.datetime", "sqlalchemy"),
-        "timestamptz" => MappedType {
-            sa_type: "DateTime(True)".to_string(),
+        CanonicalType::Timestamp { with_tz: true, .. } => MappedType {
+            sa_type: "TIMESTAMP(timezone=True)".to_string(),
             python_type: "datetime.datetime".to_string(),
-            import_module: "sqlalchemy".to_string(),
-            import_name: "DateTime".to_string(),
+            import_module: PG.to_string(),
+            import_name: "TIMESTAMP".to_string(),
             element_import: None,
         },
-        "date" => simple("Date", "datetime.date", "sqlalchemy"),
-        "time" => simple("Time", "datetime.time", "sqlalchemy"),
-        "timetz" => MappedType {
-            sa_type: "Time(True)".to_string(),
-            python_type: "datetime.time".to_string(),
-            import_module: "sqlalchemy".to_string(),
-            import_name: "Time".to_string(),
-            element_import: None,
+        CanonicalType::Interval => simple("INTERVAL", "datetime.timedelta", PG),
+        CanonicalType::Uuid => simple("UUID", "uuid.UUID", PG),
+        CanonicalType::Json => simple("JSON", "dict", PG),
+        CanonicalType::Jsonb => simple("JSONB", "dict", PG),
+        // PG's to_canonical never yields Enum/Set (native enums resolve
+        // through the schema's enum registry, not the typemap); treat them
+        // like the generic core would, defensively.
+        CanonicalType::Enum { .. } | CanonicalType::Set { .. } => {
+            canonical_sa::generic(ct, Dialect::Postgres)
+        }
+        CanonicalType::Array { element } => {
+            let inner = dialect_from_canonical(element);
+            MappedType {
+                sa_type: format!("ARRAY({})", inner.sa_type),
+                python_type: "list".to_string(),
+                import_module: "sqlalchemy".to_string(),
+                import_name: "ARRAY".to_string(),
+                element_import: Some((inner.import_module, inner.import_name)),
+            }
+        }
+        CanonicalType::Raw { type_name } => match type_name.as_str() {
+            "INET" => simple("INET", "str", PG),
+            "CIDR" => simple("CIDR", "str", PG),
+            "" => simple("NullType", "str", "sqlalchemy.sql.sqltypes"),
+            // Fallback imports from sqlalchemy (not the dialect module) to
+            // avoid generating invalid dialect imports.
+            other => simple(other, "str", "sqlalchemy"),
         },
-        "interval" => simple("Interval", "datetime.timedelta", "sqlalchemy"),
-        "uuid" => simple("UUID", "uuid.UUID", "sqlalchemy.dialects.postgresql"),
-        "json" => simple("JSON", "dict", "sqlalchemy.dialects.postgresql"),
-        "jsonb" => simple("JSONB", "dict", "sqlalchemy.dialects.postgresql"),
-        "inet" => simple("INET", "str", "sqlalchemy.dialects.postgresql"),
-        "cidr" => simple("CIDR", "str", "sqlalchemy.dialects.postgresql"),
-        // Fallback: use the udt_name as-is, uppercased
-        other => MappedType {
-            sa_type: other.to_uppercase(),
-            python_type: "str".to_string(),
-            import_module: "sqlalchemy".to_string(),
-            import_name: other.to_uppercase(),
-            element_import: None,
-        },
+    }
+}
+
+fn sized(base: &str, length: Option<i32>, python_type: &str) -> MappedType {
+    let sa_type = match length {
+        Some(n) => format!("{base}({n})"),
+        None => base.to_string(),
+    };
+    MappedType {
+        sa_type,
+        python_type: python_type.to_string(),
+        import_module: PG.to_string(),
+        import_name: base.to_string(),
+        element_import: None,
     }
 }
 
