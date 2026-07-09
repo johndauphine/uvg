@@ -826,7 +826,7 @@ async fn run_pg_ddl_batch_once(pool: &sqlx::PgPool, statements: &[String]) -> Pg
             }),
             Err(e) => {
                 retryable = is_retryable_sqlx_pg_error(&e);
-                non_transactional = is_cannot_run_in_transaction_error(&e);
+                non_transactional = needs_non_atomic_retry(&e);
                 results.push(StmtResult {
                     sql: stmt.clone(),
                     error: Some(e.to_string()),
@@ -901,15 +901,19 @@ async fn run_pg_ddl_batch_once(pool: &sqlx::PgPool, statements: &[String]) -> Pg
     }
 }
 
-/// `true` if `err` is PostgreSQL's "cannot run inside a transaction block"
-/// (SQLSTATE 25001) — e.g. `CREATE INDEX CONCURRENTLY`, `VACUUM`, `CLUSTER`,
-/// `REINDEX DATABASE`, `CREATE DATABASE`. Detecting it at runtime lets the
-/// apply fall back to statement-by-statement for exactly the statements that
-/// need it, with no SQL-grammar parsing.
-fn is_cannot_run_in_transaction_error(err: &sqlx::Error) -> bool {
+/// `true` if `err` means the batch needs a commit boundary that a single
+/// wrapping transaction can't provide, so it should be re-run
+/// statement-by-statement (non-atomic). Detecting this at runtime — rather
+/// than parsing SQL — covers every such statement, current and future:
+///
+/// - `25001` "cannot run inside a transaction block": `CREATE INDEX
+///   CONCURRENTLY`, `VACUUM`, `CLUSTER`, `REINDEX DATABASE`, `CREATE DATABASE`.
+/// - `55P04` "unsafe use of new value of enum type": `ALTER TYPE ... ADD VALUE`
+///   followed by using that value in the same transaction.
+fn needs_non_atomic_retry(err: &sqlx::Error) -> bool {
     err.as_database_error()
         .and_then(|e| e.code())
-        .map(|c| c == "25001")
+        .map(|c| c == "25001" || c == "55P04")
         .unwrap_or(false)
 }
 
