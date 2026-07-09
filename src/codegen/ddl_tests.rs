@@ -1,7 +1,7 @@
 use super::*;
 use crate::codegen::render::{
-    check_predicate_is_portable, format_ddl_default_typed, generate_column_def,
-    qualified_table_name, quote_identifier, translate_check_predicate,
+    check_predicate_is_portable, format_ddl_default_typed, qualified_table_name, quote_identifier,
+    translate_check_predicate,
 };
 use crate::testutil::{col, schema_pg, table};
 
