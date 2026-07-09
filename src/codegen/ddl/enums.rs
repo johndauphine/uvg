@@ -1,7 +1,7 @@
 use crate::dialect::Dialect;
 use crate::schema::IntrospectedSchema;
 
-use super::ident::quote_identifier;
+use crate::codegen::render::ident::quote_identifier;
 
 /// Generate CREATE TYPE statements for enums (PG target only).
 pub(super) fn generate_enum_types(

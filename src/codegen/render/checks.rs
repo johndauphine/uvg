@@ -168,7 +168,7 @@ fn has_literal_prefix_boundary(bytes: &[u8], prefix_index: usize) -> bool {
 /// level scanning of the cast region is safe; only the surrounding text
 /// might contain non-ASCII (accented string literals in CHECK predicates),
 /// which the slice-copy approach preserves intact.
-pub(super) fn strip_pg_casts_in_predicate(expr: &str) -> String {
+pub(in crate::codegen) fn strip_pg_casts_in_predicate(expr: &str) -> String {
     let bytes = expr.as_bytes();
     let mut out = String::with_capacity(expr.len());
     let mut i = 0;

@@ -1,3 +1,4 @@
+use crate::codegen::sql_text::{strip_mssql_parens, strip_pg_typecast};
 use crate::dialect::Dialect;
 
 /// Format a default value expression for the target dialect.
@@ -10,8 +11,8 @@ pub(in crate::codegen) fn format_ddl_default_typed(
 ) -> String {
     // Step 1: Strip source-specific syntax
     let cleaned = match source_dialect {
-        Dialect::Postgres => super::super::strip_pg_typecast(default),
-        Dialect::Mssql => super::super::strip_mssql_parens(default),
+        Dialect::Postgres => strip_pg_typecast(default),
+        Dialect::Mssql => strip_mssql_parens(default),
         Dialect::Mysql | Dialect::Sqlite => default.trim(),
     };
 
@@ -52,7 +53,7 @@ pub(in crate::codegen) fn format_ddl_default_typed(
 /// MySQL stores string defaults without quotes (e.g. `member` instead of `'member'`).
 /// Numbers, NULL, function calls (containing parens), boolean keywords,
 /// and already-quoted strings are left as-is.
-pub(super) fn ensure_default_quoting(expr: &str) -> String {
+pub(in crate::codegen) fn ensure_default_quoting(expr: &str) -> String {
     let trimmed = expr.trim();
 
     // Already quoted
@@ -96,7 +97,7 @@ pub(super) fn ensure_default_quoting(expr: &str) -> String {
 }
 
 /// Translate common SQL functions between dialects.
-pub(super) fn translate_default_function(expr: &str, target: Dialect) -> String {
+pub(in crate::codegen) fn translate_default_function(expr: &str, target: Dialect) -> String {
     let lower = expr.trim().to_lowercase();
 
     // Strip a trailing precision suffix like CURRENT_TIMESTAMP(6). The (6)
@@ -166,7 +167,7 @@ pub(super) fn translate_default_function(expr: &str, target: Dialect) -> String 
 /// Extract the sub-second precision from a CanonicalType::Time / Timestamp,
 /// or None for non-temporal types or temporals without a stored precision.
 /// Used for MySQL DATETIME(N)/TIMESTAMP(N) default-precision symmetry (#36).
-pub(super) fn temporal_precision(ct: &crate::ddl_typemap::CanonicalType) -> Option<u8> {
+pub(in crate::codegen) fn temporal_precision(ct: &crate::ddl_typemap::CanonicalType) -> Option<u8> {
     match ct {
         crate::ddl_typemap::CanonicalType::Time { precision, .. }
         | crate::ddl_typemap::CanonicalType::Timestamp { precision, .. } => *precision,
@@ -180,7 +181,7 @@ pub(super) fn temporal_precision(ct: &crate::ddl_typemap::CanonicalType) -> Opti
 /// alone. The translate_default_function path strips precision for
 /// cross-dialect translation; this re-attachment runs after that strip,
 /// re-establishing column-type ↔ default-precision symmetry.
-pub(super) fn reattach_now_family_precision(default: &str, precision: u8) -> String {
+pub(in crate::codegen) fn reattach_now_family_precision(default: &str, precision: u8) -> String {
     let trimmed = default.trim_end();
     // Already has a non-empty paren-arg list (e.g. CURRENT_TIMESTAMP(6),
     // SYSDATETIMEOFFSET(3)) — leave verbatim. Empty parens like `now()`
@@ -220,7 +221,7 @@ pub(super) fn reattach_now_family_precision(default: &str, precision: u8) -> Str
 /// `getdate()` → `getdate()`. Caller passes a lowercased string. Used by
 /// the now-family translation so a precision-bearing source default can
 /// still match the dialect-idiomatic mapping table.
-pub(super) fn strip_precision_suffix(lower: &str) -> String {
+pub(in crate::codegen) fn strip_precision_suffix(lower: &str) -> String {
     if let Some(open) = lower.rfind('(') {
         let close = lower.len();
         if close >= open + 2 && lower.ends_with(')') {

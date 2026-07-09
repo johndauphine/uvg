@@ -1,11 +1,12 @@
 use crate::cli::GeneratorOptions;
 use crate::codegen::imports::ImportCollector;
+use crate::codegen::python::PythonOutput;
 use crate::codegen::{
     enum_class_name, find_enum_for_column, format_fk_options, format_index_kwargs,
     format_python_string_literal, format_server_default, generate_enum_class,
     is_primary_key_column, is_serial_default, is_standard_sequence_name,
     is_unique_constraint_index, parse_check_boolean, parse_check_enum, parse_sequence_name,
-    quote_constraint_columns, topo_sort_tables, Generator,
+    quote_constraint_columns, topo_sort_tables,
 };
 use crate::dialect::Dialect;
 use crate::naming::table_to_variable_name;
@@ -13,130 +14,138 @@ use crate::schema::EnumInfo;
 use crate::schema::{ConstraintType, IntrospectedSchema, TableInfo};
 use crate::typemap::{map_column_type, map_column_type_dialect};
 
-pub struct TablesGenerator;
+/// Generate `Table()` metadata output as a single file.
+pub fn generate(schema: &IntrospectedSchema, options: &GeneratorOptions) -> String {
+    parts(schema, options).render()
+}
 
-impl Generator for TablesGenerator {
-    fn generate(&self, schema: &IntrospectedSchema, options: &GeneratorOptions) -> String {
-        let mut imports = ImportCollector::new();
-        let mut table_blocks: Vec<String> = Vec::new();
+/// Generate `Table()` metadata output split one file per table.
+pub fn generate_split(
+    schema: &IntrospectedSchema,
+    options: &GeneratorOptions,
+) -> Vec<(String, String)> {
+    parts(schema, options).split()
+}
 
-        // Always need MetaData and Table for tables generator
-        imports.add("sqlalchemy", "MetaData");
-        imports.add("sqlalchemy", "Table");
-        imports.add("sqlalchemy", "Column");
+/// Build the structured output: prelude (imports, metadata, enum classes)
+/// plus one named block per table.
+fn parts(schema: &IntrospectedSchema, options: &GeneratorOptions) -> PythonOutput {
+    let mut imports = ImportCollector::new();
+    let mut table_blocks: Vec<(String, String)> = Vec::new();
 
-        // Collect named enums and synthetic enums from check constraints
-        let mut all_enums: Vec<EnumInfo> = schema.enums.clone();
-        let mut synthetic_enum_cols: std::collections::HashMap<(String, String), String> =
-            std::collections::HashMap::new();
-        // Boolean columns detected from IN (0, 1) check constraints
-        let mut boolean_cols: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
+    // Always need MetaData and Table for tables generator
+    imports.add("sqlalchemy", "MetaData");
+    imports.add("sqlalchemy", "Table");
+    imports.add("sqlalchemy", "Column");
 
-        let sorted_tables = topo_sort_tables(&schema.tables);
+    // Collect named enums and synthetic enums from check constraints
+    let mut all_enums: Vec<EnumInfo> = schema.enums.clone();
+    let mut synthetic_enum_cols: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    // Boolean columns detected from IN (0, 1) check constraints
+    let mut boolean_cols: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
-        // Detect boolean columns from check constraints
-        for table in &sorted_tables {
-            for constraint in &table.constraints {
-                if constraint.constraint_type == ConstraintType::Check {
-                    if let Some(ref expr) = constraint.check_expression {
-                        if let Some(col_name) = parse_check_boolean(expr) {
-                            boolean_cols.insert((table.name.clone(), col_name));
-                        }
+    let sorted_tables = topo_sort_tables(&schema.tables);
+
+    // Detect boolean columns from check constraints
+    for table in &sorted_tables {
+        for constraint in &table.constraints {
+            if constraint.constraint_type == ConstraintType::Check {
+                if let Some(ref expr) = constraint.check_expression {
+                    if let Some(col_name) = parse_check_boolean(expr) {
+                        boolean_cols.insert((table.name.clone(), col_name));
                     }
                 }
             }
         }
+    }
 
-        // Extract synthetic enums from check constraints (unless nosyntheticenums)
-        if !options.nosyntheticenums {
-            for table in &sorted_tables {
-                for constraint in &table.constraints {
-                    if constraint.constraint_type == ConstraintType::Check {
-                        if let Some(ref expr) = constraint.check_expression {
-                            if let Some((col_name, values)) = parse_check_enum(expr) {
-                                let key = (table.name.clone(), col_name.clone());
-                                if let std::collections::hash_map::Entry::Vacant(entry) =
-                                    synthetic_enum_cols.entry(key)
-                                {
-                                    use heck::ToUpperCamelCase;
-                                    let enum_name = format!("{}_{}", table.name, col_name)
-                                        .to_upper_camel_case();
-                                    let ei = EnumInfo {
-                                        name: enum_name.clone(),
-                                        schema: None,
-                                        values,
-                                    };
-                                    all_enums.push(ei);
-                                    entry.insert(enum_name);
-                                }
+    // Extract synthetic enums from check constraints (unless nosyntheticenums)
+    if !options.nosyntheticenums {
+        for table in &sorted_tables {
+            for constraint in &table.constraints {
+                if constraint.constraint_type == ConstraintType::Check {
+                    if let Some(ref expr) = constraint.check_expression {
+                        if let Some((col_name, values)) = parse_check_enum(expr) {
+                            let key = (table.name.clone(), col_name.clone());
+                            if let std::collections::hash_map::Entry::Vacant(entry) =
+                                synthetic_enum_cols.entry(key)
+                            {
+                                use heck::ToUpperCamelCase;
+                                let enum_name =
+                                    format!("{}_{}", table.name, col_name).to_upper_camel_case();
+                                let ei = EnumInfo {
+                                    name: enum_name.clone(),
+                                    schema: None,
+                                    values,
+                                };
+                                all_enums.push(ei);
+                                entry.insert(enum_name);
                             }
                         }
                     }
                 }
             }
-        } // end nosyntheticenums guard
+        }
+    } // end nosyntheticenums guard
 
-        // Track which enums are actually used
-        let mut used_enum_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+    // Track which enums are actually used
+    let mut used_enum_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for table in &sorted_tables {
-            // Track named enum usage
-            for col_info in &table.columns {
-                if find_enum_for_column(&col_info.udt_name, &all_enums).is_some() {
-                    used_enum_names.insert(col_info.udt_name.clone());
-                }
-                // Track synthetic enum usage via direct lookup
-                let key = (table.name.clone(), col_info.name.clone());
-                if let Some(class_name) = synthetic_enum_cols.get(&key) {
-                    used_enum_names.insert(class_name.clone());
-                }
+    for table in &sorted_tables {
+        // Track named enum usage
+        for col_info in &table.columns {
+            if find_enum_for_column(&col_info.udt_name, &all_enums).is_some() {
+                used_enum_names.insert(col_info.udt_name.clone());
             }
-
-            let block = generate_table(
-                table,
-                &mut imports,
-                options,
-                schema.dialect,
-                &all_enums,
-                &synthetic_enum_cols,
-                &boolean_cols,
-                &schema.domains,
-            );
-            table_blocks.push(block);
+            // Track synthetic enum usage via direct lookup
+            let key = (table.name.clone(), col_info.name.clone());
+            if let Some(class_name) = synthetic_enum_cols.get(&key) {
+                used_enum_names.insert(class_name.clone());
+            }
         }
 
-        // Collect used enum infos for class generation
-        let used_enums: Vec<&EnumInfo> = all_enums
-            .iter()
-            .filter(|ei| {
-                used_enum_names.contains(&ei.name)
-                    || used_enum_names.contains(&enum_class_name(&ei.name))
-            })
-            .collect();
+        let block = generate_table(
+            table,
+            &mut imports,
+            options,
+            schema.dialect,
+            &all_enums,
+            &synthetic_enum_cols,
+            &boolean_cols,
+            &schema.domains,
+        );
+        table_blocks.push((table_to_variable_name(&table.name), block));
+    }
 
-        if !used_enums.is_empty() {
-            imports.add_bare("enum");
-            imports.add("sqlalchemy", "Enum");
-        }
+    // Collect used enum infos for class generation
+    let used_enums: Vec<&EnumInfo> = all_enums
+        .iter()
+        .filter(|ei| {
+            used_enum_names.contains(&ei.name)
+                || used_enum_names.contains(&enum_class_name(&ei.name))
+        })
+        .collect();
 
-        let mut output = imports.render();
-        output.push_str("\n\nmetadata = MetaData()\n");
+    if !used_enums.is_empty() {
+        imports.add_bare("enum");
+        imports.add("sqlalchemy", "Enum");
+    }
 
-        // Enum class definitions
-        for ei in &used_enums {
-            output.push_str("\n\n");
-            output.push_str(&generate_enum_class(ei));
-        }
+    let mut prelude = imports.render();
+    prelude.push_str("\n\nmetadata = MetaData()\n");
 
-        for block in table_blocks {
-            output.push_str("\n\n");
-            output.push_str(&block);
-        }
+    // Enum class definitions
+    for ei in &used_enums {
+        prelude.push_str("\n\n");
+        prelude.push_str(&generate_enum_class(ei));
+    }
 
-        output.push('\n');
-        output
+    PythonOutput {
+        prelude,
+        models: table_blocks,
+        separator: "\n\n",
     }
 }
 

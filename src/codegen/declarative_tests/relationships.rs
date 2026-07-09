@@ -23,8 +23,7 @@ fn test_declarative_onetomany() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Parent side: collection relationship
     assert!(output.contains("simple_items: Mapped[list['SimpleItems']] = relationship('SimpleItems', back_populates='container')"));
@@ -56,8 +55,7 @@ fn test_declarative_onetomany_selfref() {
             &["id"],
         )
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Inline FK
     assert!(output.contains(
@@ -94,8 +92,7 @@ fn test_declarative_onetomany_composite() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Composite FK stays in __table_args__
     assert!(output.contains("ForeignKeyConstraint(['container_id1', 'container_id2']"));
@@ -130,8 +127,7 @@ fn test_declarative_onetoone() {
             .unique("simple_items_other_item_id_key", &["other_item_id"])
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Parent side: one-to-one (uselist=False, Optional scalar)
     assert!(output.contains("simple_items: Mapped[Optional['SimpleItems']] = relationship('SimpleItems', uselist=False, back_populates='other_item')"));
@@ -162,8 +158,7 @@ fn test_declarative_onetomany_noinflect() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // FK column has uppercase ID suffix — stripped
     assert!(output.contains(
@@ -204,8 +199,7 @@ fn test_declarative_enum_shared_values() {
             ],
         }],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Enum class generated before Base
     assert!(output.contains("class StatusEnum(str, enum.Enum):"));
     assert!(output.contains("ACTIVE = 'active'"));
@@ -246,8 +240,7 @@ fn test_declarative_onetomany_multiref() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Parent side: disambiguated relationship names
     assert!(output.contains("simple_items_parent_container: Mapped[list['SimpleItems']]"));
@@ -273,8 +266,7 @@ fn test_declarative_onetomany_selfref_multi() {
         )
         .fk("si_top_fkey", &["top_item_id"], "simple_items", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Each self-ref FK gets foreign_keys disambiguation
     assert!(output.contains("parent_item: Mapped[Optional['SimpleItems']] = relationship('SimpleItems', remote_side=[id], foreign_keys=[parent_item_id], back_populates='parent_item_reverse')"));
@@ -305,8 +297,7 @@ fn test_declarative_manytoone_nobidi() {
         nobidi: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
 
     // Child has relationship without back_populates
     assert!(output.contains(
@@ -340,8 +331,7 @@ fn test_declarative_foreign_key_schema() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // FK target includes schema prefix
     assert!(output.contains("ForeignKey('otherschema.other_items.id')"));
@@ -368,8 +358,7 @@ fn test_declarative_manytomany() {
             .fk("assoc_right_fkey", &["right_id"], "right_table", &["id"])
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Association table rendered as Table()
     assert!(output.contains("t_association_table = Table("));
@@ -417,8 +406,7 @@ fn test_declarative_joined_inheritance() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Parent class
     assert!(output.contains("class SimpleSuperItems(Base):"));
@@ -449,8 +437,7 @@ fn test_declarative_table_with_arrays() {
         .column(col("tags").udt("_text").nullable().build())
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("tags: Mapped[Optional[list]] = mapped_column(ARRAY(Text))"));
 }
 
@@ -465,8 +452,7 @@ fn test_declarative_constraints_with_index() {
         .unique("uq_id_number", &["id", "number"])
         .index("idx_number", &["number"], false)
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("CheckConstraint('number > 0')"));
     assert!(output.contains("UniqueConstraint('id', 'number', name='uq_id_number')"));
     assert!(output.contains("Index('idx_number', 'number')"));
@@ -495,8 +481,7 @@ fn test_declarative_onetomany_conflicting_column() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // "relationship" is not in PYTHON_RESERVED or import conflicts currently,
     // so it passes through as-is. The relationship() calls still work.
     assert!(
@@ -534,8 +519,7 @@ fn test_declarative_manytomany_nobidi() {
         nobidi: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // M2M relationships exist but without back_populates
     assert!(output.contains("relationship("));
     assert!(!output.contains("back_populates"));
@@ -557,8 +541,7 @@ fn test_declarative_joined_inheritance_same_table_name() {
             .fk("ssi_fkey", &["simple_items_id"], "simple_items", &["id"])
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Child inherits from parent
     assert!(output.contains("class SimpleSubItems(SimpleItems):"));
     // FK on PK column

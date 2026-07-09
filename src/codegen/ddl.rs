@@ -1,12 +1,6 @@
-mod checks;
-mod column;
 mod comments;
-mod create_table;
 mod cycles;
-mod defaults;
 mod enums;
-mod ident;
-mod indexes;
 
 use crate::cli::DdlOptions;
 use crate::codegen::topo_sort_tables;
@@ -15,21 +9,16 @@ use crate::dialect::Dialect;
 use crate::schema::{IntrospectedSchema, TableInfo, TableType};
 
 #[cfg(test)]
-use checks::strip_pg_casts_in_predicate;
-pub(super) use checks::{check_predicate_is_portable, translate_check_predicate};
-pub(super) use column::generate_column_def;
-use comments::generate_comments;
-pub(super) use create_table::generate_create_table;
-use cycles::detect_fk_cycles;
-pub(super) use defaults::format_ddl_default_typed;
+use super::render::checks::strip_pg_casts_in_predicate;
 #[cfg(test)]
-use defaults::{
+use super::render::defaults::{
     ensure_default_quoting, reattach_now_family_precision, strip_precision_suffix,
     translate_default_function,
 };
+use super::render::{generate_create_table, generate_indexes};
+use comments::generate_comments;
+use cycles::detect_fk_cycles;
 use enums::generate_enum_types;
-pub(super) use ident::{qualified_table_name, quote_identifier};
-pub(super) use indexes::generate_indexes;
 
 /// Output from DDL generation.
 pub enum DdlOutput {

@@ -14,7 +14,7 @@ use crate::schema::{
     ColumnInfo, ConstraintInfo, ConstraintType, IndexInfo, IntrospectedSchema, TableInfo, TableType,
 };
 
-use super::ddl::{
+use super::render::{
     check_predicate_is_portable, format_ddl_default_typed, generate_column_def,
     generate_create_table, generate_indexes, qualified_table_name, quote_identifier,
     translate_check_predicate,

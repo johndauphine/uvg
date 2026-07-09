@@ -34,8 +34,7 @@ fn make_simple_schema() -> IntrospectedSchema {
 #[test]
 fn test_declarative_generator_basic() {
     let schema = make_simple_schema();
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("class Users(Base):"));
     assert!(output.contains("__tablename__ = 'users'"));
     // PrimaryKeyConstraint is NOT in __table_args__ for declarative mode
@@ -55,8 +54,7 @@ fn test_declarative_generator_basic() {
 #[test]
 fn test_declarative_generator_snapshot() {
     let schema = make_simple_schema();
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     insta::assert_yaml_snapshot!(output);
 }
 
@@ -78,8 +76,7 @@ fn make_mixed_pk_schema() -> IntrospectedSchema {
 #[test]
 fn test_declarative_no_pk_fallback_to_table() {
     let schema = make_mixed_pk_schema();
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // The PK table should be a class
     assert!(output.contains("class Users(Base):"));
@@ -104,8 +101,7 @@ fn test_declarative_no_pk_fallback_to_table() {
 #[test]
 fn test_declarative_no_pk_fallback_snapshot() {
     let schema = make_mixed_pk_schema();
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     insta::assert_yaml_snapshot!(output);
 }
 
@@ -115,8 +111,7 @@ fn test_declarative_all_no_pk() {
         .column(col("ts").udt("timestamptz").build())
         .column(col("data").udt("text").build())
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // All no-PK: should fall back to MetaData() instead of DeclarativeBase
     assert!(output.contains("metadata = MetaData()"));
@@ -139,8 +134,7 @@ fn test_declarative_all_no_pk_snapshot() {
         .column(col("ts").udt("timestamptz").build())
         .column(col("data").udt("text").build())
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     insta::assert_yaml_snapshot!(output);
 }
 
@@ -158,8 +152,7 @@ fn test_declarative_indexes() {
         .index("idx_text", &["text"], true)
         .index("idx_text_number", &["text", "number"], false)
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("class SimpleItems(Base):"));
     assert!(output.contains("__table_args__ = ("));
     assert!(output.contains("Index('idx_number', 'number')"));
@@ -179,8 +172,7 @@ fn test_declarative_table_kwargs() {
         .column(col("id").build())
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("class SimpleItems(Base):"));
     assert!(output.contains("__table_args__ = {'schema': 'testschema'}"));
     assert!(output.contains("id: Mapped[int] = mapped_column(Integer, primary_key=True)"));
@@ -197,8 +189,7 @@ fn test_declarative_table_args_kwargs() {
         .pk("simple_items_pkey", &["id"])
         .index("testidx", &["id", "name"], false)
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("__table_args__ = ("));
     assert!(output.contains("Index('testidx', 'id', 'name'),"));
     assert!(output.contains("{'schema': 'testschema'}"));
@@ -210,8 +201,7 @@ fn test_declarative_only_tables() {
     let schema = schema_pg(vec![table("simple_items")
         .column(col("id").nullable().build())
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("metadata = MetaData()"));
     assert!(output.contains("t_simple_items = Table("));
     assert!(!output.contains("class "));
@@ -225,8 +215,7 @@ fn test_declarative_column_comment() {
         .column(col("id").comment("this is a 'comment'").build())
         .pk("simple_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("id: Mapped[int] = mapped_column(Integer, primary_key=True, comment=\"this is a 'comment'\")"));
 }
 
@@ -241,8 +230,7 @@ fn test_declarative_column_comment_nocomments() {
         nocomments: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     assert!(output.contains("id: Mapped[int] = mapped_column(Integer, primary_key=True)"));
     assert!(!output.contains("comment="));
 }
@@ -255,8 +243,7 @@ fn test_declarative_table_comment() {
         .pk("simple_pkey", &["id"])
         .comment("this is a 'comment'")
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("__table_args__ = {'comment': \"this is a 'comment'\"}"));
 }
 
@@ -270,8 +257,7 @@ fn test_declarative_pascal() {
         .column(col("id").build())
         .pk("customer_api_preference_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("class CustomerApiPreference(Base):"));
     assert!(output.contains("__tablename__ = 'CustomerAPIPreference'"));
 }
@@ -283,8 +269,7 @@ fn test_declarative_underscore() {
         .column(col("id").build())
         .pk("customer_api_preference_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("class CustomerApiPreference(Base):"));
     assert!(output.contains("__tablename__ = 'customer_api_preference'"));
 }
@@ -296,8 +281,7 @@ fn test_declarative_pascal_multiple_underscore() {
         .column(col("id").build())
         .pk("customer_api_preference_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // heck's UpperCamelCase handling of double underscores
     assert!(output.contains("__tablename__ = 'customer_API__Preference'"));
 }
@@ -314,8 +298,7 @@ fn test_declarative_invalid_attribute_names() {
         .column(col("def").nullable().build())
         .pk("simple_items_pkey", &["id-test"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Hyphens replaced with underscores, explicit column name
     assert!(output
         .contains("id_test: Mapped[int] = mapped_column('id-test', Integer, primary_key=True)"));
@@ -335,8 +318,7 @@ fn test_declarative_metadata_column() {
         .column(col("metadata").udt("varchar").nullable().build())
         .pk("simple_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // "metadata" is reserved by SQLAlchemy
     assert!(output.contains("metadata_: Mapped[Optional[str]] = mapped_column('metadata', String)"));
 }
@@ -348,8 +330,7 @@ fn test_declarative_invalid_variable_name_from_column() {
         .column(col(" id ").build())
         .pk("simple_pkey", &[" id "])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Spaces trimmed and mapped, explicit column name preserved
     assert!(output.contains("id: Mapped[int] = mapped_column(' id ', Integer, primary_key=True)"));
 }
@@ -364,8 +345,7 @@ fn test_declarative_constraints() {
         .check("", "number > 0")
         .unique("uq_id_number", &["id", "number"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("CheckConstraint('number > 0')"));
     assert!(output.contains("UniqueConstraint('id', 'number', name='uq_id_number')"));
     assert!(output.contains("from sqlalchemy import CheckConstraint"));
@@ -386,8 +366,7 @@ fn test_declarative_colname_import_conflict() {
         )
         .pk("simple_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // "text" conflicts with sqlalchemy.text import (from server_default)
     assert!(output.contains("text_: Mapped[Optional[str]] = mapped_column('text', String)"));
     assert!(output.contains(
@@ -403,8 +382,7 @@ fn test_declarative_composite_autoincrement_pk() {
         .column(col("id2").build())
         .pk("simple_autoincrement_items_pkey", &["id1", "id2"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains(
         "id1: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)"
     ));
@@ -419,8 +397,7 @@ fn test_declarative_composite_nullable_pk() {
         .column(col("id2").nullable().build())
         .pk("simple_items_pkey", &["id1", "id2"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("id1: Mapped[int] = mapped_column(Integer, primary_key=True)"));
     // Nullable PK column should show Optional and nullable=True
     assert!(output.contains(
@@ -437,8 +414,7 @@ fn test_declarative_pascal_underscore() {
         .column(col("id").build())
         .pk("customer_api_preference_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("__tablename__ = 'customer_API_Preference'"));
 }
 
