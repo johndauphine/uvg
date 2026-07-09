@@ -1188,3 +1188,63 @@ fn test_mysql_stale_backing_index_drop_tagged_as_drop_index() {
         .expect("stale backing index drop present");
     assert_eq!(index_drop.kind, crate::output::ChangeKind::DropIndex);
 }
+
+#[test]
+fn test_mysql_shared_name_unique_and_fk_prefers_same_type_match() {
+    // MySQL allows a UNIQUE key and an FK symbol to share a name. Pairing
+    // the FK against the UNIQUE for content comparison would report drift
+    // forever even though an identical FK exists under that name.
+    let make = |db: &str| {
+        table("orders")
+            .schema(db)
+            .column(col("user_id").udt("int").build())
+            .unique("shared_name", &["user_id"])
+            .fk_full(
+                "shared_name",
+                &["user_id"],
+                db,
+                "users",
+                &["id"],
+                "NO ACTION",
+                "NO ACTION",
+            )
+            .build()
+    };
+    let source = schema_mysql(vec![make("appdb")]);
+    let target = schema_mysql(vec![make("appdb")]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        !ddl.contains("shared_name"),
+        "identical schemas must not churn on shared constraint names: {ddl}"
+    );
+}
+
+#[test]
+fn test_source_declared_index_with_fk_name_is_not_dropped() {
+    // The source intentionally declares an index matching the old FK's
+    // name/columns; the index diff won't re-add it (the target already has
+    // the name), so the stale-index heuristic must leave it alone.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        ddl.contains("DROP FOREIGN KEY `fk_orders_owner`"),
+        "the FK change itself is still drift: {ddl}"
+    );
+    assert!(
+        !ddl.contains("DROP INDEX `fk_orders_owner`"),
+        "an index the source still declares must not be dropped: {ddl}"
+    );
+}

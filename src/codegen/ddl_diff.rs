@@ -362,11 +362,7 @@ fn diff_table_constraints(
         // under the same name, a UNIQUE re-pointed at other columns). A
         // content mismatch drops the target's version here and re-adds the
         // source's version in the loop below.
-        if let Some(source_constraint) = source
-            .constraints
-            .iter()
-            .find(|source_constraint| source_constraint.name == constraint.name)
-        {
+        if let Some(source_constraint) = find_same_named(&source.constraints, constraint) {
             if constraints_content_match(
                 source_constraint,
                 constraint,
@@ -393,6 +389,14 @@ fn diff_table_constraints(
                 && matches!(constraint.constraint_type, ConstraintType::ForeignKey)
                 && source_constraint.columns != constraint.columns
                 && target
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.name == constraint.name && idx.columns == constraint.columns)
+                // ...unless the source schema itself declares that index —
+                // then it is intentional, and the index diff won't re-add it
+                // (the target already has the name), so dropping it here
+                // would delete an index the source still wants.
+                && !source
                     .indexes
                     .iter()
                     .any(|idx| idx.name == constraint.name && idx.columns == constraint.columns)
@@ -439,11 +443,7 @@ fn diff_table_constraints(
     }
 
     for constraint in &source.constraints {
-        if let Some(target_constraint) = target
-            .constraints
-            .iter()
-            .find(|target_constraint| target_constraint.name == constraint.name)
-        {
+        if let Some(target_constraint) = find_same_named(&target.constraints, constraint) {
             if constraints_content_match(
                 constraint,
                 target_constraint,
@@ -477,6 +477,27 @@ fn diff_table_constraints(
     }
 
     (drops, adds)
+}
+
+/// Find a same-named constraint, preferring one of the same type: MySQL
+/// allows a UNIQUE key and a FOREIGN KEY symbol to share a name, and pairing
+/// the target FK with the source UNIQUE would report perpetual drift even
+/// when an identical source FK exists under that name.
+fn find_same_named<'a>(
+    constraints: &'a [ConstraintInfo],
+    reference: &ConstraintInfo,
+) -> Option<&'a ConstraintInfo> {
+    constraints
+        .iter()
+        .find(|candidate| {
+            candidate.name == reference.name
+                && candidate.constraint_type == reference.constraint_type
+        })
+        .or_else(|| {
+            constraints
+                .iter()
+                .find(|candidate| candidate.name == reference.name)
+        })
 }
 
 /// Content comparison for same-named constraints (#113). Name identity alone
