@@ -661,3 +661,590 @@ fn test_render_changes_round_trip_with_diff_schemas() {
     );
     assert_eq!(direct, via_changes);
 }
+
+// ---- same-name constraint content comparison (#113) ----
+
+#[test]
+fn test_same_name_check_predicate_change_is_drift_same_dialect() {
+    // Editing a CHECK predicate in place (same constraint name) was
+    // invisible to the name-only diff. Same-dialect, it must now emit a
+    // drop of the target's version and a re-add of the source's.
+    let source = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "((price > 10))")
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "((price > 0))")
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"ck_price\""),
+        "changed predicate under the same name must drop the old version: {ddl}"
+    );
+    assert!(
+        ddl.contains("ADD CONSTRAINT \"ck_price\" CHECK"),
+        "changed predicate must re-add the source version: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_check_equivalent_modulo_formatting_is_not_drift() {
+    // PG stores extra wrapping parens; whitespace and identifier quoting
+    // vary. None of that is drift.
+    let source = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "((\"price\" > 0))")
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "( price  >  0 )")
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("ck_price"),
+        "formatting-only differences must not churn the constraint: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_check_cross_dialect_text_is_not_compared() {
+    // Cross-dialect stored predicates never converge textually (each server
+    // canonicalizes its own form), so comparing them would drop+add on
+    // every run. They are deliberately skipped.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("price").udt("int").build())
+        .check("ck_price", "(`price` > 0)")
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "((price >= 1))")
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("ck_price"),
+        "cross-dialect predicate text must not be treated as drift: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_unique_different_columns_is_drift() {
+    let source = schema_pg(vec![table("users")
+        .column(col("a").udt("int4").build())
+        .column(col("b").udt("int4").build())
+        .unique("uq_users", &["a"])
+        .build()]);
+    let target = schema_pg(vec![table("users")
+        .column(col("a").udt("int4").build())
+        .column(col("b").udt("int4").build())
+        .unique("uq_users", &["b"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"uq_users\""),
+        "re-pointed UNIQUE must drop the target version: {ddl}"
+    );
+    assert!(
+        ddl.contains("ADD CONSTRAINT \"uq_users\" UNIQUE (\"a\")"),
+        "re-pointed UNIQUE must add the source version: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_fk_retargeted_is_drift() {
+    let source = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk("fk_orders_user", &["user_id"], "accounts", &["id"])
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk("fk_orders_user", &["user_id"], "users", &["id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"fk_orders_user\""),
+        "retargeted FK must drop the target version: {ddl}"
+    );
+    assert!(
+        ddl.contains("REFERENCES \"accounts\""),
+        "retargeted FK must re-add pointing at the source's table: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_fk_delete_rule_change_same_dialect_is_drift() {
+    let source = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "public",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "CASCADE",
+        )
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "public",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("ON DELETE CASCADE"),
+        "delete-rule change must re-add with the source rule: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_fk_default_rule_spellings_cross_dialect_not_drift() {
+    // MySQL reports the default rule as RESTRICT where PG says NO ACTION;
+    // cross-dialect rule comparison is skipped so this is not churn.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "appdb",
+            "users",
+            &["id"],
+            "RESTRICT",
+            "RESTRICT",
+        )
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "public",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("fk_orders_user"),
+        "default rule spellings across dialects must not be drift: {ddl}"
+    );
+}
+
+#[test]
+fn test_normalize_check_predicate_peels_only_wrapping_parens() {
+    assert_eq!(normalize_check_predicate("((x > 0))"), "x>0");
+    assert_eq!(normalize_check_predicate("(`x` >  0)"), "x>0");
+    // (a) AND (b): the first paren closes mid-expression — not wrapping.
+    assert_eq!(
+        normalize_check_predicate("((a > 0) AND (b > 0))"),
+        "(a>0)and(b>0)"
+    );
+    // MSSQL preserves authored spacing and case outside literals; neither
+    // is drift.
+    assert_eq!(
+        normalize_check_predicate("([x]>=(0))"),
+        normalize_check_predicate("([x] >= (0))")
+    );
+    assert_eq!(
+        normalize_check_predicate("(x > 0 AND y > 0)"),
+        normalize_check_predicate("(x > 0 and y > 0)")
+    );
+    // Literal content is verbatim: case and internal spacing are real drift.
+    assert_ne!(
+        normalize_check_predicate("(status = 'Active')"),
+        normalize_check_predicate("(status = 'active')")
+    );
+    assert_ne!(
+        normalize_check_predicate("(status = 'a b')"),
+        normalize_check_predicate("(status = 'ab')")
+    );
+    // Parens inside literals don't confuse the wrapping-paren peel, and
+    // escaped quotes stay inside the literal.
+    assert_eq!(normalize_check_predicate("(s = ')')"), "s=')'");
+    assert_eq!(normalize_check_predicate("(s = 'it''s')"), "s='it''s'");
+}
+
+#[test]
+fn test_same_name_mysql_fk_column_change_drops_stale_backing_index() {
+    // InnoDB auto-creates an FK backing index named after the constraint
+    // and leaves it behind on DROP FOREIGN KEY. Replacing an FK with
+    // different local columns must also drop that stale index (the index
+    // diff suppresses FK-backing indexes, so nothing else would).
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    let drop_fk = ddl
+        .find("DROP FOREIGN KEY `fk_orders_owner`")
+        .expect("FK must be dropped");
+    let drop_idx = ddl
+        .find("DROP INDEX `fk_orders_owner`")
+        .expect("stale backing index must be dropped");
+    assert!(
+        drop_fk < drop_idx,
+        "index drop must follow the FK drop (InnoDB refuses it earlier): {ddl}"
+    );
+    assert!(
+        ddl.contains("ADD CONSTRAINT `fk_orders_owner` FOREIGN KEY (`acct_id`)"),
+        "source FK must be re-added: {ddl}"
+    );
+}
+
+#[test]
+fn test_lossy_type_fallback_still_converges_to_no_drift() {
+    // MySQL SET has no PG equivalent; it renders as a sized VARCHAR
+    // fallback. Once the target carries that VARCHAR, the canonical types
+    // still differ (Set vs Varchar) but the rendered target types match —
+    // emitting an ALTER here would re-emit forever without converging.
+    let mut flags = col("flags").udt("set").build();
+    flags.data_type = "set('a','b','c')".to_string();
+    let source = schema_mysql(vec![table("prefs").column(flags).build()]);
+    let target = schema_pg(vec![table("prefs")
+        .column(col("flags").udt("varchar").max_length(255).build())
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("ALTER COLUMN \"flags\" TYPE"),
+        "lossy fallback that matches the target must not emit type drift: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_mysql_fk_across_database_names_is_not_drift() {
+    // MySQL's "schema" is the database name, so two databases under diff
+    // always disagree on ref_schema; the emitted FK references the table
+    // unqualified, so that difference could never converge. Identical FKs
+    // apart from the database name must not churn.
+    let source = schema_mysql(vec![table("orders")
+        .schema("sourcedb")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "sourcedb",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .schema("targetdb")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "targetdb",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        !ddl.contains("fk_orders_user"),
+        "database-name-only FK difference must not be drift: {ddl}"
+    );
+}
+
+#[test]
+fn test_mysql_fk_restrict_no_action_spellings_not_drift() {
+    // InnoDB treats RESTRICT and NO ACTION as the same behavior and reports
+    // either spelling; our emitted ADD omits the clause for NO ACTION, so
+    // spelling drift could never converge.
+    let source = schema_mysql(vec![table("orders")
+        .schema("appdb")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "appdb",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .schema("appdb")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "appdb",
+            "users",
+            &["id"],
+            "RESTRICT",
+            "RESTRICT",
+        )
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        !ddl.contains("fk_orders_user"),
+        "RESTRICT vs NO ACTION on MySQL must not be drift: {ddl}"
+    );
+}
+
+#[test]
+fn test_mysql_stale_backing_index_kept_when_shared_by_another_fk() {
+    // A second FK on the same local columns shares the backing index;
+    // dropping it while that FK survives would make the apply fail.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .fk("fk_orders_audit", &["user_id"], "audit_users", &["id"])
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .fk("fk_orders_audit", &["user_id"], "audit_users", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        ddl.contains("DROP FOREIGN KEY `fk_orders_owner`"),
+        "changed FK must still be replaced: {ddl}"
+    );
+    assert!(
+        !ddl.contains("DROP INDEX `fk_orders_owner`"),
+        "shared backing index must not be dropped while another FK uses it: {ddl}"
+    );
+}
+
+#[test]
+fn test_renamed_pk_with_name_reused_by_other_constraint_readds_pk() {
+    // Target PK `old_pk(id)` collides by name with a source UNIQUE
+    // `old_pk(email)` (content mismatch → old_pk is dropped), while the
+    // source's PK lives under a new name `pk(id)`. The renamed-PK shortcut
+    // must not treat the *dropped* old_pk as still covering the table — the
+    // source PK must be re-added or the table ends up with no primary key.
+    let source = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .column(col("email").udt("varchar").max_length(100).build())
+        .pk("pk", &["id"])
+        .unique("old_pk", &["email"])
+        .build()]);
+    let target = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .column(col("email").udt("varchar").max_length(100).build())
+        .pk("old_pk", &["id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"old_pk\""),
+        "name-collided target PK must be dropped: {ddl}"
+    );
+    assert!(
+        ddl.contains("ADD CONSTRAINT \"pk\" PRIMARY KEY (\"id\")"),
+        "the renamed source PK must be re-added since old_pk was dropped: {ddl}"
+    );
+}
+
+#[test]
+fn test_renamed_identical_pk_still_skipped() {
+    // Plain rename with identical columns and no name collision: neither
+    // side emits anything (the pre-#113 behavior is preserved).
+    let source = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .pk("users_pk_new", &["id"])
+        .build()]);
+    let target = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .pk("users_pk_old", &["id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("users_pk"),
+        "renamed-but-identical PK must not churn: {ddl}"
+    );
+}
+
+#[test]
+fn test_noindexes_suppresses_fk_backing_index_drop() {
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let mut options = default_options(Dialect::Mysql);
+    options.noindexes = true;
+    let ddl = diff_schemas(&source, &target, &options);
+    assert!(
+        ddl.contains("DROP FOREIGN KEY `fk_orders_owner`"),
+        "FK replacement itself is constraint work and stays: {ddl}"
+    );
+    assert!(
+        !ddl.contains("DROP INDEX"),
+        "noindexes must suppress the backing-index drop: {ddl}"
+    );
+}
+
+#[test]
+fn test_pk_add_suppressed_when_same_columns_pk_survives_name_collision() {
+    // Mirror of the dropped-PK case: target has old_pk PRIMARY KEY(id) and
+    // a UNIQUE named pk; source has just pk PRIMARY KEY(id). The UNIQUE pk
+    // is dropped (type mismatch), but old_pk survives and covers (id) — so
+    // adding the source's pk would fail with two primary keys.
+    let source = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .column(col("email").udt("varchar").max_length(100).build())
+        .pk("pk", &["id"])
+        .build()]);
+    let target = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .column(col("email").udt("varchar").max_length(100).build())
+        .pk("old_pk", &["id"])
+        .unique("pk", &["email"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"pk\""),
+        "the name-collided UNIQUE must be dropped: {ddl}"
+    );
+    assert!(
+        !ddl.contains("ADD CONSTRAINT \"pk\" PRIMARY KEY"),
+        "no PK may be added while the surviving old_pk covers (id): {ddl}"
+    );
+}
+
+#[test]
+fn test_check_normalizer_preserves_quoted_identifier_case() {
+    // PG only quotes identifiers that need quoting, so "UserID" and userid
+    // are different columns — stripping case here would hide real drift.
+    assert_ne!(
+        normalize_check_predicate("(\"UserID\" > 0)"),
+        normalize_check_predicate("(userid > 0)")
+    );
+    // The same quoted identifier on both sides still matches.
+    assert_eq!(
+        normalize_check_predicate("((\"UserID\" > 0))"),
+        normalize_check_predicate("( \"UserID\" >  0 )")
+    );
+}
+
+#[test]
+fn test_mysql_stale_backing_index_drop_tagged_as_drop_index() {
+    // The injected DROP INDEX must carry ChangeKind::DropIndex, not ride
+    // under DropConstraint, so manifests and down-migration classification
+    // see it for what it is.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Mysql));
+    let index_drop = changes
+        .iter()
+        .find(|change| change.sql.contains("DROP INDEX `fk_orders_owner`"))
+        .expect("stale backing index drop present");
+    assert_eq!(index_drop.kind, crate::output::ChangeKind::DropIndex);
+}
+
+#[test]
+fn test_mysql_shared_name_unique_and_fk_prefers_same_type_match() {
+    // MySQL allows a UNIQUE key and an FK symbol to share a name. Pairing
+    // the FK against the UNIQUE for content comparison would report drift
+    // forever even though an identical FK exists under that name.
+    let make = |db: &str| {
+        table("orders")
+            .schema(db)
+            .column(col("user_id").udt("int").build())
+            .unique("shared_name", &["user_id"])
+            .fk_full(
+                "shared_name",
+                &["user_id"],
+                db,
+                "users",
+                &["id"],
+                "NO ACTION",
+                "NO ACTION",
+            )
+            .build()
+    };
+    let source = schema_mysql(vec![make("appdb")]);
+    let target = schema_mysql(vec![make("appdb")]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        !ddl.contains("shared_name"),
+        "identical schemas must not churn on shared constraint names: {ddl}"
+    );
+}
+
+#[test]
+fn test_source_declared_index_with_fk_name_is_not_dropped() {
+    // The source intentionally declares an index matching the old FK's
+    // name/columns; the index diff won't re-add it (the target already has
+    // the name), so the stale-index heuristic must leave it alone.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    assert!(
+        ddl.contains("DROP FOREIGN KEY `fk_orders_owner`"),
+        "the FK change itself is still drift: {ddl}"
+    );
+    assert!(
+        !ddl.contains("DROP INDEX `fk_orders_owner`"),
+        "an index the source still declares must not be dropped: {ddl}"
+    );
+}

@@ -118,7 +118,13 @@ pub fn compute_changes(
             let (constraint_drops, constraint_adds) = if options.noconstraints {
                 (Vec::new(), Vec::new())
             } else {
-                diff_table_constraints(table, target_table, source_dialect, target_dialect)
+                diff_table_constraints(
+                    table,
+                    target_table,
+                    source_dialect,
+                    target_dialect,
+                    options.noindexes,
+                )
             };
             let (index_drops, index_adds) = if options.noindexes {
                 (Vec::new(), Vec::new())
@@ -130,11 +136,9 @@ pub fn compute_changes(
             // than re-parsing rendered SQL. Order is unchanged (see the
             // ordering note above); only the kind tag is added.
             let mut table_sql: Vec<(ChangeKind, String)> = Vec::new();
-            table_sql.extend(
-                constraint_drops
-                    .into_iter()
-                    .map(|sql| (ChangeKind::DropConstraint, sql)),
-            );
+            // constraint_drops arrive pre-tagged: mostly DropConstraint, but
+            // the MySQL stale-FK-backing-index drop is a DropIndex (#113).
+            table_sql.extend(constraint_drops);
             table_sql.extend(
                 index_drops
                     .into_iter()
@@ -337,21 +341,88 @@ fn diff_table_constraints(
     target: &TableInfo,
     source_dialect: Dialect,
     target_dialect: Dialect,
-) -> (Vec<String>, Vec<String>) {
+    noindexes: bool,
+) -> (Vec<(ChangeKind, String)>, Vec<String>) {
     if target_dialect == Dialect::Sqlite {
         return (Vec::new(), Vec::new());
     }
 
-    let target_names: HashSet<&str> = target.constraints.iter().map(|c| c.name.as_str()).collect();
     let mut drops = Vec::new();
     let mut adds = Vec::new();
+    // Names of target constraints scheduled for DROP below; the add loop's
+    // renamed-PK shortcut must not treat a dropped PK as still covering the
+    // table (#113 review: a source constraint reusing the old PK's name for
+    // a different constraint type drops that PK — the renamed source PK
+    // must then be added, or the table ends up with no primary key).
+    let mut dropped_names: HashSet<&str> = HashSet::new();
 
     for constraint in &target.constraints {
-        if source
-            .constraints
-            .iter()
-            .any(|source_constraint| source_constraint.name == constraint.name)
-        {
+        // Same-named constraints are compared by content (#113); a name
+        // match alone used to hide real drift (a CHECK predicate edited
+        // under the same name, a UNIQUE re-pointed at other columns). A
+        // content mismatch drops the target's version here and re-adds the
+        // source's version in the loop below.
+        if let Some(source_constraint) = find_same_named(&source.constraints, constraint) {
+            if constraints_content_match(
+                source_constraint,
+                constraint,
+                source_dialect,
+                target_dialect,
+            ) {
+                continue;
+            }
+            dropped_names.insert(constraint.name.as_str());
+            drops.push((
+                ChangeKind::DropConstraint,
+                render_dropped_constraint(source, constraint, source_dialect, target_dialect),
+            ));
+            // InnoDB auto-creates a backing index (named after the
+            // constraint) for each FK and leaves it behind on DROP FOREIGN
+            // KEY. When the FK is being replaced with different local
+            // columns, that stale index no longer serves the new FK (which
+            // auto-creates its own) and is invisible to the index diff,
+            // which suppresses FK-backing indexes by design. Drop it
+            // explicitly, right after the FK drop — InnoDB refuses to drop
+            // it while the FK still exists.
+            if !noindexes
+                && target_dialect == Dialect::Mysql
+                && matches!(constraint.constraint_type, ConstraintType::ForeignKey)
+                && source_constraint.columns != constraint.columns
+                && target
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.name == constraint.name && idx.columns == constraint.columns)
+                // ...unless the source schema itself declares that index —
+                // then it is intentional, and the index diff won't re-add it
+                // (the target already has the name), so dropping it here
+                // would delete an index the source still wants.
+                && !source
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.name == constraint.name && idx.columns == constraint.columns)
+                // InnoDB shares one backing index between FKs on the same
+                // local columns; if another target FK still uses them, the
+                // DROP INDEX would be rejected while that FK exists. Leave
+                // the index alone then — a possibly-stale index is the
+                // lesser evil against a failing apply.
+                && !target.constraints.iter().any(|other| {
+                    other.name != constraint.name
+                        && matches!(other.constraint_type, ConstraintType::ForeignKey)
+                        && other.columns == constraint.columns
+                })
+            {
+                let tname = qualified_table_name(
+                    &source.schema,
+                    &source.name,
+                    source_dialect,
+                    target_dialect,
+                );
+                let iname = quote_identifier(&constraint.name, target_dialect);
+                drops.push((
+                    ChangeKind::DropIndex,
+                    format!("ALTER TABLE {tname} DROP INDEX {iname};"),
+                ));
+            }
             continue;
         }
         if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
@@ -364,24 +435,36 @@ fn diff_table_constraints(
         {
             continue;
         }
-        drops.push(render_dropped_constraint(
-            source,
-            constraint,
-            source_dialect,
-            target_dialect,
+        dropped_names.insert(constraint.name.as_str());
+        drops.push((
+            ChangeKind::DropConstraint,
+            render_dropped_constraint(source, constraint, source_dialect, target_dialect),
         ));
     }
 
     for constraint in &source.constraints {
-        if target_names.contains(constraint.name.as_str()) {
-            continue;
+        if let Some(target_constraint) = find_same_named(&target.constraints, constraint) {
+            if constraints_content_match(
+                constraint,
+                target_constraint,
+                source_dialect,
+                target_dialect,
+            ) {
+                continue;
+            }
         }
+        // Renamed-but-identical PK: if a same-columns target PK survives the
+        // drop pass (it was neither name-collided nor content-mismatched),
+        // adding this one would both churn and fail with two primary keys.
+        // This applies whether the source PK's name is free on the target or
+        // currently taken by a different (dropped) constraint.
         if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
             && target.constraints.iter().any(|target_constraint| {
                 matches!(
                     target_constraint.constraint_type,
                     ConstraintType::PrimaryKey
                 ) && target_constraint.columns == constraint.columns
+                    && !dropped_names.contains(target_constraint.name.as_str())
             })
         {
             continue;
@@ -394,6 +477,214 @@ fn diff_table_constraints(
     }
 
     (drops, adds)
+}
+
+/// Find a same-named constraint, preferring one of the same type: MySQL
+/// allows a UNIQUE key and a FOREIGN KEY symbol to share a name, and pairing
+/// the target FK with the source UNIQUE would report perpetual drift even
+/// when an identical source FK exists under that name.
+fn find_same_named<'a>(
+    constraints: &'a [ConstraintInfo],
+    reference: &ConstraintInfo,
+) -> Option<&'a ConstraintInfo> {
+    constraints
+        .iter()
+        .find(|candidate| {
+            candidate.name == reference.name
+                && candidate.constraint_type == reference.constraint_type
+        })
+        .or_else(|| {
+            constraints
+                .iter()
+                .find(|candidate| candidate.name == reference.name)
+        })
+}
+
+/// Content comparison for same-named constraints (#113). Name identity alone
+/// hid real drift: a CHECK predicate edited in place, a UNIQUE re-pointed at
+/// different columns, or a foreign key retargeted at another table were all
+/// invisible to the diff.
+///
+/// Structured fields (constraint type, columns, FK table/columns) compare
+/// across any dialect pair. Text-derived fields compare **same-dialect
+/// only**:
+///
+/// - CHECK predicates: servers store parser-canonicalized text (PG deparses
+///   `x IN (1,2)` as `x = ANY (ARRAY[1, 2])`), so two dialects' stored forms
+///   of the same predicate never converge textually, and comparing them
+///   would emit a drop+add on every run. Same-dialect comparison is
+///   convergent because a server's canonicalization of its own stored text
+///   is a fixed point.
+/// - FK ref_schema and update/delete rules: dialects report different
+///   default schemas (`public` vs `dbo`) and different spellings of the
+///   default rule (`NO ACTION` vs `RESTRICT`), which are not drift.
+fn constraints_content_match(
+    source: &ConstraintInfo,
+    target: &ConstraintInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> bool {
+    if source.constraint_type != target.constraint_type {
+        return false;
+    }
+    if source.columns != target.columns {
+        return false;
+    }
+    match (&source.foreign_key, &target.foreign_key) {
+        (Some(source_fk), Some(target_fk)) => {
+            if source_fk.ref_table != target_fk.ref_table
+                || source_fk.ref_columns != target_fk.ref_columns
+            {
+                return false;
+            }
+            if source_dialect == target_dialect
+                && (normalize_fk_rule(&source_fk.update_rule, source_dialect)
+                    != normalize_fk_rule(&target_fk.update_rule, source_dialect)
+                    || normalize_fk_rule(&source_fk.delete_rule, source_dialect)
+                        != normalize_fk_rule(&target_fk.delete_rule, source_dialect))
+            {
+                return false;
+            }
+            // ref_schema compares same-dialect only, and never on MySQL:
+            // there the "schema" is the database name (two databases being
+            // diffed always differ in it), and the emitted ADD CONSTRAINT
+            // references the table unqualified — a ref_schema difference
+            // could never be materialized by our own DDL, so comparing it
+            // would drop+add on every run without converging.
+            if source_dialect == target_dialect
+                && source_dialect != Dialect::Mysql
+                && source_fk.ref_schema != target_fk.ref_schema
+            {
+                return false;
+            }
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    if source_dialect == target_dialect {
+        // A side with no stored predicate (introspection gap on older
+        // servers) is not assertable drift; compare only when both exist.
+        if let (Some(source_expr), Some(target_expr)) =
+            (&source.check_expression, &target.check_expression)
+        {
+            if normalize_check_predicate(source_expr) != normalize_check_predicate(target_expr) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Normalize an FK referential action for same-dialect comparison. On
+/// MySQL/InnoDB, `RESTRICT` and `NO ACTION` are the same behavior and the
+/// server reports either spelling depending on how the FK was authored;
+/// our emitted ADD CONSTRAINT omits the clause for `NO ACTION`, so treating
+/// the spellings as drift would drop+add on every run without converging.
+fn normalize_fk_rule(rule: &str, dialect: Dialect) -> &str {
+    if dialect == Dialect::Mysql && rule.eq_ignore_ascii_case("RESTRICT") {
+        "NO ACTION"
+    } else {
+        rule
+    }
+}
+
+/// Normalize a stored CHECK predicate for same-dialect comparison.
+///
+/// Outside string literals and quoted identifiers: all whitespace is removed
+/// (engines that preserve authored text, like MSSQL, store `[x]>=(0)` or
+/// `[x] >= (0)` depending on how the constraint was written) and characters
+/// are lowercased (unquoted identifiers and keywords are case-insensitive on
+/// every supported dialect's stored form). String literals are kept verbatim
+/// — `'Active'` vs `'active'` and `'a b'` vs `'ab'` are real drift. Quoted
+/// identifiers (`"..."`, `` `...` ``, `[...]`) lose their delimiters but keep
+/// their content case-sensitively: PG only quotes identifiers that need it,
+/// so `"UserID"` and `userid` are genuinely different columns. Finally,
+/// fully-wrapping outer parentheses are peeled (PG stores `((x > 0))`);
+/// inner parentheses are semantic and kept.
+fn normalize_check_predicate(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.chars().peekable();
+    let mut in_literal = false;
+    // Some(closer) while inside a quoted identifier.
+    let mut ident_closer: Option<char> = None;
+    while let Some(c) = chars.next() {
+        if in_literal {
+            out.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    // Escaped quote stays inside the literal.
+                    out.push(chars.next().expect("peeked"));
+                } else {
+                    in_literal = false;
+                }
+            }
+            continue;
+        }
+        if let Some(closer) = ident_closer {
+            if c == closer {
+                if chars.peek() == Some(&closer) {
+                    // Doubled closer is an escaped delimiter in the name.
+                    out.push(chars.next().expect("peeked"));
+                } else {
+                    ident_closer = None;
+                }
+            } else {
+                // Identifier content is case-significant; copy verbatim.
+                out.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                out.push(c);
+                in_literal = true;
+            }
+            '"' => ident_closer = Some('"'),
+            '`' => ident_closer = Some('`'),
+            '[' => ident_closer = Some(']'),
+            c if c.is_whitespace() => {}
+            c => out.extend(c.to_lowercase()),
+        }
+    }
+    while let Some(inner) = peel_wrapping_parens(&out) {
+        out = inner.to_string();
+    }
+    out
+}
+
+/// If the expression's first `(` closes exactly at its last character, the
+/// parens wrap the whole expression; return the inside. `(a)and(b)` is not
+/// wrapped — its first paren closes mid-expression. Parentheses inside
+/// string literals are skipped.
+fn peel_wrapping_parens(expr: &str) -> Option<&str> {
+    if !expr.starts_with('(') || !expr.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_literal = false;
+    for (i, c) in expr.char_indices() {
+        if in_literal {
+            // Toggle semantics: an escaped `''` reads as exit-then-re-enter,
+            // which is equivalent for paren counting (nothing sits between
+            // the adjacent quotes).
+            if c == '\'' {
+                in_literal = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_literal = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (i == expr.len() - 1).then(|| &expr[1..expr.len() - 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn render_dropped_constraint(
@@ -601,10 +892,22 @@ fn diff_column(
     let tname = qualified_table_name(table_schema, table_name, source_dialect, target_dialect);
     let cname = quote_identifier(&source.name, target_dialect);
 
-    let source_type = ddl_typemap::map_ddl_type(source, source_dialect, target_dialect);
-    let target_type = ddl_typemap::map_ddl_type(target, target_dialect, target_dialect);
-
-    let type_changed = source_type.sql_type != target_type.sql_type;
+    // Type drift is decided canonically first (#113): each side is parsed
+    // once into CanonicalType, which has structural equality. Equal canonical
+    // types are never drift — from_canonical is a pure function, so they
+    // always render identically. When the canonical types differ, drift is
+    // confirmed only if the difference survives rendering to the target
+    // dialect: from_canonical is deliberately lossy (e.g. MySQL SET falls
+    // back to VARCHAR on other targets), and emitting an ALTER whose rendered
+    // type already matches the target's current type would re-emit on every
+    // run without ever converging.
+    let source_canonical = ddl_typemap::to_canonical(source, source_dialect);
+    let target_canonical = ddl_typemap::to_canonical(target, target_dialect);
+    let source_type = ddl_typemap::from_canonical(&source_canonical, target_dialect);
+    let type_changed = source_canonical != target_canonical && {
+        let target_type = ddl_typemap::from_canonical(&target_canonical, target_dialect);
+        source_type.sql_type != target_type.sql_type
+    };
     let source_auto = is_auto_increment_column(source, source_dialect);
     let target_auto = is_auto_increment_column(target, target_dialect);
     let nullable_changed = if source_dialect != target_dialect && source_auto && target_auto {
@@ -614,8 +917,7 @@ fn diff_column(
     };
 
     // Compare defaults with boolean-aware normalization
-    let canonical = ddl_typemap::to_canonical(source, source_dialect);
-    let is_boolean = matches!(canonical, ddl_typemap::CanonicalType::Boolean);
+    let is_boolean = matches!(source_canonical, ddl_typemap::CanonicalType::Boolean);
     let source_default = source
         .column_default
         .as_deref()
