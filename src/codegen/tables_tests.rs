@@ -15,8 +15,7 @@ fn make_simple_schema() -> IntrospectedSchema {
 #[test]
 fn test_tables_generator_basic() {
     let schema = make_simple_schema();
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("t_users = Table("));
     assert!(output.contains("'users', metadata,"));
     assert!(output.contains("Column('id', Integer, primary_key=True)"));
@@ -28,8 +27,7 @@ fn test_tables_generator_basic() {
 #[test]
 fn test_tables_generator_snapshot() {
     let schema = make_simple_schema();
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     insta::assert_yaml_snapshot!(output);
 }
 
@@ -44,8 +42,7 @@ fn make_no_pk_schema() -> IntrospectedSchema {
 #[test]
 fn test_tables_generator_no_pk() {
     let schema = make_no_pk_schema();
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Should generate a Table() without any primary_key=True
     assert!(output.contains("t_audit_log = Table("));
@@ -59,8 +56,7 @@ fn test_tables_generator_no_pk() {
 #[test]
 fn test_tables_generator_no_pk_snapshot() {
     let schema = make_no_pk_schema();
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     insta::assert_yaml_snapshot!(output);
 }
 
@@ -78,8 +74,7 @@ fn test_tables_indexes() {
         .index("ix_text_number", &["text", "number"], true)
         .index("ix_text", &["text"], true)
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('id', Integer)"));
     assert!(output.contains("Column('number', Integer)"));
     assert!(output.contains("Column('text', String)"));
@@ -97,8 +92,7 @@ fn test_tables_unique_constraint() {
         .column(col("number").nullable().build())
         .unique("uq_id_number", &["id", "number"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('id', Integer)"));
     assert!(output.contains("Column('number', Integer)"));
     assert!(output.contains("UniqueConstraint('id', 'number', name='uq_id_number')"));
@@ -112,8 +106,7 @@ fn test_tables_table_comment() {
         .pk("simple_pkey", &["id"])
         .comment("this is a 'comment'")
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('id', Integer, primary_key=True)"));
     assert!(output.contains("comment=\"this is a 'comment'\""));
 }
@@ -126,8 +119,7 @@ fn test_tables_table_name_identifiers() {
         .column(col("id").build())
         .pk("simple_items_table_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Variable name should sanitize non-identifier chars
     assert!(output.contains("t_simple_items_table = Table("));
     // But the table name string should preserve original
@@ -146,8 +138,7 @@ fn test_tables_option_noindexes() {
         noindexes: true,
         ..GeneratorOptions::default()
     };
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     assert!(output.contains("Column('number', Integer)"));
     assert!(output.contains("UniqueConstraint('number', name='uq_number')"));
     // Index should be suppressed
@@ -166,8 +157,7 @@ fn test_tables_option_noconstraints() {
         noconstraints: true,
         ..GeneratorOptions::default()
     };
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     assert!(output.contains("Column('number', Integer)"));
     // Constraint should be suppressed
     assert!(!output.contains("UniqueConstraint("));
@@ -187,8 +177,7 @@ fn test_tables_option_nocomments() {
         nocomments: true,
         ..GeneratorOptions::default()
     };
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     assert!(output.contains("Column('id', Integer, primary_key=True)"));
     // Comments should be suppressed
     assert!(!output.contains("comment="));
@@ -201,8 +190,7 @@ fn test_tables_schema() {
         .schema("testschema")
         .column(col("name").udt("varchar").nullable().build())
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("t_simple_items = Table("));
     assert!(output.contains("Column('name', String)"));
     assert!(output.contains("schema='testschema'"));
@@ -215,8 +203,7 @@ fn test_tables_pk_default() {
         .column(col("id").default_val("uuid_generate_v4()").build())
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains(
         "Column('id', Integer, primary_key=True, server_default=text('uuid_generate_v4()'))"
     ));
@@ -241,8 +228,7 @@ fn test_tables_identity_column() {
         )
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Identity("));
     assert!(output.contains("start=1"));
     assert!(output.contains("increment=2"));
@@ -262,8 +248,7 @@ fn test_tables_multiline_column_comment() {
                 .build(),
         )
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("comment='This\\nis a multi-line\\ncomment'"));
 }
 
@@ -274,8 +259,7 @@ fn test_tables_multiline_table_comment() {
         .column(col("id").nullable().build())
         .comment("This\nis a multi-line\ncomment")
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("comment='This\\nis a multi-line\\ncomment'"));
 }
 
@@ -290,8 +274,7 @@ fn test_tables_server_default_multiline() {
         )
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("server_default=text('/*Comment*/\\n/*Next line*/\\nsomething()')"));
 }
 
@@ -307,8 +290,7 @@ fn test_tables_server_default_colon() {
                 .build(),
         )
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("server_default=text(\"':001'\")"));
 }
 
@@ -318,8 +300,7 @@ fn test_tables_null_type() {
     let schema = schema_pg(vec![table("simple_items")
         .column(col("problem").udt("").nullable().build())
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('problem', NullType)"));
     assert!(output.contains("from sqlalchemy.sql.sqltypes import NullType"));
 }
@@ -339,8 +320,7 @@ fn test_tables_foreign_key_options() {
             "CASCADE",
         )
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("ondelete='CASCADE'"));
     assert!(output.contains("onupdate='CASCADE'"));
 }
@@ -367,8 +347,7 @@ fn test_tables_identity_column_decimal_values() {
         )
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Identity(start=1, increment=2)"));
     assert!(output.contains("primary_key=True"));
 }
@@ -402,8 +381,7 @@ fn test_tables_enum_shared_values() {
             ],
         }],
     );
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Enum class generated
     assert!(output.contains("class StatusEnum(str, enum.Enum):"));
     assert!(output.contains("ACTIVE = 'active'"));
@@ -427,8 +405,7 @@ fn test_tables_synthetic_enum_generation() {
             "simple_items.status IN ('active', 'inactive', 'pending')",
         )
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
 
     // Synthetic enum class generated
     assert!(output.contains("class SimpleItemsStatus(str, enum.Enum):"));
@@ -459,8 +436,7 @@ fn test_tables_enum_named_with_schema() {
             values: vec!["active".to_string(), "inactive".to_string()],
         }],
     );
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Enum() includes schema kwarg
     assert!(output.contains("schema='someschema'"));
     assert!(output.contains("name='status_enum'"));
@@ -480,8 +456,7 @@ fn test_tables_postgresql_sequence_standard_name() {
         )
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Standard sequence stripped — just primary_key=True, no server_default
     assert!(output.contains("Column('id', Integer, primary_key=True)"));
     assert!(!output.contains("Sequence"));
@@ -500,8 +475,7 @@ fn test_tables_postgresql_sequence_nonstandard_name() {
         )
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Sequence('test_seq')"));
     assert!(output.contains("primary_key=True"));
     assert!(output.contains("from sqlalchemy import"));
@@ -516,8 +490,7 @@ fn test_tables_computed_column() {
         .column(col("computed").nullable().default_val("1 + 2").build())
         .pk("computed_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // For now, computed columns render as server_default (full Computed() support is future work)
     assert!(output.contains("Column('id', Integer, primary_key=True)"));
     assert!(output.contains("server_default=text('1 + 2')"));
@@ -533,8 +506,7 @@ fn test_tables_column_adaptation() {
         .column(col("id").udt("int8").nullable().build())
         .column(col("length").udt("float8").nullable().build())
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('id', BigInteger)"));
     assert!(output.contains("Column('length', Double)"));
     assert!(output.contains("BigInteger"));
@@ -548,8 +520,7 @@ fn test_tables_jsonb_default() {
     let schema = schema_pg(vec![table("simple_items")
         .column(col("jsonb").udt("jsonb").nullable().build())
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('jsonb', JSONB)"));
     assert!(output.contains("from sqlalchemy.dialects.postgresql import JSONB"));
 }
@@ -561,8 +532,7 @@ fn test_tables_json_default() {
     let schema = schema_pg(vec![table("simple_items")
         .column(col("json").udt("json").nullable().build())
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('json', JSON)"));
     assert!(output.contains("from sqlalchemy.dialects.postgresql import JSON"));
 }
@@ -574,8 +544,7 @@ fn test_tables_arrays() {
     let schema = schema_pg(vec![table("simple_items")
         .column(col("int_array").udt("_int4").nullable().build())
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('int_array', ARRAY(Integer))"));
     assert!(output.contains("from sqlalchemy import ARRAY"));
 }
@@ -594,8 +563,7 @@ fn test_tables_check_constraint_preserved() {
         )
         .check("", "simple_items.status IN ('A', 'B', 'C')")
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Check constraint is preserved
     assert!(output.contains("CheckConstraint("));
     // Synthetic enum is also generated
@@ -615,8 +583,7 @@ fn test_tables_synthetic_enum_nosyntheticenums() {
         nosyntheticenums: true,
         ..GeneratorOptions::default()
     };
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // No enum class generated
     assert!(!output.contains("class SimpleItemsStatus"));
     assert!(!output.contains("import enum"));
@@ -643,8 +610,7 @@ fn test_tables_synthetic_enum_shared_values() {
             .check("", "table2.status IN ('active', 'inactive')")
             .build(),
     ]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Each table gets its own enum class
     assert!(output.contains("class Table1Status(str, enum.Enum):"));
     assert!(output.contains("class Table2Status(str, enum.Enum):"));
@@ -661,8 +627,7 @@ fn test_tables_boolean_detection() {
         .check("", "simple_items.bool1 IN (0, 1)")
         .check("", "simple_items.bool2 IN (0, 1)")
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('bool1', Boolean)"));
     assert!(output.contains("Column('bool2', Boolean)"));
     // Check constraints suppressed (boolean detection consumed them)
@@ -678,8 +643,7 @@ fn test_tables_schema_boolean() {
         .column(col("bool1").nullable().build())
         .check("", "testschema.simple_items.bool1 IN (0, 1)")
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('bool1', Boolean)"));
     assert!(output.contains("schema='testschema'"));
 }
@@ -703,8 +667,7 @@ fn test_tables_domain_text() {
             check_expression: Some("VALUE ~ '^\\d{5}$'".to_string()),
         }],
     };
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("DOMAIN("));
     assert!(output.contains("'us_postal_code'"));
     assert!(output.contains("Text()"));
@@ -731,8 +694,7 @@ fn test_tables_domain_int() {
             check_expression: Some("VALUE > 0".to_string()),
         }],
     };
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("DOMAIN("));
     assert!(output.contains("'positive_int'"));
     assert!(output.contains("Integer()"));
@@ -753,8 +715,7 @@ fn test_tables_postgresql_sequence_with_schema() {
         )
         .pk("simple_items_pkey", &["id"])
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Schema-qualified sequence: split into name + schema kwarg
     assert!(output.contains("'test_seq'"));
     assert!(output.contains("schema='testschema'"));
@@ -783,8 +744,7 @@ fn test_tables_keep_dialect_types_pg() {
         keep_dialect_types: true,
         ..GeneratorOptions::default()
     };
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // PG dialect types preserved
     assert!(output.contains("BIGINT"));
     assert!(output.contains("VARCHAR(100)"));
@@ -800,8 +760,7 @@ fn test_tables_no_keep_dialect_types_pg() {
         .column(col("id").udt("int8").nullable().build())
         .column(col("score").udt("float8").nullable().build())
         .build()]);
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Generic types
     assert!(output.contains("BigInteger"));
     assert!(output.contains("Double"));
@@ -822,8 +781,7 @@ fn test_tables_keep_dialect_types_mssql() {
         keep_dialect_types: true,
         ..GeneratorOptions::default()
     };
-    let gen = TablesGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // MSSQL dialect types preserved
     assert!(output.contains("INTEGER"));
     assert!(output.contains("SMALLINT"));

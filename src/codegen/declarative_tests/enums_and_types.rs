@@ -15,8 +15,7 @@ fn test_declarative_synthetic_enum() {
             "simple_items.status IN ('active', 'inactive', 'pending')",
         )
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Synthetic enum class
     assert!(output.contains("class SimpleItemsStatus(str, enum.Enum):"));
     assert!(output.contains("ACTIVE = 'active'"));
@@ -58,8 +57,7 @@ fn test_declarative_onetomany_multiref_composite() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Two ForeignKeyConstraints in __table_args__
     assert!(output.contains("ForeignKeyConstraint(['container1_id1', 'container1_id2']"));
     assert!(output.contains("ForeignKeyConstraint(['container2_id1', 'container2_id2']"));
@@ -106,8 +104,7 @@ fn test_declarative_manytomany_composite() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Composite M2M: assoc is NOT an association table (requires single-col FKs)
     // So it gets Table() fallback (no PK)
     assert!(output.contains("t_assoc = Table("));
@@ -132,8 +129,7 @@ fn test_declarative_onetomany_conflicting_relationship() {
             .fk("si_fkey", &["container_id"], "simple_containers", &["id"])
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // "container" column exists, so relationship "container" becomes "container_"
     assert!(output.contains("container: Mapped[Optional[str]] = mapped_column(String)"));
     assert!(output.contains("container_: Mapped[Optional['SimpleContainers']] = relationship("));
@@ -167,8 +163,7 @@ fn test_declarative_onetomany_multiref_with_nofknames() {
         nofknames: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // ForeignKeyConstraint without name= kwarg
     assert!(output.contains("ForeignKeyConstraint("));
     assert!(!output.contains("name='si_c1_fkey'"));
@@ -187,8 +182,7 @@ fn test_declarative_synthetic_enum_nosyntheticenums() {
         nosyntheticenums: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // No enum class generated
     assert!(!output.contains("class SimpleItemsStatus"));
     assert!(!output.contains("import enum"));
@@ -229,8 +223,7 @@ fn test_declarative_onetomany_multiref_no_id_suffix() {
         noidsuffix: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // With noidsuffix, relationship names keep the full FK column name.
     // Since they collide with column names, they get underscore suffix.
     assert!(output.contains("parent_container_id_: Mapped[Optional['SimpleContainers']]"));
@@ -265,8 +258,7 @@ fn test_declarative_manytomany_multi() {
             .fk("a2_right_fkey", &["right_id"], "right_table", &["id"])
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Both association tables rendered as Table()
     assert!(output.contains("t_assoc1 = Table("));
     assert!(output.contains("t_assoc2 = Table("));
@@ -296,8 +288,7 @@ fn test_declarative_domain_json() {
             check_expression: None,
         }],
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Domain columns in declarative mode: domain udt_name not resolved to base type
     // (full DOMAIN() support in declarative is future work — currently falls through
     // to the type mapper which uses the udt_name as-is)
@@ -315,8 +306,7 @@ fn test_declarative_named_constraints() {
         .check("checktest", "id > 0")
         .unique("uniquetest", &["text"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Check and Unique constraints in __table_args__
     assert!(output.contains("CheckConstraint('id > 0', name='checktest')"));
     assert!(output.contains("UniqueConstraint('text', name='uniquetest')"));
@@ -347,8 +337,7 @@ fn test_declarative_manytomany_multi_with_nofknames() {
         nofknames: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // M2M still works with nofknames
     assert!(output.contains("secondary='assoc'"));
 }
@@ -373,8 +362,7 @@ fn test_declarative_named_foreign_key_constraints() {
             )
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // FK rendered inline with relationship
     assert!(output.contains("ForeignKey('simple_containers.id')"));
     assert!(output.contains("relationship('SimpleContainers'"));
@@ -404,8 +392,7 @@ fn test_declarative_named_foreign_key_constraints_with_noidsuffix() {
         noidsuffix: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // With noidsuffix, relationship name keeps _id suffix
     assert!(output.contains("relationship('SimpleContainers'"));
 }
@@ -424,8 +411,7 @@ fn test_declarative_index_with_kwargs() {
             &[("postgresql_using", "gist"), ("mysql_length", "10")],
         )
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Index('idx_name', 'name'"));
     assert!(output.contains("mysql_length='10'"));
     assert!(output.contains("postgresql_using='gist'"));
@@ -440,8 +426,7 @@ fn test_declarative_index_with_empty_kwargs() {
         .pk("si_pkey", &["id"])
         .index_with_kwargs("idx_name", &["name"], false, &[("postgresql_using", "")])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Index('idx_name', 'name')"));
     // Empty kwargs should be skipped
     assert!(!output.contains("postgresql_using"));
@@ -463,8 +448,7 @@ fn test_declarative_manytomany_selfref() {
             .fk("ci_child_fkey", &["child_id"], "simple_items", &["id"])
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Self-referential M2M: association table rendered
     assert!(output.contains("t_child_items = Table("));
     // Relationships with secondary on the parent table
@@ -479,8 +463,7 @@ fn test_declarative_include_dialect_options_not_enabled() {
         .column(col("id").build())
         .pk("si_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // No dialect options in output
     assert!(!output.contains("postgresql_"));
 }
@@ -499,8 +482,7 @@ fn test_declarative_fancy_coltypes() {
                 .build(),
         )
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Boolean"));
     assert!(output.contains("Numeric"));
 }
@@ -523,8 +505,7 @@ fn test_declarative_enum_unnamed() {
             values: vec!["active".to_string(), "inactive".to_string()],
         }],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Enum class generated
     assert!(output.contains("class Status(str, enum.Enum):"));
     assert!(output.contains("ACTIVE = 'active'"));
@@ -555,8 +536,7 @@ fn test_declarative_enum_nonativeenums() {
         nonativeenums: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // TODO: When nonativeenums is wired, assert enum class is NOT generated
     // and column uses String type instead of Enum().
     // For now, verify the option is accepted and output is valid.
@@ -584,8 +564,7 @@ fn test_declarative_array_enum_named() {
             ],
         }],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Array column rendered (array-of-enum is complex; for now just test it doesn't panic)
     assert!(output.contains("roles:"));
 }
@@ -611,8 +590,7 @@ fn test_declarative_domain_non_default_json() {
             check_expression: None,
         }],
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Domain in declarative: currently uses udt_name as-is
     assert!(output.contains("data:"));
 }
@@ -624,8 +602,7 @@ fn test_declarative_jsonb_with_params() {
     let schema = schema_pg(vec![table("simple_items")
         .column(col("data").udt("jsonb").nullable().build())
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Basic JSONB renders correctly
     assert!(output.contains("JSONB"));
 }
@@ -654,8 +631,7 @@ fn test_declarative_enum_unnamed_reuse() {
             },
         ],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Both enum classes generated (even with same values, different names)
     assert!(output.contains("class StatusA(str, enum.Enum):"));
     assert!(output.contains("class StatusB(str, enum.Enum):"));
@@ -691,8 +667,7 @@ fn test_declarative_enum_unnamed_collision() {
             },
         ],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Different enum classes with different values
     assert!(output.contains("class StatusA(str, enum.Enum):"));
     assert!(output.contains("class StatusB(str, enum.Enum):"));
@@ -716,8 +691,7 @@ fn test_declarative_array_enum_named_with_schema() {
             values: vec!["admin".to_string(), "user".to_string()],
         }],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Schema enum with array — renders the column
     assert!(output.contains("roles:"));
 }
@@ -731,8 +705,7 @@ fn test_declarative_include_dialect_options_skipped_by_default() {
         .column(col("id").build())
         .pk("si_pkey", &["id"])
         .build()]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(!output.contains("postgresql_"));
     assert!(!output.contains("mysql_"));
 }
@@ -753,8 +726,7 @@ fn test_declarative_array_enum_nullable() {
             values: vec!["tech".to_string(), "science".to_string()],
         }],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("tags: Mapped[Optional[list]]"));
 }
 
@@ -774,8 +746,7 @@ fn test_declarative_array_enum_with_dimensions() {
             values: vec!["a".to_string(), "b".to_string()],
         }],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Array column with enum renders
     assert!(output.contains("matrix:"));
 }
@@ -800,8 +771,7 @@ fn test_declarative_array_enum_nonativeenums() {
         nonativeenums: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // With nonativeenums — doesn't crash (wiring is future work)
     assert!(output.contains("roles:"));
 }
@@ -823,8 +793,7 @@ fn test_declarative_array_enum_shared() {
             values: vec!["admin".to_string(), "user".to_string()],
         }],
     );
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Enum class used for both regular and array columns
     assert!(output.contains("class RoleEnum(str, enum.Enum):"));
     assert!(output.contains("role: Mapped[RoleEnum]"));
@@ -849,8 +818,7 @@ fn test_declarative_use_inflect_placeholder() {
             .fk("si_fkey", &["container_id"], "simple_containers", &["id"])
             .build(),
     ]);
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &GeneratorOptions::default());
+    let output = generate(&schema, &GeneratorOptions::default());
     // Without inflect: collection uses table name "simple_items"
     assert!(output.contains("simple_items: Mapped[list['SimpleItems']]"));
     // TODO: With use_inflect, parent side would use singularized/pluralized names
@@ -876,8 +844,7 @@ fn test_declarative_keep_dialect_types_pg() {
         keep_dialect_types: true,
         ..GeneratorOptions::default()
     };
-    let gen = DeclarativeGenerator;
-    let output = gen.generate(&schema, &opts);
+    let output = generate(&schema, &opts);
     // PG dialect types preserved in declarative
     assert!(output.contains("BIGINT"));
     assert!(output.contains("VARCHAR(100)"));

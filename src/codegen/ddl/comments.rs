@@ -1,7 +1,7 @@
 use crate::dialect::Dialect;
 use crate::schema::TableInfo;
 
-use super::ident::{qualified_table_name, quote_identifier};
+use crate::codegen::render::ident::{qualified_table_name, quote_identifier};
 
 /// Generate COMMENT ON statements (PG only; MySQL is inline).
 pub(super) fn generate_comments(

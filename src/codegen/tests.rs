@@ -1,4 +1,8 @@
+use super::sql_text::{strip_mssql_parens, strip_pg_typecast};
 use super::*;
+use crate::cli::GeneratorOptions;
+use crate::dialect::Dialect;
+use crate::testutil::{col, schema_pg, table};
 
 #[test]
 fn test_format_server_default_pg() {
@@ -53,29 +57,17 @@ fn test_is_serial_default() {
 
 #[test]
 fn test_split_python_declarative() {
-    let full = "\
-from typing import Optional
-
-from sqlalchemy import Integer, String
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-class Users(Base):
-    __tablename__ = 'users'
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-
-
-class Posts(Base):
-    __tablename__ = 'posts'
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-";
-    let files = split_python_output(full);
+    let schema = schema_pg(vec![
+        table("users")
+            .column(col("id").build())
+            .pk("users_pk", &["id"])
+            .build(),
+        table("posts")
+            .column(col("id").build())
+            .pk("posts_pk", &["id"])
+            .build(),
+    ]);
+    let files = declarative::generate_split(&schema, &GeneratorOptions::default());
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
 
     assert!(names.contains(&"base.py"), "missing base.py: {names:?}");
@@ -105,58 +97,32 @@ class Posts(Base):
 
 #[test]
 fn test_split_python_enum_stays_in_base() {
-    let full = "\
-import enum
-
-from sqlalchemy import Enum, Integer, String
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-
-class StatusEnum(str, enum.Enum):
-    ACTIVE = 'active'
-    INACTIVE = 'inactive'
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-class Users(Base):
-    __tablename__ = 'users'
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-";
-    let files = split_python_output(full);
+    // A synthetic enum from a CHECK constraint renders as an enum class in
+    // the prelude; it must land in base.py, never in its own file.
+    let schema = schema_pg(vec![table("users")
+        .column(col("id").build())
+        .column(col("status").udt("varchar").max_length(20).build())
+        .pk("users_pk", &["id"])
+        .check("users_status_check", "status IN ('active', 'inactive')")
+        .build()]);
+    let files = declarative::generate_split(&schema, &GeneratorOptions::default());
     let base = &files.iter().find(|(n, _)| n == "base.py").unwrap().1;
-    assert!(base.contains("StatusEnum"), "enum should be in base.py");
+    assert!(base.contains("UsersStatus"), "enum should be in base.py");
 
-    // Enum should NOT be split into its own file
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
     assert!(
-        !names.contains(&"status_enum.py"),
-        "enum should not be a separate file"
+        !names.contains(&"users_status.py"),
+        "enum should not be a separate file: {names:?}"
     );
 }
 
 #[test]
 fn test_split_python_tables_generator() {
-    // Tables generator uses double-newline separators
-    let full = "\
-from sqlalchemy import Column, Integer, MetaData, String, Table
-
-metadata = MetaData()
-
-t_users = Table(
-    'users', metadata,
-    Column('id', Integer, primary_key=True)
-)
-
-t_posts = Table(
-    'posts', metadata,
-    Column('id', Integer, primary_key=True)
-)
-";
-    let files = split_python_output(full);
+    let schema = schema_pg(vec![
+        table("users").column(col("id").build()).build(),
+        table("posts").column(col("id").build()).build(),
+    ]);
+    let files = tables::generate_split(&schema, &GeneratorOptions::default());
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
     assert!(
         names.contains(&"t_users.py"),
@@ -166,4 +132,8 @@ t_posts = Table(
         names.contains(&"t_posts.py"),
         "missing t_posts.py: {names:?}"
     );
+    // __init__ re-exports base + both modules.
+    let init = &files.iter().find(|(n, _)| n == "__init__.py").unwrap().1;
+    assert!(init.contains("from .base import *"));
+    assert!(init.contains("from .t_users import *"));
 }

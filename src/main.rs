@@ -29,9 +29,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Command, ConnectionConfig, GeneratorOptions, SnapshotCommand};
 use crate::codegen::ddl_diff::{compute_changes, render_changes};
-use crate::codegen::declarative::DeclarativeGenerator;
-use crate::codegen::tables::TablesGenerator;
-use crate::codegen::Generator;
+use crate::codegen::{declarative, tables};
 use crate::dialect::Dialect;
 use crate::output::{apply_order, write_split_changes, Manifest, OutputContext};
 use crate::schema::{IntrospectedSchema, TableType};
@@ -76,21 +74,18 @@ async fn main() -> Result<()> {
     match cli.generator.as_str() {
         "tables" => {
             if cli.split_tables {
-                let files = TablesGenerator.generate_split(&schema, &options);
+                let files = tables::generate_split(&schema, &options);
                 write_split_output(&files, &cli.outfile)?;
             } else {
-                write_output(&TablesGenerator.generate(&schema, &options), &cli.outfile)?;
+                write_output(&tables::generate(&schema, &options), &cli.outfile)?;
             }
         }
         "declarative" => {
             if cli.split_tables {
-                let files = DeclarativeGenerator.generate_split(&schema, &options);
+                let files = declarative::generate_split(&schema, &options);
                 write_split_output(&files, &cli.outfile)?;
             } else {
-                write_output(
-                    &DeclarativeGenerator.generate(&schema, &options),
-                    &cli.outfile,
-                )?;
+                write_output(&declarative::generate(&schema, &options), &cli.outfile)?;
             }
         }
         "ddl" => {
