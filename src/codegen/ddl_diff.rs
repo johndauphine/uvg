@@ -364,7 +364,40 @@ fn diff_table_constraints(
             ) {
                 continue;
             }
-        } else if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
+            drops.push(render_dropped_constraint(
+                source,
+                constraint,
+                source_dialect,
+                target_dialect,
+            ));
+            // InnoDB auto-creates a backing index (named after the
+            // constraint) for each FK and leaves it behind on DROP FOREIGN
+            // KEY. When the FK is being replaced with different local
+            // columns, that stale index no longer serves the new FK (which
+            // auto-creates its own) and is invisible to the index diff,
+            // which suppresses FK-backing indexes by design. Drop it
+            // explicitly, right after the FK drop — InnoDB refuses to drop
+            // it while the FK still exists.
+            if target_dialect == Dialect::Mysql
+                && matches!(constraint.constraint_type, ConstraintType::ForeignKey)
+                && source_constraint.columns != constraint.columns
+                && target
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.name == constraint.name && idx.columns == constraint.columns)
+            {
+                let tname = qualified_table_name(
+                    &source.schema,
+                    &source.name,
+                    source_dialect,
+                    target_dialect,
+                );
+                let iname = quote_identifier(&constraint.name, target_dialect);
+                drops.push(format!("ALTER TABLE {tname} DROP INDEX {iname};"));
+            }
+            continue;
+        }
+        if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
             && source.constraints.iter().any(|source_constraint| {
                 matches!(
                     source_constraint.constraint_type,
@@ -478,39 +511,77 @@ fn constraints_content_match(
     true
 }
 
-/// Normalize a stored CHECK predicate for same-dialect comparison: strip
-/// identifier quoting, collapse whitespace, and peel fully-wrapping outer
-/// parentheses (PG stores `((x > 0))`, MySQL `` (`x` > 0) ``). Literal case
-/// is preserved — `'Active'` vs `'active'` is real drift — and inner
-/// parentheses are semantic and kept.
+/// Normalize a stored CHECK predicate for same-dialect comparison.
+///
+/// Outside string literals: identifier quoting (`"`, `` ` ``, `[`, `]`) is
+/// stripped, all whitespace is removed (engines that preserve authored text,
+/// like MSSQL, store `[x]>=(0)` or `[x] >= (0)` depending on how the
+/// constraint was written), and characters are lowercased (keyword and
+/// identifier case is not drift on any supported dialect's stored form).
+/// String literals are kept verbatim — `'Active'` vs `'active'` and
+/// `'a b'` vs `'ab'` are real drift. Finally, fully-wrapping outer
+/// parentheses are peeled (PG stores `((x > 0))`); inner parentheses are
+/// semantic and kept.
 fn normalize_check_predicate(expr: &str) -> String {
-    let unquoted: String = expr
-        .chars()
-        .filter(|c| !matches!(c, '"' | '`' | '[' | ']'))
-        .collect();
-    let mut normalized = unquoted.split_whitespace().collect::<Vec<_>>().join(" ");
-    while let Some(inner) = peel_wrapping_parens(&normalized) {
-        normalized = inner.trim().to_string();
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.chars().peekable();
+    let mut in_literal = false;
+    while let Some(c) = chars.next() {
+        if in_literal {
+            out.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    // Escaped quote stays inside the literal.
+                    out.push(chars.next().expect("peeked"));
+                } else {
+                    in_literal = false;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                out.push(c);
+                in_literal = true;
+            }
+            '"' | '`' | '[' | ']' => {}
+            c if c.is_whitespace() => {}
+            c => out.extend(c.to_lowercase()),
+        }
     }
-    normalized
+    while let Some(inner) = peel_wrapping_parens(&out) {
+        out = inner.to_string();
+    }
+    out
 }
 
 /// If the expression's first `(` closes exactly at its last character, the
-/// parens wrap the whole expression; return the inside. `(a) AND (b)` is
-/// not wrapped — its first paren closes mid-expression.
+/// parens wrap the whole expression; return the inside. `(a)and(b)` is not
+/// wrapped — its first paren closes mid-expression. Parentheses inside
+/// string literals are skipped.
 fn peel_wrapping_parens(expr: &str) -> Option<&str> {
-    let trimmed = expr.trim();
-    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+    if !expr.starts_with('(') || !expr.ends_with(')') {
         return None;
     }
     let mut depth = 0i32;
-    for (i, c) in trimmed.char_indices() {
+    let mut in_literal = false;
+    for (i, c) in expr.char_indices() {
+        if in_literal {
+            // Toggle semantics: an escaped `''` reads as exit-then-re-enter,
+            // which is equivalent for paren counting (nothing sits between
+            // the adjacent quotes).
+            if c == '\'' {
+                in_literal = false;
+            }
+            continue;
+        }
         match c {
+            '\'' => in_literal = true,
             '(' => depth += 1,
             ')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return (i == trimmed.len() - 1).then(|| &trimmed[1..trimmed.len() - 1]);
+                    return (i == expr.len() - 1).then(|| &expr[1..expr.len() - 1]);
                 }
             }
             _ => {}

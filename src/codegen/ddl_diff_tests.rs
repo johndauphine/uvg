@@ -848,17 +848,70 @@ fn test_same_name_fk_default_rule_spellings_cross_dialect_not_drift() {
 
 #[test]
 fn test_normalize_check_predicate_peels_only_wrapping_parens() {
-    assert_eq!(normalize_check_predicate("((x > 0))"), "x > 0");
-    assert_eq!(normalize_check_predicate("(`x` >  0)"), "x > 0");
+    assert_eq!(normalize_check_predicate("((x > 0))"), "x>0");
+    assert_eq!(normalize_check_predicate("(`x` >  0)"), "x>0");
     // (a) AND (b): the first paren closes mid-expression — not wrapping.
     assert_eq!(
         normalize_check_predicate("((a > 0) AND (b > 0))"),
-        "(a > 0) AND (b > 0)"
+        "(a>0)and(b>0)"
     );
-    // Literal case is real drift and preserved.
+    // MSSQL preserves authored spacing and case outside literals; neither
+    // is drift.
+    assert_eq!(
+        normalize_check_predicate("([x]>=(0))"),
+        normalize_check_predicate("([x] >= (0))")
+    );
+    assert_eq!(
+        normalize_check_predicate("(x > 0 AND y > 0)"),
+        normalize_check_predicate("(x > 0 and y > 0)")
+    );
+    // Literal content is verbatim: case and internal spacing are real drift.
     assert_ne!(
         normalize_check_predicate("(status = 'Active')"),
         normalize_check_predicate("(status = 'active')")
+    );
+    assert_ne!(
+        normalize_check_predicate("(status = 'a b')"),
+        normalize_check_predicate("(status = 'ab')")
+    );
+    // Parens inside literals don't confuse the wrapping-paren peel, and
+    // escaped quotes stay inside the literal.
+    assert_eq!(normalize_check_predicate("(s = ')')"), "s=')'");
+    assert_eq!(normalize_check_predicate("(s = 'it''s')"), "s='it''s'");
+}
+
+#[test]
+fn test_same_name_mysql_fk_column_change_drops_stale_backing_index() {
+    // InnoDB auto-creates an FK backing index named after the constraint
+    // and leaves it behind on DROP FOREIGN KEY. Replacing an FK with
+    // different local columns must also drop that stale index (the index
+    // diff suppresses FK-backing indexes, so nothing else would).
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Mysql));
+    let drop_fk = ddl
+        .find("DROP FOREIGN KEY `fk_orders_owner`")
+        .expect("FK must be dropped");
+    let drop_idx = ddl
+        .find("DROP INDEX `fk_orders_owner`")
+        .expect("stale backing index must be dropped");
+    assert!(
+        drop_fk < drop_idx,
+        "index drop must follow the FK drop (InnoDB refuses it earlier): {ddl}"
+    );
+    assert!(
+        ddl.contains("ADD CONSTRAINT `fk_orders_owner` FOREIGN KEY (`acct_id`)"),
+        "source FK must be re-added: {ddl}"
     );
 }
 
