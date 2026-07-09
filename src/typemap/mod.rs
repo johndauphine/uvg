@@ -1,3 +1,4 @@
+mod canonical_sa;
 pub mod mssql;
 pub mod mysql;
 pub mod pg;
