@@ -121,7 +121,8 @@ fn reverse_create_index(statement: &str, target_dialect: Dialect) -> Option<Stri
     let rest = &statement[prefix_len..];
     let on_idx = rest.to_ascii_uppercase().find(" ON ")?;
     let index = rest[..on_idx].trim();
-    if matches!(target_dialect, Dialect::Mysql | Dialect::Mssql) && index.contains('.') {
+    if target_dialect.drop_index_requires_table() && index.contains('.') {
+        // The DROP INDEX ... ON form cannot take a schema-qualified index.
         return None;
     }
     let after_on = rest[on_idx + " ON ".len()..].trim();
@@ -130,9 +131,10 @@ fn reverse_create_index(statement: &str, target_dialect: Dialect) -> Option<Stri
         .map(|(table, _)| table)
         .unwrap_or(after_on)
         .trim();
-    match target_dialect {
-        Dialect::Mysql | Dialect::Mssql => Some(format!("DROP INDEX {index} ON {table};")),
-        Dialect::Postgres | Dialect::Sqlite => Some(format!("DROP INDEX {index};")),
+    if target_dialect.drop_index_requires_table() {
+        Some(format!("DROP INDEX {index} ON {table};"))
+    } else {
+        Some(format!("DROP INDEX {index};"))
     }
 }
 

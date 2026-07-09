@@ -349,7 +349,7 @@ pub(crate) struct ParseError {
 /// `SET PARSEONLY`), and SQLite's `EXPLAIN` doesn't cover most DDL —
 /// those dialects skip silently per #44.
 pub(crate) fn supports_parse_check(config: &ConnectionConfig) -> bool {
-    matches!(config, ConnectionConfig::Postgres(_))
+    config.dialect().supports_parse_check()
 }
 
 /// Pre-validate every DDL statement by running it through the target

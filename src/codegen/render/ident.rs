@@ -31,7 +31,7 @@ pub(in crate::codegen) fn qualified_table_name(
 
     // For MySQL targets, the schema IS the database name — always suppress it
     // since the target connection already specifies the database.
-    let suppress_for_mysql_target = target_dialect == Dialect::Mysql;
+    let suppress_for_mysql_target = target_dialect.schema_is_database();
 
     // For MySQL SOURCE on a non-MySQL target, the source's "schema" is also
     // the database name (MySQL conflates the two). The user's target DB
@@ -40,7 +40,7 @@ pub(in crate::codegen) fn qualified_table_name(
     // qualification cross-dialect from MySQL. Same-dialect (mysql->mysql)
     // preserves it via the `target_dialect == Mysql` branch above. See #40.
     let suppress_for_mysql_source =
-        source_dialect == Dialect::Mysql && target_dialect != Dialect::Mysql;
+        source_dialect.schema_is_database() && !target_dialect.schema_is_database();
 
     if is_source_default_schema || suppress_for_mysql_target || suppress_for_mysql_source {
         return quote_identifier(table, target_dialect);
