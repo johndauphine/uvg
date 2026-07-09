@@ -118,7 +118,13 @@ pub fn compute_changes(
             let (constraint_drops, constraint_adds) = if options.noconstraints {
                 (Vec::new(), Vec::new())
             } else {
-                diff_table_constraints(table, target_table, source_dialect, target_dialect)
+                diff_table_constraints(
+                    table,
+                    target_table,
+                    source_dialect,
+                    target_dialect,
+                    options.noindexes,
+                )
             };
             let (index_drops, index_adds) = if options.noindexes {
                 (Vec::new(), Vec::new())
@@ -337,6 +343,7 @@ fn diff_table_constraints(
     target: &TableInfo,
     source_dialect: Dialect,
     target_dialect: Dialect,
+    noindexes: bool,
 ) -> (Vec<String>, Vec<String>) {
     if target_dialect == Dialect::Sqlite {
         return (Vec::new(), Vec::new());
@@ -344,6 +351,12 @@ fn diff_table_constraints(
 
     let mut drops = Vec::new();
     let mut adds = Vec::new();
+    // Names of target constraints scheduled for DROP below; the add loop's
+    // renamed-PK shortcut must not treat a dropped PK as still covering the
+    // table (#113 review: a source constraint reusing the old PK's name for
+    // a different constraint type drops that PK — the renamed source PK
+    // must then be added, or the table ends up with no primary key).
+    let mut dropped_names: HashSet<&str> = HashSet::new();
 
     for constraint in &target.constraints {
         // Same-named constraints are compared by content (#113); a name
@@ -364,6 +377,7 @@ fn diff_table_constraints(
             ) {
                 continue;
             }
+            dropped_names.insert(constraint.name.as_str());
             drops.push(render_dropped_constraint(
                 source,
                 constraint,
@@ -378,7 +392,8 @@ fn diff_table_constraints(
             // which suppresses FK-backing indexes by design. Drop it
             // explicitly, right after the FK drop — InnoDB refuses to drop
             // it while the FK still exists.
-            if target_dialect == Dialect::Mysql
+            if !noindexes
+                && target_dialect == Dialect::Mysql
                 && matches!(constraint.constraint_type, ConstraintType::ForeignKey)
                 && source_constraint.columns != constraint.columns
                 && target
@@ -417,6 +432,7 @@ fn diff_table_constraints(
         {
             continue;
         }
+        dropped_names.insert(constraint.name.as_str());
         drops.push(render_dropped_constraint(
             source,
             constraint,
@@ -445,8 +461,11 @@ fn diff_table_constraints(
                     target_constraint.constraint_type,
                     ConstraintType::PrimaryKey
                 ) && target_constraint.columns == constraint.columns
+                    && !dropped_names.contains(target_constraint.name.as_str())
             })
         {
+            // Renamed-but-identical PK: the target's same-columns PK
+            // survives, so adding another would both churn and fail.
             continue;
         }
         if let Some(sql) =

@@ -1042,3 +1042,80 @@ fn test_mysql_stale_backing_index_kept_when_shared_by_another_fk() {
         "shared backing index must not be dropped while another FK uses it: {ddl}"
     );
 }
+
+#[test]
+fn test_renamed_pk_with_name_reused_by_other_constraint_readds_pk() {
+    // Target PK `old_pk(id)` collides by name with a source UNIQUE
+    // `old_pk(email)` (content mismatch → old_pk is dropped), while the
+    // source's PK lives under a new name `pk(id)`. The renamed-PK shortcut
+    // must not treat the *dropped* old_pk as still covering the table — the
+    // source PK must be re-added or the table ends up with no primary key.
+    let source = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .column(col("email").udt("varchar").max_length(100).build())
+        .pk("pk", &["id"])
+        .unique("old_pk", &["email"])
+        .build()]);
+    let target = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .column(col("email").udt("varchar").max_length(100).build())
+        .pk("old_pk", &["id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"old_pk\""),
+        "name-collided target PK must be dropped: {ddl}"
+    );
+    assert!(
+        ddl.contains("ADD CONSTRAINT \"pk\" PRIMARY KEY (\"id\")"),
+        "the renamed source PK must be re-added since old_pk was dropped: {ddl}"
+    );
+}
+
+#[test]
+fn test_renamed_identical_pk_still_skipped() {
+    // Plain rename with identical columns and no name collision: neither
+    // side emits anything (the pre-#113 behavior is preserved).
+    let source = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .pk("users_pk_new", &["id"])
+        .build()]);
+    let target = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .pk("users_pk_old", &["id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("users_pk"),
+        "renamed-but-identical PK must not churn: {ddl}"
+    );
+}
+
+#[test]
+fn test_noindexes_suppresses_fk_backing_index_drop() {
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let mut options = default_options(Dialect::Mysql);
+    options.noindexes = true;
+    let ddl = diff_schemas(&source, &target, &options);
+    assert!(
+        ddl.contains("DROP FOREIGN KEY `fk_orders_owner`"),
+        "FK replacement itself is constraint work and stays: {ddl}"
+    );
+    assert!(
+        !ddl.contains("DROP INDEX"),
+        "noindexes must suppress the backing-index drop: {ddl}"
+    );
+}
