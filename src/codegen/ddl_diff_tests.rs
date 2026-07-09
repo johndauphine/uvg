@@ -661,3 +661,223 @@ fn test_render_changes_round_trip_with_diff_schemas() {
     );
     assert_eq!(direct, via_changes);
 }
+
+// ---- same-name constraint content comparison (#113) ----
+
+#[test]
+fn test_same_name_check_predicate_change_is_drift_same_dialect() {
+    // Editing a CHECK predicate in place (same constraint name) was
+    // invisible to the name-only diff. Same-dialect, it must now emit a
+    // drop of the target's version and a re-add of the source's.
+    let source = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "((price > 10))")
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "((price > 0))")
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"ck_price\""),
+        "changed predicate under the same name must drop the old version: {ddl}"
+    );
+    assert!(
+        ddl.contains("ADD CONSTRAINT \"ck_price\" CHECK"),
+        "changed predicate must re-add the source version: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_check_equivalent_modulo_formatting_is_not_drift() {
+    // PG stores extra wrapping parens; whitespace and identifier quoting
+    // vary. None of that is drift.
+    let source = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "((\"price\" > 0))")
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "( price  >  0 )")
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("ck_price"),
+        "formatting-only differences must not churn the constraint: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_check_cross_dialect_text_is_not_compared() {
+    // Cross-dialect stored predicates never converge textually (each server
+    // canonicalizes its own form), so comparing them would drop+add on
+    // every run. They are deliberately skipped.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("price").udt("int").build())
+        .check("ck_price", "(`price` > 0)")
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("price").udt("int4").build())
+        .check("ck_price", "((price >= 1))")
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("ck_price"),
+        "cross-dialect predicate text must not be treated as drift: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_unique_different_columns_is_drift() {
+    let source = schema_pg(vec![table("users")
+        .column(col("a").udt("int4").build())
+        .column(col("b").udt("int4").build())
+        .unique("uq_users", &["a"])
+        .build()]);
+    let target = schema_pg(vec![table("users")
+        .column(col("a").udt("int4").build())
+        .column(col("b").udt("int4").build())
+        .unique("uq_users", &["b"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"uq_users\""),
+        "re-pointed UNIQUE must drop the target version: {ddl}"
+    );
+    assert!(
+        ddl.contains("ADD CONSTRAINT \"uq_users\" UNIQUE (\"a\")"),
+        "re-pointed UNIQUE must add the source version: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_fk_retargeted_is_drift() {
+    let source = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk("fk_orders_user", &["user_id"], "accounts", &["id"])
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk("fk_orders_user", &["user_id"], "users", &["id"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"fk_orders_user\""),
+        "retargeted FK must drop the target version: {ddl}"
+    );
+    assert!(
+        ddl.contains("REFERENCES \"accounts\""),
+        "retargeted FK must re-add pointing at the source's table: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_fk_delete_rule_change_same_dialect_is_drift() {
+    let source = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "public",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "CASCADE",
+        )
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "public",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("ON DELETE CASCADE"),
+        "delete-rule change must re-add with the source rule: {ddl}"
+    );
+}
+
+#[test]
+fn test_same_name_fk_default_rule_spellings_cross_dialect_not_drift() {
+    // MySQL reports the default rule as RESTRICT where PG says NO ACTION;
+    // cross-dialect rule comparison is skipped so this is not churn.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "appdb",
+            "users",
+            &["id"],
+            "RESTRICT",
+            "RESTRICT",
+        )
+        .build()]);
+    let target = schema_pg(vec![table("orders")
+        .column(col("user_id").udt("int4").build())
+        .fk_full(
+            "fk_orders_user",
+            &["user_id"],
+            "public",
+            "users",
+            &["id"],
+            "NO ACTION",
+            "NO ACTION",
+        )
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("fk_orders_user"),
+        "default rule spellings across dialects must not be drift: {ddl}"
+    );
+}
+
+#[test]
+fn test_normalize_check_predicate_peels_only_wrapping_parens() {
+    assert_eq!(normalize_check_predicate("((x > 0))"), "x > 0");
+    assert_eq!(normalize_check_predicate("(`x` >  0)"), "x > 0");
+    // (a) AND (b): the first paren closes mid-expression — not wrapping.
+    assert_eq!(
+        normalize_check_predicate("((a > 0) AND (b > 0))"),
+        "(a > 0) AND (b > 0)"
+    );
+    // Literal case is real drift and preserved.
+    assert_ne!(
+        normalize_check_predicate("(status = 'Active')"),
+        normalize_check_predicate("(status = 'active')")
+    );
+}
+
+#[test]
+fn test_lossy_type_fallback_still_converges_to_no_drift() {
+    // MySQL SET has no PG equivalent; it renders as a sized VARCHAR
+    // fallback. Once the target carries that VARCHAR, the canonical types
+    // still differ (Set vs Varchar) but the rendered target types match —
+    // emitting an ALTER here would re-emit forever without converging.
+    let mut flags = col("flags").udt("set").build();
+    flags.data_type = "set('a','b','c')".to_string();
+    let source = schema_mysql(vec![table("prefs").column(flags).build()]);
+    let target = schema_pg(vec![table("prefs")
+        .column(col("flags").udt("varchar").max_length(255).build())
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        !ddl.contains("ALTER COLUMN \"flags\" TYPE"),
+        "lossy fallback that matches the target must not emit type drift: {ddl}"
+    );
+}

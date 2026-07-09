@@ -342,19 +342,29 @@ fn diff_table_constraints(
         return (Vec::new(), Vec::new());
     }
 
-    let target_names: HashSet<&str> = target.constraints.iter().map(|c| c.name.as_str()).collect();
     let mut drops = Vec::new();
     let mut adds = Vec::new();
 
     for constraint in &target.constraints {
-        if source
+        // Same-named constraints are compared by content (#113); a name
+        // match alone used to hide real drift (a CHECK predicate edited
+        // under the same name, a UNIQUE re-pointed at other columns). A
+        // content mismatch drops the target's version here and re-adds the
+        // source's version in the loop below.
+        if let Some(source_constraint) = source
             .constraints
             .iter()
-            .any(|source_constraint| source_constraint.name == constraint.name)
+            .find(|source_constraint| source_constraint.name == constraint.name)
         {
-            continue;
-        }
-        if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
+            if constraints_content_match(
+                source_constraint,
+                constraint,
+                source_dialect,
+                target_dialect,
+            ) {
+                continue;
+            }
+        } else if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
             && source.constraints.iter().any(|source_constraint| {
                 matches!(
                     source_constraint.constraint_type,
@@ -373,10 +383,20 @@ fn diff_table_constraints(
     }
 
     for constraint in &source.constraints {
-        if target_names.contains(constraint.name.as_str()) {
-            continue;
-        }
-        if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
+        if let Some(target_constraint) = target
+            .constraints
+            .iter()
+            .find(|target_constraint| target_constraint.name == constraint.name)
+        {
+            if constraints_content_match(
+                constraint,
+                target_constraint,
+                source_dialect,
+                target_dialect,
+            ) {
+                continue;
+            }
+        } else if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
             && target.constraints.iter().any(|target_constraint| {
                 matches!(
                     target_constraint.constraint_type,
@@ -394,6 +414,109 @@ fn diff_table_constraints(
     }
 
     (drops, adds)
+}
+
+/// Content comparison for same-named constraints (#113). Name identity alone
+/// hid real drift: a CHECK predicate edited in place, a UNIQUE re-pointed at
+/// different columns, or a foreign key retargeted at another table were all
+/// invisible to the diff.
+///
+/// Structured fields (constraint type, columns, FK table/columns) compare
+/// across any dialect pair. Text-derived fields compare **same-dialect
+/// only**:
+///
+/// - CHECK predicates: servers store parser-canonicalized text (PG deparses
+///   `x IN (1,2)` as `x = ANY (ARRAY[1, 2])`), so two dialects' stored forms
+///   of the same predicate never converge textually, and comparing them
+///   would emit a drop+add on every run. Same-dialect comparison is
+///   convergent because a server's canonicalization of its own stored text
+///   is a fixed point.
+/// - FK ref_schema and update/delete rules: dialects report different
+///   default schemas (`public` vs `dbo`) and different spellings of the
+///   default rule (`NO ACTION` vs `RESTRICT`), which are not drift.
+fn constraints_content_match(
+    source: &ConstraintInfo,
+    target: &ConstraintInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> bool {
+    if source.constraint_type != target.constraint_type {
+        return false;
+    }
+    if source.columns != target.columns {
+        return false;
+    }
+    match (&source.foreign_key, &target.foreign_key) {
+        (Some(source_fk), Some(target_fk)) => {
+            if source_fk.ref_table != target_fk.ref_table
+                || source_fk.ref_columns != target_fk.ref_columns
+            {
+                return false;
+            }
+            if source_dialect == target_dialect
+                && (source_fk.ref_schema != target_fk.ref_schema
+                    || source_fk.update_rule != target_fk.update_rule
+                    || source_fk.delete_rule != target_fk.delete_rule)
+            {
+                return false;
+            }
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    if source_dialect == target_dialect {
+        // A side with no stored predicate (introspection gap on older
+        // servers) is not assertable drift; compare only when both exist.
+        if let (Some(source_expr), Some(target_expr)) =
+            (&source.check_expression, &target.check_expression)
+        {
+            if normalize_check_predicate(source_expr) != normalize_check_predicate(target_expr) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Normalize a stored CHECK predicate for same-dialect comparison: strip
+/// identifier quoting, collapse whitespace, and peel fully-wrapping outer
+/// parentheses (PG stores `((x > 0))`, MySQL `` (`x` > 0) ``). Literal case
+/// is preserved — `'Active'` vs `'active'` is real drift — and inner
+/// parentheses are semantic and kept.
+fn normalize_check_predicate(expr: &str) -> String {
+    let unquoted: String = expr
+        .chars()
+        .filter(|c| !matches!(c, '"' | '`' | '[' | ']'))
+        .collect();
+    let mut normalized = unquoted.split_whitespace().collect::<Vec<_>>().join(" ");
+    while let Some(inner) = peel_wrapping_parens(&normalized) {
+        normalized = inner.trim().to_string();
+    }
+    normalized
+}
+
+/// If the expression's first `(` closes exactly at its last character, the
+/// parens wrap the whole expression; return the inside. `(a) AND (b)` is
+/// not wrapped — its first paren closes mid-expression.
+fn peel_wrapping_parens(expr: &str) -> Option<&str> {
+    let trimmed = expr.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, c) in trimmed.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (i == trimmed.len() - 1).then(|| &trimmed[1..trimmed.len() - 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn render_dropped_constraint(
@@ -601,10 +724,22 @@ fn diff_column(
     let tname = qualified_table_name(table_schema, table_name, source_dialect, target_dialect);
     let cname = quote_identifier(&source.name, target_dialect);
 
-    let source_type = ddl_typemap::map_ddl_type(source, source_dialect, target_dialect);
-    let target_type = ddl_typemap::map_ddl_type(target, target_dialect, target_dialect);
-
-    let type_changed = source_type.sql_type != target_type.sql_type;
+    // Type drift is decided canonically first (#113): each side is parsed
+    // once into CanonicalType, which has structural equality. Equal canonical
+    // types are never drift — from_canonical is a pure function, so they
+    // always render identically. When the canonical types differ, drift is
+    // confirmed only if the difference survives rendering to the target
+    // dialect: from_canonical is deliberately lossy (e.g. MySQL SET falls
+    // back to VARCHAR on other targets), and emitting an ALTER whose rendered
+    // type already matches the target's current type would re-emit on every
+    // run without ever converging.
+    let source_canonical = ddl_typemap::to_canonical(source, source_dialect);
+    let target_canonical = ddl_typemap::to_canonical(target, target_dialect);
+    let source_type = ddl_typemap::from_canonical(&source_canonical, target_dialect);
+    let type_changed = source_canonical != target_canonical && {
+        let target_type = ddl_typemap::from_canonical(&target_canonical, target_dialect);
+        source_type.sql_type != target_type.sql_type
+    };
     let source_auto = is_auto_increment_column(source, source_dialect);
     let target_auto = is_auto_increment_column(target, target_dialect);
     let nullable_changed = if source_dialect != target_dialect && source_auto && target_auto {
@@ -614,8 +749,7 @@ fn diff_column(
     };
 
     // Compare defaults with boolean-aware normalization
-    let canonical = ddl_typemap::to_canonical(source, source_dialect);
-    let is_boolean = matches!(canonical, ddl_typemap::CanonicalType::Boolean);
+    let is_boolean = matches!(source_canonical, ddl_typemap::CanonicalType::Boolean);
     let source_default = source
         .column_default
         .as_deref()
