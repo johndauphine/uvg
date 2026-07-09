@@ -136,11 +136,9 @@ pub fn compute_changes(
             // than re-parsing rendered SQL. Order is unchanged (see the
             // ordering note above); only the kind tag is added.
             let mut table_sql: Vec<(ChangeKind, String)> = Vec::new();
-            table_sql.extend(
-                constraint_drops
-                    .into_iter()
-                    .map(|sql| (ChangeKind::DropConstraint, sql)),
-            );
+            // constraint_drops arrive pre-tagged: mostly DropConstraint, but
+            // the MySQL stale-FK-backing-index drop is a DropIndex (#113).
+            table_sql.extend(constraint_drops);
             table_sql.extend(
                 index_drops
                     .into_iter()
@@ -344,7 +342,7 @@ fn diff_table_constraints(
     source_dialect: Dialect,
     target_dialect: Dialect,
     noindexes: bool,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<(ChangeKind, String)>, Vec<String>) {
     if target_dialect == Dialect::Sqlite {
         return (Vec::new(), Vec::new());
     }
@@ -378,11 +376,9 @@ fn diff_table_constraints(
                 continue;
             }
             dropped_names.insert(constraint.name.as_str());
-            drops.push(render_dropped_constraint(
-                source,
-                constraint,
-                source_dialect,
-                target_dialect,
+            drops.push((
+                ChangeKind::DropConstraint,
+                render_dropped_constraint(source, constraint, source_dialect, target_dialect),
             ));
             // InnoDB auto-creates a backing index (named after the
             // constraint) for each FK and leaves it behind on DROP FOREIGN
@@ -418,7 +414,10 @@ fn diff_table_constraints(
                     target_dialect,
                 );
                 let iname = quote_identifier(&constraint.name, target_dialect);
-                drops.push(format!("ALTER TABLE {tname} DROP INDEX {iname};"));
+                drops.push((
+                    ChangeKind::DropIndex,
+                    format!("ALTER TABLE {tname} DROP INDEX {iname};"),
+                ));
             }
             continue;
         }
@@ -433,11 +432,9 @@ fn diff_table_constraints(
             continue;
         }
         dropped_names.insert(constraint.name.as_str());
-        drops.push(render_dropped_constraint(
-            source,
-            constraint,
-            source_dialect,
-            target_dialect,
+        drops.push((
+            ChangeKind::DropConstraint,
+            render_dropped_constraint(source, constraint, source_dialect, target_dialect),
         ));
     }
 
@@ -455,7 +452,13 @@ fn diff_table_constraints(
             ) {
                 continue;
             }
-        } else if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
+        }
+        // Renamed-but-identical PK: if a same-columns target PK survives the
+        // drop pass (it was neither name-collided nor content-mismatched),
+        // adding this one would both churn and fail with two primary keys.
+        // This applies whether the source PK's name is free on the target or
+        // currently taken by a different (dropped) constraint.
+        if matches!(constraint.constraint_type, ConstraintType::PrimaryKey)
             && target.constraints.iter().any(|target_constraint| {
                 matches!(
                     target_constraint.constraint_type,
@@ -464,8 +467,6 @@ fn diff_table_constraints(
                     && !dropped_names.contains(target_constraint.name.as_str())
             })
         {
-            // Renamed-but-identical PK: the target's same-columns PK
-            // survives, so adding another would both churn and fail.
             continue;
         }
         if let Some(sql) =
@@ -568,19 +569,23 @@ fn normalize_fk_rule(rule: &str, dialect: Dialect) -> &str {
 
 /// Normalize a stored CHECK predicate for same-dialect comparison.
 ///
-/// Outside string literals: identifier quoting (`"`, `` ` ``, `[`, `]`) is
-/// stripped, all whitespace is removed (engines that preserve authored text,
-/// like MSSQL, store `[x]>=(0)` or `[x] >= (0)` depending on how the
-/// constraint was written), and characters are lowercased (keyword and
-/// identifier case is not drift on any supported dialect's stored form).
-/// String literals are kept verbatim — `'Active'` vs `'active'` and
-/// `'a b'` vs `'ab'` are real drift. Finally, fully-wrapping outer
-/// parentheses are peeled (PG stores `((x > 0))`); inner parentheses are
-/// semantic and kept.
+/// Outside string literals and quoted identifiers: all whitespace is removed
+/// (engines that preserve authored text, like MSSQL, store `[x]>=(0)` or
+/// `[x] >= (0)` depending on how the constraint was written) and characters
+/// are lowercased (unquoted identifiers and keywords are case-insensitive on
+/// every supported dialect's stored form). String literals are kept verbatim
+/// — `'Active'` vs `'active'` and `'a b'` vs `'ab'` are real drift. Quoted
+/// identifiers (`"..."`, `` `...` ``, `[...]`) lose their delimiters but keep
+/// their content case-sensitively: PG only quotes identifiers that need it,
+/// so `"UserID"` and `userid` are genuinely different columns. Finally,
+/// fully-wrapping outer parentheses are peeled (PG stores `((x > 0))`);
+/// inner parentheses are semantic and kept.
 fn normalize_check_predicate(expr: &str) -> String {
     let mut out = String::with_capacity(expr.len());
     let mut chars = expr.chars().peekable();
     let mut in_literal = false;
+    // Some(closer) while inside a quoted identifier.
+    let mut ident_closer: Option<char> = None;
     while let Some(c) = chars.next() {
         if in_literal {
             out.push(c);
@@ -594,12 +599,28 @@ fn normalize_check_predicate(expr: &str) -> String {
             }
             continue;
         }
+        if let Some(closer) = ident_closer {
+            if c == closer {
+                if chars.peek() == Some(&closer) {
+                    // Doubled closer is an escaped delimiter in the name.
+                    out.push(chars.next().expect("peeked"));
+                } else {
+                    ident_closer = None;
+                }
+            } else {
+                // Identifier content is case-significant; copy verbatim.
+                out.push(c);
+            }
+            continue;
+        }
         match c {
             '\'' => {
                 out.push(c);
                 in_literal = true;
             }
-            '"' | '`' | '[' | ']' => {}
+            '"' => ident_closer = Some('"'),
+            '`' => ident_closer = Some('`'),
+            '[' => ident_closer = Some(']'),
             c if c.is_whitespace() => {}
             c => out.extend(c.to_lowercase()),
         }

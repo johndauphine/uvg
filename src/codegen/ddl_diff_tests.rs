@@ -1119,3 +1119,72 @@ fn test_noindexes_suppresses_fk_backing_index_drop() {
         "noindexes must suppress the backing-index drop: {ddl}"
     );
 }
+
+#[test]
+fn test_pk_add_suppressed_when_same_columns_pk_survives_name_collision() {
+    // Mirror of the dropped-PK case: target has old_pk PRIMARY KEY(id) and
+    // a UNIQUE named pk; source has just pk PRIMARY KEY(id). The UNIQUE pk
+    // is dropped (type mismatch), but old_pk survives and covers (id) — so
+    // adding the source's pk would fail with two primary keys.
+    let source = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .column(col("email").udt("varchar").max_length(100).build())
+        .pk("pk", &["id"])
+        .build()]);
+    let target = schema_pg(vec![table("users")
+        .column(col("id").udt("int4").build())
+        .column(col("email").udt("varchar").max_length(100).build())
+        .pk("old_pk", &["id"])
+        .unique("pk", &["email"])
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+    assert!(
+        ddl.contains("DROP CONSTRAINT IF EXISTS \"pk\""),
+        "the name-collided UNIQUE must be dropped: {ddl}"
+    );
+    assert!(
+        !ddl.contains("ADD CONSTRAINT \"pk\" PRIMARY KEY"),
+        "no PK may be added while the surviving old_pk covers (id): {ddl}"
+    );
+}
+
+#[test]
+fn test_check_normalizer_preserves_quoted_identifier_case() {
+    // PG only quotes identifiers that need quoting, so "UserID" and userid
+    // are different columns — stripping case here would hide real drift.
+    assert_ne!(
+        normalize_check_predicate("(\"UserID\" > 0)"),
+        normalize_check_predicate("(userid > 0)")
+    );
+    // The same quoted identifier on both sides still matches.
+    assert_eq!(
+        normalize_check_predicate("((\"UserID\" > 0))"),
+        normalize_check_predicate("( \"UserID\" >  0 )")
+    );
+}
+
+#[test]
+fn test_mysql_stale_backing_index_drop_tagged_as_drop_index() {
+    // The injected DROP INDEX must carry ChangeKind::DropIndex, not ride
+    // under DropConstraint, so manifests and down-migration classification
+    // see it for what it is.
+    let source = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["acct_id"], "accounts", &["id"])
+        .build()]);
+    let target = schema_mysql(vec![table("orders")
+        .column(col("user_id").udt("int").build())
+        .column(col("acct_id").udt("int").build())
+        .fk("fk_orders_owner", &["user_id"], "accounts", &["id"])
+        .index("fk_orders_owner", &["user_id"], false)
+        .build()]);
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Mysql));
+    let index_drop = changes
+        .iter()
+        .find(|change| change.sql.contains("DROP INDEX `fk_orders_owner`"))
+        .expect("stale backing index drop present");
+    assert_eq!(index_drop.kind, crate::output::ChangeKind::DropIndex);
+}
