@@ -6,15 +6,17 @@ coverage, but it does not close this gate by itself.
 
 ## Current Status
 
-As of 2026-05-20, this gate has one completed real-schema baseline pass and a
-repeatable schema-drift matrix: the public StackOverflow2010 SQL Server schema
-migrated to SQL Server, PostgreSQL, MySQL, and SQLite targets, then evolved
-through additive, column-change, constraint/index, and destructive drift packs
-until each applicable target converged after each pack. Stable release readiness
-still needs at least one additional independent schema source, or an explicit
-release-note caveat explaining the narrower validation scope. Do not mark the
-gate complete until the result table below contains the required runs and any
-discovered blockers have an issue, fix, or explicit release-note warning.
+As of 2026-07-16, this gate is complete for the v1.7.0 release-candidate line.
+The public StackOverflow2010 SQL Server schema covers the repeatable
+cross-dialect drift matrix, and the independently maintained Pagila PostgreSQL
+schema completed generated-model import, source DDL, snapshot, direct apply,
+versioned migration, and convergence checks from clean candidate commit
+`837c7a305ebdd8693864a0e4ed36482f4a89c44d`. Every Pagila step passed with no
+skips. PostgreSQL object classes outside UVg's current table-oriented DDL scope
+are disclosed in the release notes and tracked in
+[#128](https://github.com/johndauphine/uvg/issues/128). See the
+[Pagila validation record](validation/pagila-v1.7.0-rc.1.md) for the complete
+result and catalog assertions.
 
 ## Schema Source Requirements
 
@@ -155,7 +157,7 @@ A stable release can proceed only when:
 | 2026-05-20 | stackoverflow2010-mssql-to-postgres-default-schemas | SQL Server 2022 source to PostgreSQL 16.13 target | Public StackOverflow2010 database restored locally | Declarative, `Table()`, source DDL, snapshot, diff/apply, post-apply convergence, versioned migration, post-migration convergence | Pass | Bundle: `/tmp/uvg-beta-validation/20260520T095432Z_stackoverflow2010-mssql-to-postgres-default-schemas`; targets: `uvg_so2010_target`, `uvg_so2010_migration`. Need at least one additional independent schema before closing #86. |
 | 2026-05-20 | stackoverflow2010-mssql-to-postgres-delta | SQL Server 2022 source clone to PostgreSQL 16.13 target | Public StackOverflow2010 schema cloned to disposable SQL Server and mutated with additive table, column, constraint, and index changes | Diff/apply from changed SQL Server source into existing PostgreSQL target, direct catalog verification, post-apply convergence | Pass | Delta artifacts: `/tmp/uvg-so2010-delta/delta_fixed.sql`, `/tmp/uvg-so2010-delta/delta_apply_fixed.sql`, `/tmp/uvg-so2010-delta/post_delta_diff_final.sql`; target `uvg_so2010_delta_target` converged with `-- No schema changes detected.` Fixed blockers found during this run: unsafe MSSQL parse-check handling, MSSQL `SYSUTCDATETIME()` default translation, MSSQL Unicode CHECK literal translation, and added constraints/indexes on existing-table diffs. This strengthens the StackOverflow2010 result but does not count as an independent second schema. |
 | 2026-05-20 | stackoverflow2010-drift-matrix | SQL Server 2022 source clone to SQL Server 2022, PostgreSQL 16.13, MySQL 8.0, and SQLite targets | Public StackOverflow2010 schema cloned to disposable SQL Server and evolved through committed drift packs | Baseline convergence, additive drift, column evolution, added constraints/indexes, destructive table/column/index drift, dropped constraints where supported, direct catalog checks after every applicable pack | Pass | Bundle: `/tmp/uvg-stackoverflow-drift-full/20260520T104328Z`; workflow: `.github/workflows/stackoverflow-drift.yml`. SQLite skips table-rebuild-required packs. This is the repeatable drift gate; the workflow runs on demand via `workflow_dispatch` once `STACKOVERFLOW2010_BAK_URL` is configured. |
-| 2026-05-20 | pending-additional-schema | TBD | Awaiting another authorized schema source | TBD | Blocked | Required to satisfy the stable-release gate's independent-schema criterion. |
+| 2026-07-16 | pagila-postgres-v1.7.0-rc.1-final | PostgreSQL 16.14 source to two PostgreSQL 16.14 targets | Public Pagila schema at commit `5ba5a57aeb159f75f02aca2432d3c262186d13d3` | Declarative and `Table()` generation with syntax/import checks, source DDL, snapshot, diff/direct apply, post-apply convergence, versioned migration, current revision, post-migration convergence, and direct catalog assertions | Pass | Clean UVg candidate `837c7a305ebdd8693864a0e4ed36482f4a89c44d`; 18/18 steps passed with zero failures/skips. Bundle: `/tmp/uvg-beta-validation/20260716T220557Z_pagila-postgres-v1.7.0-rc.1-final`. Unsupported PostgreSQL metadata is documented and tracked in #128. [Detailed record](validation/pagila-v1.7.0-rc.1.md). |
 
 ## Issue Triage
 

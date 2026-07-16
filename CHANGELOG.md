@@ -81,7 +81,8 @@ Suggested headings:
   standalone sequence ownership/options. Pagila validation covers the
   supported table, column, constraint, index, enum, generated-model, apply,
   and migration surfaces; the unsupported metadata remains explicitly
-  deferred and must not be described as round-trip fidelity.
+  deferred in [#128](https://github.com/johndauphine/uvg/issues/128) and must
+  not be described as round-trip fidelity.
 
 ## v1.6.0 - 2026-07-08
 
