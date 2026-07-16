@@ -19,6 +19,7 @@ pub use python::{
 pub use schema_info::{
     find_enum_for_column, has_primary_key, is_primary_key_column, is_unique_constraint_index,
 };
+pub(crate) use schema_info::{find_enum_for_ddl_column, is_enum_array_column};
 pub use sql_text::{
     is_auto_increment_column, is_serial_default, is_standard_sequence_name, parse_check_boolean,
     parse_check_enum, parse_sequence_name,

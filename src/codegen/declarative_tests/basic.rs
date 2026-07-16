@@ -128,6 +128,42 @@ fn test_declarative_all_no_pk() {
     assert!(output.contains("Table"));
 }
 
+/// Pagila views have no primary key but still use the native mpaa_rating enum.
+#[test]
+fn test_declarative_no_pk_fallback_native_enum() {
+    use crate::schema::{EnumInfo, TableType};
+
+    let schema = schema_pg_with_enums(
+        vec![table("film_list")
+            .table_type(TableType::View)
+            .column(col("rating").udt("mpaa_rating").nullable().build())
+            .build()],
+        vec![EnumInfo {
+            name: "mpaa_rating".to_string(),
+            schema: Some("public".to_string()),
+            values: vec![
+                "G".to_string(),
+                "PG".to_string(),
+                "PG-13".to_string(),
+                "R".to_string(),
+                "NC-17".to_string(),
+            ],
+        }],
+    );
+    let output = generate(&schema, &GeneratorOptions::default());
+
+    assert_eq!(
+        output
+            .lines()
+            .find(|line| line.contains("Column('rating'"))
+            .expect("rating column"),
+        "    Column('rating', Enum(MpaaRating, values_callable=lambda cls: [member.value for member in cls], name='mpaa_rating', schema='public'))"
+    );
+    assert!(output.contains("class MpaaRating(str, enum.Enum):"));
+    assert!(output.contains("from sqlalchemy import Column, Enum, MetaData, Table"));
+    assert!(!output.contains("MPAA_RATING"));
+}
+
 #[test]
 fn test_declarative_all_no_pk_snapshot() {
     let schema = schema_pg(vec![table("events")
@@ -161,6 +197,19 @@ fn test_declarative_indexes() {
     assert!(output.contains("id: Mapped[int] = mapped_column(Integer, primary_key=True)"));
     assert!(output.contains("number: Mapped[Optional[int]] = mapped_column(Integer)"));
     assert!(output.contains("text: Mapped[Optional[str]] = mapped_column(String)"));
+}
+
+#[test]
+fn test_declarative_single_index_table_args_is_a_tuple() {
+    let schema = schema_pg(vec![table("items")
+        .column(col("id").build())
+        .pk("items_pkey", &["id"])
+        .index("ix_items_id", &["id"], false)
+        .build()]);
+
+    let output = generate(&schema, &GeneratorOptions::default());
+
+    assert!(output.contains("    __table_args__ = (\n        Index('ix_items_id', 'id'),\n    )"));
 }
 
 /// Adapted from sqlacodegen test_table_kwargs.

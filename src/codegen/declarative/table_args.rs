@@ -137,11 +137,15 @@ pub(super) fn build_table_args(
     }
 
     let last = positional_args.len() - 1;
+    // Parentheses alone do not make a Python tuple. A single positional
+    // __table_args__ entry needs its trailing comma or SQLAlchemy receives an
+    // Index/Constraint object instead of the required tuple.
+    let singleton = positional_args.len() == 1;
     let formatted: Vec<String> = positional_args
         .iter()
         .enumerate()
         .map(|(i, a)| {
-            if i < last {
+            if i < last || singleton {
                 format!("        {a},")
             } else {
                 format!("        {a}")

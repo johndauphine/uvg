@@ -87,6 +87,17 @@ fn test_dialect_types() {
     assert_eq!(map_column_type(&col("json")).sa_type, "JSON");
     assert_eq!(map_column_type(&col("inet")).sa_type, "INET");
     assert_eq!(map_column_type(&col("cidr")).sa_type, "CIDR");
+
+    let tsvector = map_column_type(&col("tsvector"));
+    assert_eq!(tsvector.sa_type, "TSVECTOR");
+    assert_eq!(tsvector.import_name, "TSVECTOR");
+    assert_eq!(tsvector.import_module, "sqlalchemy.dialects.postgresql");
+
+    let dialect_tsvector = map_column_type_dialect(&col("tsvector"));
+    assert_eq!(
+        dialect_tsvector.import_module,
+        "sqlalchemy.dialects.postgresql"
+    );
 }
 
 #[test]

@@ -6,6 +6,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use super::actions::{apply_ddl, generate_ddl};
 use super::app::{group_changes, node_detail_line_count, App, AppState};
 use super::render::render;
+use crate::apply::{apply_failure_note, ApplyReport};
 
 pub(super) async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
@@ -37,28 +38,9 @@ pub(super) async fn event_loop(
             AppState::Applying => {
                 let result = apply_ddl(app).await;
                 match result {
-                    Ok(results) => {
-                        let failed = results.iter().find(|r| r.error.is_some());
-                        if let Some(f) = failed {
-                            let applied = results.iter().take_while(|r| r.error.is_none()).count();
-                            app.error_msg = Some(format!(
-                                "Failed on statement {}/{}:\n{}\n\nError: {}",
-                                applied + 1,
-                                results.len(),
-                                f.sql,
-                                f.error.as_ref().unwrap()
-                            ));
-                        } else {
-                            app.success_msg = Some(format!(
-                                "Successfully applied {} statement(s) to target database.",
-                                results.len()
-                            ));
-                        }
-                        app.apply_results = results;
-                        app.state = AppState::Done;
-                    }
+                    Ok(report) => record_apply_report(app, report),
                     Err(e) => {
-                        app.error_msg = Some(format!("Connection error: {e}"));
+                        app.error_msg = Some(format!("Apply blocked or failed: {e}"));
                         app.state = AppState::Done;
                     }
                 }
@@ -93,6 +75,48 @@ pub(super) async fn event_loop(
             }
         }
     }
+}
+
+/// Store a completed shared apply report and translate its safety details into
+/// TUI-owned messages. Keeping this separate from the event loop makes the
+/// alternate-screen behavior directly testable without writing to stderr.
+pub(super) fn record_apply_report(app: &mut App, report: ApplyReport) {
+    app.error_msg = None;
+    app.success_msg = None;
+
+    let parse_notice = report
+        .parse_check
+        .notice()
+        .map(|notice| format!("\n\nNote: {notice}"))
+        .unwrap_or_default();
+    let failed = report
+        .statements
+        .iter()
+        .find(|result| result.error.is_some());
+    if let Some(failed) = failed {
+        let applied = report
+            .statements
+            .iter()
+            .take_while(|result| result.error.is_none())
+            .count();
+        app.error_msg = Some(format!(
+            "Failed on statement {}/{}:\n{}\n\nError: {}{}{}",
+            applied + 1,
+            report.statements.len(),
+            failed.sql,
+            failed.error.as_deref().unwrap_or("unknown database error"),
+            apply_failure_note(&report.statements, 0),
+            parse_notice,
+        ));
+    } else {
+        app.success_msg = Some(format!(
+            "Successfully applied {} statement(s) to target database.{}",
+            report.statements.len(),
+            parse_notice,
+        ));
+    }
+    app.apply_results = report.statements;
+    app.state = AppState::Done;
 }
 
 fn handle_input_keys(app: &mut App, key: KeyCode) {

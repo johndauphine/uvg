@@ -1,6 +1,7 @@
 mod comments;
 mod cycles;
 mod enums;
+mod sequences;
 
 use crate::cli::DdlOptions;
 use crate::codegen::topo_sort_tables;
@@ -19,6 +20,9 @@ use super::render::{generate_create_table, generate_indexes};
 use comments::generate_comments;
 use cycles::detect_fk_cycles;
 use enums::generate_enum_types;
+pub(super) use enums::{generate_enum_type, referenced_enums};
+use sequences::generate_sequences;
+pub(super) use sequences::{generate_sequence, referenced_sequences, shared_sequences};
 
 /// Output from DDL generation.
 pub enum DdlOutput {
@@ -48,6 +52,7 @@ impl DdlGenerator {
         let source_dialect = schema.dialect;
         let target_dialect = options.target_dialect;
         let sorted = topo_sort_tables(&schema.tables);
+        let shared_sequences = shared_sequences(schema);
 
         // Filter to tables only (skip views for DDL)
         let tables: Vec<&&TableInfo> = sorted
@@ -68,13 +73,26 @@ impl DdlGenerator {
             header.push_str("-- WARNING: Circular foreign key dependencies detected.\n-- Some FK constraints may reference tables not yet created.\n-- Consider applying FK constraints separately via ALTER TABLE.\n");
         }
 
-        // Enum types (PG target only)
+        // Schema-scoped dependencies (PG target only). Sequences precede
+        // tables so shared nextval() defaults can retain their original name.
         let enum_stmts = generate_enum_types(schema, target_dialect);
+        let sequence_stmts = generate_sequences(schema, target_dialect);
+        let schema_stmts = sequence_stmts
+            .into_iter()
+            .chain(enum_stmts)
+            .collect::<Vec<_>>();
 
         for table in &tables {
             let mut table_stmts = Vec::new();
 
-            let create = generate_create_table(table, source_dialect, target_dialect, options);
+            let create = generate_create_table(
+                table,
+                source_dialect,
+                target_dialect,
+                options,
+                &shared_sequences,
+                &schema.enums,
+            );
             table_stmts.push(create);
 
             if !options.noindexes {
@@ -102,10 +120,10 @@ impl DdlGenerator {
         if options.split_tables {
             let mut files: Vec<(String, String)> = Vec::new();
 
-            if !enum_stmts.is_empty() {
+            if !schema_stmts.is_empty() {
                 files.push((
                     "_types.sql".to_string(),
-                    format!("{header}\n{}", enum_stmts.join("\n\n")),
+                    format!("{header}\n{}", schema_stmts.join("\n\n")),
                 ));
             }
 
@@ -124,9 +142,9 @@ impl DdlGenerator {
             DdlOutput::Split(files)
         } else {
             let mut full = header;
-            if !enum_stmts.is_empty() {
+            if !schema_stmts.is_empty() {
                 full.push('\n');
-                full.push_str(&enum_stmts.join("\n\n"));
+                full.push_str(&schema_stmts.join("\n\n"));
                 full.push_str("\n\n");
             }
             full.push('\n');

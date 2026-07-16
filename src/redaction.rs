@@ -4,7 +4,7 @@
 /// query-parameter credential keys supported by database drivers. Values
 /// that are not parseable as URLs are returned unchanged; in UVG those are
 /// expected to be SQLite forms that do not carry network credentials.
-pub(crate) fn redact_connection_url(raw: &str) -> String {
+pub fn redact_connection_url(raw: &str) -> String {
     let Ok(mut parsed) = url::Url::parse(raw) else {
         return raw.to_string();
     };

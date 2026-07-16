@@ -61,3 +61,13 @@ fn missing_api_key_is_clear() {
 
     assert!(err.contains("ANTHROPIC_API_KEY is required"));
 }
+
+#[test]
+fn anthropic_config_debug_redacts_api_key() {
+    let config = AnthropicConfig::from_api_key(Some("sk-ant-secret".to_string())).unwrap();
+
+    let debug = format!("{config:?}");
+
+    assert!(!debug.contains("sk-ant-secret"));
+    assert!(debug.contains("api_key: \"***\""));
+}

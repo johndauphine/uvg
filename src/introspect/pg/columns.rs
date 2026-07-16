@@ -11,7 +11,7 @@ pub async fn query_columns(
     let rows = sqlx::query_as::<_, ColumnRow>(
         r#"
         SELECT c.column_name, c.ordinal_position::int4, c.is_nullable = 'YES' AS is_nullable,
-               c.data_type, c.udt_name, c.character_maximum_length::int4,
+               c.data_type, c.udt_name, c.udt_schema, c.character_maximum_length::int4,
                c.numeric_precision::int4, c.numeric_scale::int4, c.column_default,
                c.is_identity = 'YES' AS is_identity, c.identity_generation,
                col_description(
@@ -36,6 +36,7 @@ pub async fn query_columns(
             None
         };
         columns.push(ColumnInfo {
+            udt_schema: row.udt_schema,
             character_maximum_length: row.character_maximum_length,
             numeric_precision: row.numeric_precision,
             numeric_scale: row.numeric_scale,
@@ -97,6 +98,7 @@ struct ColumnRow {
     is_nullable: bool,
     data_type: String,
     udt_name: String,
+    udt_schema: Option<String>,
     character_maximum_length: Option<i32>,
     numeric_precision: Option<i32>,
     numeric_scale: Option<i32>,

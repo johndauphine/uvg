@@ -1,12 +1,17 @@
-use crate::codegen::{is_auto_increment_column, is_primary_key_column};
+use std::collections::BTreeSet;
+
+use crate::codegen::parse_sequence_name;
+use crate::codegen::{
+    is_auto_increment_column, is_enum_array_column, is_primary_key_column, is_serial_default,
+};
 use crate::ddl_typemap;
 use crate::dialect::Dialect;
-use crate::schema::{ColumnInfo, ConstraintInfo};
+use crate::schema::{ColumnInfo, ConstraintInfo, EnumInfo};
 
 use super::defaults::{
     format_ddl_default_typed, reattach_now_family_precision, temporal_precision,
 };
-use super::ident::quote_identifier;
+use super::ident::{qualified_object_name, quote_identifier};
 
 /// Generate a column definition line.
 pub(in crate::codegen) fn generate_column_def(
@@ -14,11 +19,27 @@ pub(in crate::codegen) fn generate_column_def(
     constraints: &[ConstraintInfo],
     source_dialect: Dialect,
     target_dialect: Dialect,
+    shared_sequences: &BTreeSet<String>,
+    enum_info: Option<&EnumInfo>,
 ) -> String {
     let qname = quote_identifier(&col.name, target_dialect);
 
     // Detect auto-increment
     let is_auto = is_auto_increment_column(col, source_dialect);
+    // Re-emitting every PostgreSQL nextval() as SERIAL invents a fresh
+    // table-local sequence. Real schemas (including partitioned Pagila
+    // tables) can intentionally share one sequence, so same-dialect output
+    // preserves the explicit default and creates referenced sequences once at
+    // schema scope.
+    let preserve_pg_sequence = source_dialect == Dialect::Postgres
+        && target_dialect == Dialect::Postgres
+        && col
+            .column_default
+            .as_deref()
+            .filter(|default| is_serial_default(default, source_dialect))
+            .and_then(parse_sequence_name)
+            .is_some_and(|sequence| shared_sequences.contains(&sequence));
+    let render_as_auto = is_auto && !preserve_pg_sequence;
 
     let is_pk = is_primary_key_column(&col.name, constraints);
 
@@ -27,8 +48,23 @@ pub(in crate::codegen) fn generate_column_def(
     let is_boolean = matches!(canonical, crate::ddl_typemap::CanonicalType::Boolean);
 
     // Type
-    let type_str = if is_auto {
+    let type_str = if render_as_auto {
         format_autoincrement_type(col, source_dialect, target_dialect, is_pk)
+    } else if source_dialect.supports_native_enums() && target_dialect.supports_native_enums() {
+        match enum_info {
+            Some(enum_info) => {
+                let mut enum_type = qualified_object_name(
+                    enum_info.schema.as_deref(),
+                    &enum_info.name,
+                    target_dialect,
+                );
+                if is_enum_array_column(col) {
+                    enum_type.push_str("[]");
+                }
+                enum_type
+            }
+            None => ddl_typemap::from_canonical(&canonical, target_dialect).sql_type,
+        }
     } else {
         ddl_typemap::from_canonical(&canonical, target_dialect).sql_type
     };
@@ -36,7 +72,7 @@ pub(in crate::codegen) fn generate_column_def(
     let mut parts = vec![format!("    {qname} {type_str}")];
 
     // NOT NULL (skip for auto-increment PKs where NOT NULL is implied)
-    if !(col.is_nullable || is_auto && is_pk) {
+    if !(col.is_nullable || render_as_auto && is_pk) {
         parts.push("NOT NULL".to_string());
     }
 
@@ -61,7 +97,7 @@ pub(in crate::codegen) fn generate_column_def(
                 | crate::ddl_typemap::CanonicalType::Bytes { length: None }
                 | crate::ddl_typemap::CanonicalType::Array { .. }
         );
-    if !is_auto && !no_default_on_mysql {
+    if !render_as_auto && !no_default_on_mysql {
         if let Some(ref default) = col.column_default {
             let mut ddl_default =
                 format_ddl_default_typed(default, source_dialect, target_dialect, is_boolean);
@@ -83,7 +119,7 @@ pub(in crate::codegen) fn generate_column_def(
     }
 
     // Auto-increment suffix (MySQL, MSSQL, SQLite)
-    if is_auto {
+    if render_as_auto {
         let suffix = format_autoincrement_suffix(col, target_dialect, is_pk);
         if !suffix.is_empty() {
             parts.push(suffix);

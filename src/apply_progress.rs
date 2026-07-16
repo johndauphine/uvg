@@ -1,9 +1,8 @@
 //! Per-statement progress reporting for `--apply` (#45).
 //!
 //! Headless rendering: one stderr line per executed statement plus a
-//! final class-breakdown summary. The TUI's interactive apply path
-//! stays on `tui/mod.rs`; this module is only used by `main.rs`'s
-//! `apply_inline` / `apply_manifest`.
+//! final class-breakdown summary. The shared apply module enables this
+//! reporter for CLI calls and leaves it off when the TUI renders results.
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};

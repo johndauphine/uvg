@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
+pub use crate::connection::ConnectionConfig;
 use crate::dialect::Dialect;
 
 pub const DEFAULT_INTROSPECT_CONCURRENCY: usize = 8;
@@ -49,7 +50,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = crate::apply_progress::ProgressMode::Auto)]
     pub progress: crate::apply_progress::ProgressMode,
 
-    /// Maximum retry attempts per statement on `--apply` for transient
+    /// Maximum retry attempts per statement on CLI or interactive apply for transient
     /// errors (deadlock, lock-wait timeout, brief connection drops).
     /// Logical errors (constraint, syntax, missing column) fail
     /// immediately regardless. `0` disables retry; default `3`.
@@ -57,8 +58,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 3)]
     pub apply_retries: u8,
 
-    /// Skip the parse-check step that runs before `--apply` would
-    /// touch the target. By default uvg pre-validates every DDL
+    /// Skip the parse-check step that runs before a CLI or interactive apply
+    /// would touch the target. By default uvg pre-validates every DDL
     /// statement via the dialect's parse-only mode:
     ///   - PG: savepoint-per-statement inside one outer transaction,
     ///     ROLLBACK at the end. Catches syntax errors AND catalog
@@ -290,68 +291,6 @@ pub struct DdlOptions {
     pub nocomments: bool,
 }
 
-/// Parsed connection configuration.
-#[derive(Debug)]
-pub enum ConnectionConfig {
-    Postgres(String),
-    Mssql {
-        host: String,
-        port: u16,
-        database: String,
-        user: String,
-        password: String,
-        trust_cert: bool,
-    },
-    Mysql(String),
-    Sqlite(String),
-}
-
-/// Best-effort dialect inference from a connection URL's scheme, for
-/// display-only paths (e.g. the TUI statement counter) that hold a raw URL
-/// rather than a parsed [`ConnectionConfig`]. Mirrors the scheme prefixes
-/// accepted by [`Cli::parse_connection`]; defaults to Postgres for
-/// unrecognized or empty input. Not for correctness-critical paths — those
-/// use [`ConnectionConfig::dialect`] on the already-parsed config.
-pub(crate) fn dialect_from_url(url: &str) -> Dialect {
-    let u = url.trim();
-    if u.starts_with("mysql") || u.starts_with("mariadb") {
-        Dialect::Mysql
-    } else if u.starts_with("mssql") || u.starts_with("sqlserver") {
-        Dialect::Mssql
-    } else if u.starts_with("sqlite") {
-        Dialect::Sqlite
-    } else {
-        Dialect::Postgres
-    }
-}
-
-impl ConnectionConfig {
-    pub fn dialect(&self) -> Dialect {
-        match self {
-            ConnectionConfig::Postgres(_) => Dialect::Postgres,
-            ConnectionConfig::Mssql { .. } => Dialect::Mssql,
-            ConnectionConfig::Mysql(_) => Dialect::Mysql,
-            ConnectionConfig::Sqlite(_) => Dialect::Sqlite,
-        }
-    }
-
-    /// Extract the database name from a MySQL connection URL.
-    /// Returns `None` if the URL has no database path or it is empty.
-    pub fn database_name(&self) -> Option<String> {
-        match self {
-            ConnectionConfig::Mysql(url) => url::Url::parse(url).ok().and_then(|u| {
-                let database = u.path().trim_start_matches('/').to_string();
-                if database.is_empty() {
-                    None
-                } else {
-                    Some(database)
-                }
-            }),
-            _ => None,
-        }
-    }
-}
-
 /// Split a comma-delimited CLI value, trimming whitespace and dropping
 /// empty entries. `None` / empty string produce an empty vec.
 fn split_csv(raw: Option<&str>) -> Vec<String> {
@@ -360,21 +299,6 @@ fn split_csv(raw: Option<&str>) -> Vec<String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect()
-}
-
-/// Ensure a MySQL URL includes `charset=utf8mb4` so that `information_schema`
-/// returns proper VARCHAR columns instead of VARBINARY.
-fn ensure_mysql_charset(url: &str) -> String {
-    let Ok(mut parsed) = url::Url::parse(url) else {
-        return url.to_string();
-    };
-
-    let has_charset = parsed.query_pairs().any(|(key, _)| key == "charset");
-    if !has_charset {
-        parsed.query_pairs_mut().append_pair("charset", "utf8mb4");
-    }
-
-    parsed.into()
 }
 
 fn parse_positive_usize(raw: &str) -> Result<usize, String> {
@@ -512,118 +436,7 @@ impl Cli {
         &self,
         url: &str,
     ) -> Result<ConnectionConfig, crate::error::UvgError> {
-        // PostgreSQL schemes
-        if let Some(rest) = url
-            .strip_prefix("postgresql+psycopg2://")
-            .or_else(|| url.strip_prefix("postgresql+asyncpg://"))
-            .or_else(|| url.strip_prefix("postgresql+psycopg://"))
-        {
-            return Ok(ConnectionConfig::Postgres(format!("postgres://{rest}")));
-        }
-        if url.starts_with("postgresql://") || url.starts_with("postgres://") {
-            return Ok(ConnectionConfig::Postgres(url.to_string()));
-        }
-
-        // MSSQL schemes
-        if url.starts_with("mssql://")
-            || url.starts_with("mssql+pytds://")
-            || url.starts_with("mssql+pyodbc://")
-            || url.starts_with("mssql+pymssql://")
-        {
-            return self.parse_mssql_url(url);
-        }
-
-        // MySQL schemes
-        if let Some(rest) = url
-            .strip_prefix("mysql+pymysql://")
-            .or_else(|| url.strip_prefix("mysql+mysqldb://"))
-            .or_else(|| url.strip_prefix("mysql+aiomysql://"))
-            .or_else(|| url.strip_prefix("mysql+asyncmy://"))
-        {
-            return Ok(ConnectionConfig::Mysql(ensure_mysql_charset(&format!(
-                "mysql://{rest}"
-            ))));
-        }
-        if let Some(rest) = url
-            .strip_prefix("mariadb+pymysql://")
-            .or_else(|| url.strip_prefix("mariadb+mysqldb://"))
-        {
-            return Ok(ConnectionConfig::Mysql(ensure_mysql_charset(&format!(
-                "mysql://{rest}"
-            ))));
-        }
-        if let Some(rest) = url.strip_prefix("mariadb://") {
-            return Ok(ConnectionConfig::Mysql(ensure_mysql_charset(&format!(
-                "mysql://{rest}"
-            ))));
-        }
-        if url.starts_with("mysql://") {
-            return Ok(ConnectionConfig::Mysql(ensure_mysql_charset(url)));
-        }
-
-        // SQLite schemes
-        if let Some(rest) = url.strip_prefix("sqlite:///") {
-            // sqlacodegen format: sqlite:///relative or sqlite:////absolute
-            // sqlx format: sqlite:relative or sqlite:///absolute
-            if rest.starts_with('/') {
-                // sqlite:////absolute/path -> sqlite:///absolute/path
-                return Ok(ConnectionConfig::Sqlite(format!("sqlite://{rest}")));
-            }
-            if rest == ":memory:" {
-                return Ok(ConnectionConfig::Sqlite("sqlite::memory:".to_string()));
-            }
-            // sqlite:///relative/path -> sqlite:relative/path
-            return Ok(ConnectionConfig::Sqlite(format!("sqlite:{rest}")));
-        }
-
-        Err(crate::error::UvgError::UnsupportedScheme(
-            url.split("://").next().unwrap_or("unknown").to_string(),
-        ))
-    }
-
-    fn parse_mssql_url(&self, raw: &str) -> Result<ConnectionConfig, crate::error::UvgError> {
-        // Normalize scheme to a url-crate-parseable form
-        let normalized = if let Some(rest) = raw.strip_prefix("mssql+pytds://") {
-            format!("mssql://{rest}")
-        } else if let Some(rest) = raw.strip_prefix("mssql+pyodbc://") {
-            format!("mssql://{rest}")
-        } else if let Some(rest) = raw.strip_prefix("mssql+pymssql://") {
-            format!("mssql://{rest}")
-        } else {
-            raw.to_string()
-        };
-
-        let parsed = url::Url::parse(&normalized)
-            .map_err(|e| crate::error::UvgError::Connection(format!("Invalid MSSQL URL: {e}")))?;
-
-        let host = parsed.host_str().unwrap_or("localhost").to_string();
-        let port = parsed.port().unwrap_or(1433);
-        let database = parsed.path().trim_start_matches('/').to_string();
-        if database.is_empty() {
-            return Err(crate::error::UvgError::Connection(
-                "MSSQL URL must include a database name".to_string(),
-            ));
-        }
-        let user = percent_encoding::percent_decode_str(parsed.username())
-            .decode_utf8_lossy()
-            .into_owned();
-        let password = parsed
-            .password()
-            .map(|p| {
-                percent_encoding::percent_decode_str(p)
-                    .decode_utf8_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_default();
-
-        Ok(ConnectionConfig::Mssql {
-            host,
-            port,
-            database,
-            user,
-            password,
-            trust_cert: self.trust_cert,
-        })
+        crate::connection::parse_connection_url(url, self.trust_cert)
     }
 }
 

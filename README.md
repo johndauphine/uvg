@@ -369,24 +369,26 @@ cargo install --locked cargo-deny
 cargo deny --all-features --locked check advisories licenses bans sources
 ```
 
-Integration tests require a live database (except SQLite which runs in-memory):
+The live integration smoke tests are split into feature-focused test crates.
+PostgreSQL and MySQL introspection require a live database; SQLite runs
+in-memory:
 
 ```bash
-# PostgreSQL
-DATABASE_URL=postgresql://user:pass@localhost/testdb cargo test --test integration -- --ignored
+# PostgreSQL introspection
+DATABASE_URL=postgresql://user:pass@localhost/testdb cargo test --test introspect test_introspect_live_pg -- --ignored
 
 # PostgreSQL versioned migration workflow on a disposable database
-UVG_DISPOSABLE_PG_URL=postgresql://user:pass@localhost/testdb cargo test --test integration test_versioned_migration_live_postgres_workflow_cli -- --ignored
+UVG_DISPOSABLE_PG_URL=postgresql://user:pass@localhost/testdb cargo test --test migrations test_versioned_migration_live_postgres_workflow_cli -- --ignored
 
-# MySQL
-MYSQL_URL=mysql://user:pass@localhost/testdb cargo test --test integration -- --ignored
-
-# Microsoft SQL Server
-DATABASE_URL=mssql://user:pass@localhost/testdb cargo test --test integration -- --ignored
+# MySQL introspection
+MYSQL_URL=mysql://user:pass@localhost/testdb cargo test --test introspect test_introspect_live_mysql -- --ignored
 
 # SQLite (runs automatically, no server needed)
-cargo test --test integration test_introspect_sqlite_in_memory
+cargo test --test introspect test_introspect_sqlite_in_memory
 ```
+
+Microsoft SQL Server end-to-end coverage is provided by the cross-dialect CRM
+matrix below.
 
 ### Cross-dialect matrix
 
@@ -407,7 +409,9 @@ Before calling a release stable, maintainers run UVG against authorized
 real-world schemas and record the outcome in
 [`docs/beta-validation.md`](docs/beta-validation.md). The helper below creates
 a private validation bundle with generated models, DDL, optional diff/apply
-logs, and optional versioned migration logs:
+logs, and optional versioned migration logs. It records the Git commit, UVg
+version, and available database versions, syntax-checks generated Python, and
+imports it when SQLAlchemy is installed:
 
 ```bash
 cargo build --release

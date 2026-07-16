@@ -1,8 +1,10 @@
 use anyhow::Result;
 
 use super::app::{App, TreeNode};
-use crate::cli::{Cli, DdlOptions};
+use crate::apply::{apply_sql, ApplyOptions, ApplyReport};
+use crate::cli::DdlOptions;
 use crate::codegen::ddl_diff::compute_changes;
+use crate::connection::parse_connection_url;
 use crate::db;
 use crate::output::Change;
 
@@ -10,13 +12,10 @@ pub(super) async fn generate_ddl(app: &mut App) -> Result<Vec<Change>> {
     let source_url = app.source_url.trim().to_string();
     let target_url = app.target_url.trim().to_string();
 
-    // Parse connection configs using a helper Cli
-    let source_cli = make_cli(&source_url, app.trust_cert);
-    let source_config = source_cli.parse_connection()?;
+    let source_config = parse_connection_url(&source_url, app.trust_cert)?;
     let source_dialect = source_config.dialect();
 
-    let target_cli = make_cli(&target_url, app.trust_cert);
-    let target_config = target_cli.parse_connection()?;
+    let target_config = parse_connection_url(&target_url, app.trust_cert)?;
     let target_dialect = target_config.dialect();
 
     // Introspect source
@@ -69,16 +68,20 @@ pub(super) async fn generate_ddl(app: &mut App) -> Result<Vec<Change>> {
     ))
 }
 
-pub(super) async fn apply_ddl(app: &mut App) -> Result<Vec<db::StmtResult>> {
+pub(super) async fn apply_ddl(app: &mut App) -> Result<ApplyReport> {
     let target_url = app.target_url.trim().to_string();
-    let config = make_cli(&target_url, app.trust_cert).parse_connection()?;
+    let config = parse_connection_url(&target_url, app.trust_cert)?;
     let sql = collect_apply_sql(&app.nodes);
-    // TUI renders its own per-statement status from the returned
-    // Vec<StmtResult>; the per-statement progress reporter is for the
-    // headless --apply path only (see apply_progress::print_progress).
-    // TUI doesn't take a CLI flag for retries (it's an interactive
-    // path); use the same default the headless --apply does.
-    db::execute_ddl(&config, &sql, 3, |_, _, _| {}).await
+    // The TUI renders its own per-statement status from the returned results,
+    // but validation, parse-check, and retry behavior are exactly the same as
+    // the headless path. CLI flags provided with --interactive are retained.
+    apply_sql(
+        &config,
+        &sql,
+        "interactive ddl",
+        ApplyOptions::new(app.parse_check, app.apply_retries, false),
+    )
+    .await
 }
 
 /// Concatenate the SQL of every checked node into a single blob suitable
@@ -95,34 +98,6 @@ pub(super) fn collect_apply_sql(nodes: &[TreeNode]) -> String {
         }
     }
     parts.join("\n\n")
-}
-
-fn make_cli(url: &str, trust_cert: bool) -> Cli {
-    Cli {
-        command: None,
-        profile: None,
-        url: Some(url.to_string()),
-        target_url: None,
-        generator: "ddl".to_string(),
-        target_dialect: None,
-        split_tables: false,
-        apply: false,
-        progress: crate::apply_progress::ProgressMode::Auto,
-        apply_retries: 3,
-        no_parse_check: false,
-        risk_classify: false,
-        introspect_concurrency: crate::cli::DEFAULT_INTROSPECT_CONCURRENCY,
-        tables: None,
-        exclude_tables: None,
-        schemas: None,
-        noviews: false,
-        options: None,
-        outfile: None,
-        out_dir: None,
-        name: None,
-        trust_cert,
-        interactive: false,
-    }
 }
 
 #[cfg(test)]

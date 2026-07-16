@@ -466,6 +466,51 @@ fn test_reverse_add_column_is_flagged_destructive_but_still_applies() {
 }
 
 #[test]
+fn test_reverse_create_type_drops_the_created_type() {
+    let change = Change {
+        table_schema: "".into(),
+        table_name: None,
+        sql: "CREATE TYPE \"mpaa_rating\" AS ENUM ('G', 'PG');".into(),
+        kind: ChangeKind::CreateType,
+    };
+
+    let down = reverse_change(&change, Dialect::Postgres);
+
+    assert_eq!(down, "DROP TYPE IF EXISTS \"mpaa_rating\";");
+}
+
+#[test]
+fn test_reverse_create_type_preserves_qualified_quoted_name_with_spaces() {
+    let change = Change {
+        table_schema: "billing schema".into(),
+        table_name: None,
+        sql: "CREATE TYPE \"billing schema\".\"review state\" AS ENUM ('open');".into(),
+        kind: ChangeKind::CreateType,
+    };
+
+    let down = reverse_change(&change, Dialect::Postgres);
+
+    assert_eq!(
+        down,
+        "DROP TYPE IF EXISTS \"billing schema\".\"review state\";"
+    );
+}
+
+#[test]
+fn test_reverse_create_sequence_drops_the_created_sequence() {
+    let change = Change {
+        table_schema: String::new(),
+        table_name: None,
+        sql: "CREATE SEQUENCE payment_payment_id_seq;".into(),
+        kind: ChangeKind::CreateSequence,
+    };
+
+    let down = reverse_change(&change, Dialect::Postgres);
+
+    assert_eq!(down, "DROP SEQUENCE IF EXISTS payment_payment_id_seq;");
+}
+
+#[test]
 fn test_reverse_dropped_column_is_irreversible() {
     // A forward DROP COLUMN cannot be reversed (the column definition and its
     // data are gone), so its DOWN must be refused rather than silently applied.
@@ -678,6 +723,123 @@ async fn test_sqlite_apply_migration_executes_up_sql() {
         .unwrap();
     pool.close().await;
     assert_eq!(count, 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn test_migration_safety_validation_rejects_comment_only_plan_before_execution() {
+    let config = ConnectionConfig::Sqlite("sqlite::memory:".to_string());
+    let migration = migration_file(
+        "20260513_193001",
+        "-- WARNING: enum labels differ; manual migration required",
+        Some(""),
+    );
+
+    let error = format!(
+        "{:#}",
+        apply_migration(&config, &migration).await.unwrap_err()
+    );
+
+    assert!(error.contains("failed safety validation"), "{error}");
+    assert!(error.contains("non-executable text"), "{error}");
+}
+
+#[tokio::test]
+async fn test_migration_safety_allows_exact_scaffolded_baseline_noop() {
+    let config = ConnectionConfig::Sqlite("sqlite::memory:".to_string());
+    let mut migration = migration_file(
+        crate::init::BASELINE_REVISION,
+        crate::init::BASELINE_UP_SQL,
+        Some(crate::init::BASELINE_DOWN_SQL),
+    );
+    migration.description = crate::init::BASELINE_DESCRIPTION.to_string();
+
+    apply_migration(&config, &migration).await.unwrap();
+    apply_down_migration(&config, &migration).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_migration_safety_allows_exact_generated_merge_noop() {
+    let config = ConnectionConfig::Sqlite("sqlite::memory:".to_string());
+    let mut migration = migration_file(
+        "20260514_100000",
+        files::GENERATED_MERGE_UP_SQL,
+        Some(files::GENERATED_MERGE_DOWN_SQL),
+    );
+    migration.parents = vec!["20260514_080000".into(), "20260514_090000".into()];
+
+    apply_migration(&config, &migration).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_migration_marker_validation_prevents_partial_execution() {
+    let dir = tmpdir("sqlite-marker-guard");
+    let db_path = dir.join("target.db");
+    fs::File::create(&db_path).unwrap();
+    let config = ConnectionConfig::Sqlite(format!("sqlite://{}", db_path.display()));
+    let migration = migration_file(
+        "20260513_193002",
+        "CREATE TABLE must_not_land(id integer);\n\
+         -- WARNING: SQLite does not support ALTER COLUMN. Table recreation required.",
+        Some(""),
+    );
+
+    let error = apply_migration(&config, &migration)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("failed safety validation"), "{error}");
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'must_not_land'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(count, 0);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn test_migration_blocked_marker_prevents_pre_hook_execution() {
+    let dir = tmpdir("sqlite-blocked-pre-hook-guard");
+    let db_path = dir.join("target.db");
+    fs::File::create(&db_path).unwrap();
+    let config = ConnectionConfig::Sqlite(format!("sqlite://{}", db_path.display()));
+    let mut migration = migration_file(
+        "20260513_193003",
+        "-- UVG-BLOCKED: manual enum replacement required",
+        Some(""),
+    );
+    migration.pre_sql = "CREATE TABLE pre_hook_must_not_land(id integer);".into();
+
+    let error = apply_migration(&config, &migration)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("failed safety validation"), "{error}");
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pre_hook_must_not_land'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(count, 0, "validation must run before PRE hooks");
 
     fs::remove_dir_all(&dir).ok();
 }

@@ -1,6 +1,6 @@
 [package]
 name = "uvg"
-version = "1.6.0"
+version = "1.7.0-rc.1"
 edition = "2021"
 rust-version = "1.82"
 authors = ["John Dauphine <jdauphine@gmail.com>"]

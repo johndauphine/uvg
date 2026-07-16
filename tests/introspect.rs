@@ -1,7 +1,7 @@
 /// Integration tests require a live database.
 /// Set the appropriate env var to run these tests:
-///   DATABASE_URL=postgresql://user:pass@localhost/testdb cargo test --test introspect -- --ignored
-///   MYSQL_URL=mysql://user:pass@localhost/testdb cargo test --test introspect -- --ignored
+///   DATABASE_URL=postgresql://user:pass@localhost/testdb cargo test --test introspect test_introspect_live_pg -- --ignored
+///   MYSQL_URL=mysql://user:pass@localhost/testdb cargo test --test introspect test_introspect_live_mysql -- --ignored
 #[cfg(test)]
 mod tests {
     #[tokio::test]

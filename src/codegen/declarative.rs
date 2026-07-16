@@ -108,9 +108,9 @@ fn parts(schema: &IntrospectedSchema, options: &GeneratorOptions) -> PythonOutpu
     let mut used_enum_names: HashSet<String> = HashSet::new();
 
     for table in &sorted_tables {
-        // Only track enum usage for tables that will render Enum() types
-        // (classes with PK, not fallback Table() or association tables).
-        let renders_enums = has_primary_key(&table.constraints) && !is_association_table(table);
+        // ORM classes and no-PK Table() fallbacks both render Enum() types.
+        // Association tables use their own renderer, which does not yet do so.
+        let renders_enums = !is_association_table(table);
         if renders_enums {
             for col_info in &table.columns {
                 if find_enum_for_column(&col_info.udt_name, &all_enums).is_some() {
@@ -159,8 +159,15 @@ fn parts(schema: &IntrospectedSchema, options: &GeneratorOptions) -> PythonOutpu
             use heck::ToSnakeCase;
             blocks.push((table_to_class_name(&table.name).to_snake_case(), block));
         } else {
-            let block =
-                generate_table_fallback(table, &mut imports, options, schema.dialect, metadata_ref);
+            let block = generate_table_fallback(
+                table,
+                &mut imports,
+                options,
+                schema.dialect,
+                metadata_ref,
+                &all_enums,
+                &synthetic_enum_cols,
+            );
             blocks.push((table_to_variable_name(&table.name), block));
         }
     }

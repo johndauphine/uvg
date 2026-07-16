@@ -33,6 +33,8 @@ Options:
 Environment:
   UVG                        uvg binary path. Defaults to target/release/uvg,
                              then uvg on PATH.
+  PYTHON                     Python interpreter used to validate generated
+                             code. Defaults to python3, then python on PATH.
 
 Examples:
   cargo build --release
@@ -60,6 +62,127 @@ slugify() {
 
 timestamp_utc() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+first_nonempty_line() {
+  awk '
+    NF {
+      gsub(/\r/, "")
+      sub(/^[[:space:]]+/, "")
+      sub(/[[:space:]]+$/, "")
+      print
+      exit
+    }
+  '
+}
+
+database_engine() {
+  case "$1" in
+    postgres://*|postgresql://*|postgresql+*://*) printf 'postgresql' ;;
+    mysql://*|mysql+*://*|mariadb://*|mariadb+*://*) printf 'mysql' ;;
+    sqlite:*|sqlite://*) printf 'sqlite' ;;
+    mssql://*|mssql+*://*|sqlserver://*) printf 'mssql' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+database_engine_name() {
+  case "$1" in
+    postgresql) printf 'PostgreSQL' ;;
+    mysql) printf 'MySQL' ;;
+    sqlite) printf 'SQLite' ;;
+    mssql) printf 'Microsoft SQL Server' ;;
+    *) printf 'Unknown' ;;
+  esac
+}
+
+query_version_with_sqlalchemy() {
+  local url=$1
+  local engine=$2
+  local python_code
+
+  python_code=$(cat <<'PY'
+import os
+
+from sqlalchemy import create_engine, text
+
+queries = {
+    "postgresql": "SHOW server_version",
+    "mysql": "SELECT VERSION()",
+    "sqlite": "SELECT sqlite_version()",
+    "mssql": "SELECT CONVERT(varchar(128), SERVERPROPERTY('ProductVersion'))",
+}
+
+engine_name = os.environ["UVG_METADATA_ENGINE"]
+db = create_engine(os.environ["UVG_METADATA_DATABASE_URL"])
+try:
+    with db.connect() as connection:
+        value = connection.execute(text(queries[engine_name])).scalar()
+        if value is not None:
+            print(value)
+finally:
+    db.dispose()
+PY
+)
+
+  if command -v timeout >/dev/null 2>&1; then
+    UVG_METADATA_DATABASE_URL="$url" UVG_METADATA_ENGINE="$engine" \
+      timeout 10s "$PYTHON_BIN" -c "$python_code"
+  else
+    UVG_METADATA_DATABASE_URL="$url" UVG_METADATA_ENGINE="$engine" \
+      "$PYTHON_BIN" -c "$python_code"
+  fi
+}
+
+database_version() {
+  local url=$1
+  local engine=$2
+  local version=
+  local postgres_url
+
+  # SQLite stores no engine version in the database file. Read a local
+  # library version without opening (and accidentally creating) the path.
+  if [[ "$engine" == "sqlite" ]]; then
+    if command -v sqlite3 >/dev/null 2>&1; then
+      version=$(sqlite3 --version 2>/dev/null | awk '{print $1}') || version=
+    else
+      version=$("$PYTHON_BIN" -c 'import sqlite3; print(sqlite3.sqlite_version)' 2>/dev/null) || version=
+    fi
+  elif [[ $SQLALCHEMY_AVAILABLE -eq 1 && "$engine" != "unknown" ]]; then
+    version=$(query_version_with_sqlalchemy "$url" "$engine" 2>/dev/null) || version=
+  fi
+
+  if [[ -z "$version" ]]; then
+    case "$engine" in
+      postgresql)
+        if command -v psql >/dev/null 2>&1; then
+          postgres_url=$url
+          case "$postgres_url" in
+            postgresql+*://*) postgres_url="postgresql://${postgres_url#*://}" ;;
+          esac
+          version=$(PGCONNECT_TIMEOUT=5 psql "$postgres_url" -X -w -A -t -q \
+            -c 'SHOW server_version' 2>/dev/null) || version=
+        fi
+        ;;
+    esac
+  fi
+
+  version=$(printf '%s\n' "$version" | first_nonempty_line)
+  printf '%s' "${version:-unavailable}"
+}
+
+database_description() {
+  local url=$1
+  local engine version
+
+  if [[ -z "$url" ]]; then
+    printf 'not provided'
+    return
+  fi
+
+  engine=$(database_engine "$url")
+  version=$(database_version "$url" "$engine")
+  printf '%s (version %s)' "$(database_engine_name "$engine")" "$version"
 }
 
 LABEL=
@@ -168,11 +291,52 @@ if [[ -z "$UVG" ]]; then
   fi
 fi
 
+PYTHON_BIN=${PYTHON:-}
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN=$(command -v python3)
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN=$(command -v python)
+  else
+    echo "error: Python not found; it is required to syntax-check generated models" >&2
+    exit 1
+  fi
+elif ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "error: PYTHON does not name an executable: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+SQLALCHEMY_AVAILABLE=0
+if "$PYTHON_BIN" -c 'import sqlalchemy' >/dev/null 2>&1; then
+  SQLALCHEMY_AVAILABLE=1
+fi
+
+UVG_VERSION_OUTPUT=unavailable
+if version_output=$("$UVG" --version 2>/dev/null); then
+  UVG_VERSION_OUTPUT=$(printf '%s\n' "$version_output" | first_nonempty_line)
+  UVG_VERSION_OUTPUT=${UVG_VERSION_OUTPUT:-unavailable}
+fi
+
+GIT_SHA=unavailable
+GIT_WORKTREE=unavailable
+if git_sha=$(git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null); then
+  GIT_SHA=$git_sha
+  if [[ -z "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]]; then
+    GIT_WORKTREE=clean
+  else
+    GIT_WORKTREE=dirty
+  fi
+fi
+
 SLUG=$(slugify "$LABEL")
 if [[ -z "$SLUG" ]]; then
   echo "error: --label must contain at least one alphanumeric, dot, underscore, or dash" >&2
   exit 2
 fi
+
+SOURCE_DATABASE=$(database_description "$SOURCE_URL")
+TARGET_DATABASE=$(database_description "$TARGET_URL")
+MIGRATION_TARGET_DATABASE=$(database_description "$MIGRATION_TARGET_URL")
 
 RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')"
 OUT_DIR="$OUT_ROOT/${RUN_ID}_${SLUG}"
@@ -187,9 +351,15 @@ cat > "$SUMMARY" <<EOF
 
 - Started: $(timestamp_utc)
 - Output bundle: $OUT_DIR
+- Git commit: $GIT_SHA
+- Git worktree: $GIT_WORKTREE
+- UVg version: $UVG_VERSION_OUTPUT
 - Source URL: not recorded by this script
+- Source database: $SOURCE_DATABASE
 - Target URL: $([[ -n "$TARGET_URL" ]] && printf 'provided' || printf 'not provided')
+- Target database: $TARGET_DATABASE
 - Migration target URL: $([[ -n "$MIGRATION_TARGET_URL" ]] && printf 'provided' || printf 'not provided')
+- Migration target database: $MIGRATION_TARGET_DATABASE
 - Target dialect: ${TARGET_DIALECT:-inferred}
 - Schemas: ${SCHEMAS:-default}
 - Tables: ${TABLES:-all}
@@ -225,6 +395,7 @@ fi
 [[ -n "$OPTIONS" ]] && POST_MIGRATION_ARGS+=(--options "$OPTIONS")
 
 fail_count=0
+skip_count=0
 
 run_step() {
   local step=$1
@@ -252,6 +423,23 @@ run_step() {
     printf -- '- `%s`: FAIL in %ss, see `%s`\n' "$step" "$seconds" "$log" >> "$SUMMARY"
     fail_count=$((fail_count + 1))
   fi
+}
+
+skip_step() {
+  local step=$1
+  local artifact=$2
+  local reason=$3
+  local log="$OUT_DIR/logs/${step}.log"
+
+  {
+    echo "step=$step"
+    echo "started_at=$(timestamp_utc)"
+    echo "artifact=$artifact"
+    echo "skipped=$reason"
+  } > "$log"
+  printf '%s\tSKIP\t0\t%s\t%s\n' "$step" "$artifact" "$log" >> "$MANIFEST"
+  printf -- '- `%s`: SKIP (%s)\n' "$step" "$reason" >> "$SUMMARY"
+  skip_count=$((skip_count + 1))
 }
 
 check_no_schema_changes() {
@@ -296,6 +484,33 @@ run_step declarative "$OUT_DIR/declarative.py" \
 
 run_step tables "$OUT_DIR/tables.py" \
   "$UVG" "${COMMON_ARGS[@]}" "$SOURCE_URL" --generator tables --outfile "$OUT_DIR/tables.py"
+
+run_step declarative-syntax "$OUT_DIR/declarative.py" \
+  "$PYTHON_BIN" -c \
+  'from pathlib import Path; import sys; path = Path(sys.argv[1]); compile(path.read_bytes(), str(path), "exec")' \
+  "$OUT_DIR/declarative.py"
+
+run_step tables-syntax "$OUT_DIR/tables.py" \
+  "$PYTHON_BIN" -c \
+  'from pathlib import Path; import sys; path = Path(sys.argv[1]); compile(path.read_bytes(), str(path), "exec")' \
+  "$OUT_DIR/tables.py"
+
+if [[ $SQLALCHEMY_AVAILABLE -eq 1 ]]; then
+  run_step declarative-import "$OUT_DIR/declarative.py" \
+    "$PYTHON_BIN" -c \
+    'import runpy, sys; runpy.run_path(sys.argv[1], run_name="__uvg_validation__"); from sqlalchemy.orm import configure_mappers; configure_mappers()' \
+    "$OUT_DIR/declarative.py"
+
+  run_step tables-import "$OUT_DIR/tables.py" \
+    "$PYTHON_BIN" -c \
+    'import runpy, sys; runpy.run_path(sys.argv[1], run_name="__uvg_validation__")' \
+    "$OUT_DIR/tables.py"
+else
+  skip_step declarative-import "$OUT_DIR/declarative.py" \
+    "SQLAlchemy is not installed for $PYTHON_BIN"
+  skip_step tables-import "$OUT_DIR/tables.py" \
+    "SQLAlchemy is not installed for $PYTHON_BIN"
+fi
 
 run_step source-ddl "$OUT_DIR/source.sql" \
   "$UVG" "${COMMON_ARGS[@]}" "$SOURCE_URL" --generator ddl "${TARGET_DIALECT_ARGS[@]}" --outfile "$OUT_DIR/source.sql"
@@ -346,6 +561,7 @@ cat >> "$SUMMARY" <<EOF
 
 - Finished: $(timestamp_utc)
 - Failed steps: $fail_count
+- Skipped steps: $skip_count
 - Manifest: $MANIFEST
 EOF
 

@@ -24,12 +24,28 @@ pub(in crate::codegen) fn generate_indexes(
             .iter()
             .map(|c| quote_identifier(c, target_dialect))
             .collect();
+        let using = postgres_index_method(idx, target_dialect);
         stmts.push(format!(
-            "CREATE {unique}INDEX {} ON {tname} ({});",
+            "CREATE {unique}INDEX {} ON {tname}{using} ({});",
             quote_identifier(&idx.name, target_dialect),
             cols.join(", ")
         ));
     }
 
     stmts
+}
+
+pub(in crate::codegen) fn postgres_index_method(
+    index: &crate::schema::IndexInfo,
+    target_dialect: Dialect,
+) -> String {
+    if target_dialect != Dialect::Postgres {
+        return String::new();
+    }
+    index
+        .kwargs
+        .get("postgresql_using")
+        .filter(|method| !method.is_empty() && method.as_str() != "btree")
+        .map(|method| format!(" USING {method}"))
+        .unwrap_or_default()
 }

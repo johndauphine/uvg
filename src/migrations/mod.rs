@@ -35,7 +35,7 @@ use self::{
 #[cfg(test)]
 use crate::db;
 
-pub(crate) async fn run(cli: &Cli, command: &Command) -> Result<()> {
+pub async fn run(cli: &Cli, command: &Command) -> Result<()> {
     match command {
         Command::Init(args) => crate::init::run(args),
         Command::Revision(args) => run_revision(cli, args).await,
