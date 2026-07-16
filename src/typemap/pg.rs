@@ -93,6 +93,7 @@ fn dialect_from_canonical(ct: &CanonicalType) -> MappedType {
         CanonicalType::Raw { type_name } => match type_name.as_str() {
             "INET" => simple("INET", "str", PG),
             "CIDR" => simple("CIDR", "str", PG),
+            "TSVECTOR" => simple("TSVECTOR", "str", PG),
             "" => simple("NullType", "str", "sqlalchemy.sql.sqltypes"),
             // Fallback imports from sqlalchemy (not the dialect module) to
             // avoid generating invalid dialect imports.

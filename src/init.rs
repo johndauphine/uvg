@@ -6,8 +6,10 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::cli::InitCommand;
 
-const BASELINE_REVISION: &str = "00000000_000000";
-const BASELINE_DESCRIPTION: &str = "initial baseline";
+pub(crate) const BASELINE_REVISION: &str = "00000000_000000";
+pub(crate) const BASELINE_DESCRIPTION: &str = "initial baseline";
+pub(crate) const BASELINE_UP_SQL: &str = "-- Baseline revision. No SQL is executed.";
+pub(crate) const BASELINE_DOWN_SQL: &str = "-- Baseline downgrade. No SQL is executed.";
 const BASELINE_FILENAME: &str = ".uvg-revision-00000000_000000_initial.sql";
 const META_FILENAME: &str = "meta.yaml";
 /// Sample profile name scaffolded into `profiles.yaml`. Kept in sync with the
@@ -132,9 +134,9 @@ fn baseline_sql() -> String {
          -- parent: \n\
          -- description: {BASELINE_DESCRIPTION}\n\n\
          -- UP\n\
-         -- Baseline revision. No SQL is executed.\n\n\
+         {BASELINE_UP_SQL}\n\n\
          -- DOWN\n\
-         -- Baseline downgrade. No SQL is executed.\n"
+         {BASELINE_DOWN_SQL}\n"
     )
 }
 

@@ -79,7 +79,13 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/uvg.exe" "$name/"
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, NOTICE "$name/"
           Compress-Archive -Path "$name" -DestinationPath "$name.zip"
-          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          $checksum = "$hash  $name.zip`n"
+          [System.IO.File]::WriteAllText(
+            "$name.zip.sha256",
+            $checksum,
+            [System.Text.UTF8Encoding]::new($false)
+          )
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -90,5 +96,7 @@ jobs:
             uvg-*.zip
             uvg-*.zip.sha256
           draft: false
-          prerelease: false
+          # SemVer prerelease tags contain a hyphen (for example,
+          # v1.7.0-rc.1). Stable vX.Y.Z tags do not.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

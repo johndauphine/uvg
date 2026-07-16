@@ -1,10 +1,14 @@
+use clap::Parser;
 use crossterm::event::KeyCode;
+use std::time::Duration;
 
-use super::actions::{collect_apply_sql, count_statements};
+use super::actions::{apply_ddl, collect_apply_sql, count_statements};
 use super::app::{
     group_changes, node_detail_line_count, node_detail_text, App, AppState, TreeNode,
 };
-use super::events::handle_view_keys;
+use super::events::{handle_view_keys, record_apply_report};
+use crate::apply::{ApplyReport, ParseCheckStatus};
+use crate::db::StmtResult;
 use crate::output::Change;
 
 fn ch(schema: &str, table: Option<&str>, sql: &str) -> Change {
@@ -41,9 +45,97 @@ fn view_app(nodes: Vec<TreeNode>) -> App {
         success_msg: None,
         apply_results: Vec::new(),
         trust_cert: false,
+        apply_retries: 3,
+        parse_check: true,
     };
     app.set_nodes(nodes);
     app
+}
+
+fn apply_stmt(error: Option<&str>, rolled_back: bool) -> StmtResult {
+    StmtResult {
+        sql: "CREATE TABLE users(id INTEGER);".to_string(),
+        error: error.map(str::to_string),
+        duration: Duration::from_millis(1),
+        rolled_back,
+    }
+}
+
+#[test]
+fn tui_discloses_partial_state_and_parse_check_skip_without_stderr() {
+    let mut app = view_app(Vec::new());
+    record_apply_report(
+        &mut app,
+        ApplyReport {
+            statements: vec![apply_stmt(None, false), apply_stmt(Some("boom"), false)],
+            parse_check: ParseCheckStatus::SkippedUnsupported,
+        },
+    );
+
+    let message = app.error_msg.as_deref().unwrap();
+    assert!(message.contains("nontransactional"), "{message}");
+    assert!(message.contains("may have persisted"), "{message}");
+    assert!(message.contains("partially migrated"), "{message}");
+    assert!(message.contains("parse-check skipped"), "{message}");
+    assert_eq!(app.apply_results.len(), 2);
+}
+
+#[test]
+fn tui_retains_confirmed_rollback_wording() {
+    let mut app = view_app(Vec::new());
+    record_apply_report(
+        &mut app,
+        ApplyReport {
+            statements: vec![apply_stmt(None, true), apply_stmt(Some("boom"), true)],
+            parse_check: ParseCheckStatus::Passed,
+        },
+    );
+
+    let message = app.error_msg.as_deref().unwrap();
+    assert!(message.contains("rolled back"), "{message}");
+    assert!(message.contains("target is unchanged"), "{message}");
+    assert!(!message.contains("partially migrated"), "{message}");
+    assert!(!message.contains("parse-check skipped"), "{message}");
+}
+
+#[test]
+fn interactive_app_retains_apply_safety_options_from_cli() {
+    let cli = crate::cli::Cli::try_parse_from([
+        "uvg",
+        "--interactive",
+        "--apply-retries",
+        "9",
+        "--no-parse-check",
+        "sqlite:///source.db",
+        "sqlite:///target.db",
+    ])
+    .unwrap();
+
+    let app = App::new(&cli);
+    assert_eq!(app.apply_retries, 9);
+    assert!(!app.parse_check);
+}
+
+#[tokio::test]
+async fn interactive_apply_uses_shared_marker_guard_before_connecting() {
+    let mut app = view_app(vec![TreeNode {
+        name: "users".into(),
+        changes: vec![ch(
+            "",
+            Some("users"),
+            "CREATE TABLE must_not_land(id int);\n\
+             -- WARNING: SQLite does not support ALTER COLUMN. Table recreation required.",
+        )],
+        checked: true,
+    }]);
+    app.target_url = "sqlite:////definitely/missing/target.db".into();
+
+    let error = apply_ddl(&mut app).await.unwrap_err().to_string();
+    assert!(error.contains("refusing to apply"), "{error}");
+    assert!(
+        error.contains("SQLite does not support ALTER COLUMN"),
+        "{error}"
+    );
 }
 
 #[test]

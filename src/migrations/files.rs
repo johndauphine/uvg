@@ -12,6 +12,11 @@ use super::graph::MigrationGraph;
 use super::model::{MigrationFile, MigrationSection};
 use super::render::{render_down_sql, render_up_sql};
 
+pub(super) const GENERATED_MERGE_UP_SQL: &str =
+    "-- Empty merge revision. Branch migrations already carry the SQL.";
+pub(super) const GENERATED_MERGE_DOWN_SQL: &str =
+    "-- Merge downgrade is not automatic because uvg_version tracks one current revision.";
+
 pub(super) fn parse_migration_file(body: &str, path: PathBuf) -> Result<MigrationFile> {
     let mut revision = None;
     let mut parents: Option<Vec<String>> = None;
@@ -186,11 +191,11 @@ pub(super) fn write_merge_revision_file(
         flatten_for_comment(description)
     ));
     body.push_str("-- UP\n");
-    body.push_str("-- Empty merge revision. Branch migrations already carry the SQL.\n\n");
+    body.push_str(GENERATED_MERGE_UP_SQL);
+    body.push_str("\n\n");
     body.push_str("-- DOWN\n");
-    body.push_str(
-        "-- Merge downgrade is not automatic because uvg_version tracks one current revision.\n",
-    );
+    body.push_str(GENERATED_MERGE_DOWN_SQL);
+    body.push('\n');
 
     fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)

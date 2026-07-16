@@ -79,6 +79,11 @@ pub struct ColumnInfo {
     pub is_nullable: bool,
     pub data_type: String,
     pub udt_name: String,
+    /// Schema containing the PostgreSQL user-defined type, when known.
+    /// Optional so snapshots produced before this field was added remain
+    /// readable and non-PostgreSQL dialects do not invent a type schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udt_schema: Option<String>,
     pub character_maximum_length: Option<i32>,
     pub numeric_precision: Option<i32>,
     pub numeric_scale: Option<i32>,
@@ -105,6 +110,7 @@ impl ColumnInfo {
             is_nullable,
             data_type: data_type.into(),
             udt_name: udt_name.into(),
+            udt_schema: None,
             character_maximum_length: None,
             numeric_precision: None,
             numeric_scale: None,

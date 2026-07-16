@@ -1,7 +1,7 @@
-use super::{apply_rollback_note, redact_target_url, validate_apply_blob};
-use crate::db::StmtResult;
-use crate::dialect::Dialect;
 use std::time::Duration;
+use uvg::apply::{apply_rollback_note, redact_target_url, validate_apply_blob};
+use uvg::db::StmtResult;
+use uvg::dialect::Dialect;
 
 fn stmt(error: Option<&str>, rolled_back: bool) -> StmtResult {
     StmtResult {
@@ -13,14 +13,16 @@ fn stmt(error: Option<&str>, rolled_back: bool) -> StmtResult {
 }
 
 #[test]
-fn apply_rollback_note_flags_rolled_back_batches_only() {
+fn apply_rollback_note_discloses_confirmed_and_unconfirmed_outcomes() {
     // Transactional (PostgreSQL) failure: results carry rolled_back -> note.
     let rolled = [stmt(None, true), stmt(Some("boom"), true)];
     assert!(apply_rollback_note(&rolled).contains("rolled back"));
 
-    // Non-transactional failure: earlier statements may have landed -> no note.
+    // Non-transactional failure: earlier statements may have landed -> warn.
     let partial = [stmt(None, false), stmt(Some("boom"), false)];
-    assert_eq!(apply_rollback_note(&partial), "");
+    let note = apply_rollback_note(&partial);
+    assert!(note.contains("may have persisted"), "{note}");
+    assert!(note.contains("partially migrated"), "{note}");
 }
 
 #[test]

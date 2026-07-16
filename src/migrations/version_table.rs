@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 
-use crate::cli::ConnectionConfig;
+use crate::connection::ConnectionConfig;
 
 use super::model::MigrationFile;
 

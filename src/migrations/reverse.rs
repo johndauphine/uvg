@@ -17,6 +17,8 @@ pub(super) fn reverse_change(change: &Change, target_dialect: Dialect) -> String
     };
 
     match change.kind {
+        ChangeKind::CreateSequence => reverse_create_sequence(&statement),
+        ChangeKind::CreateType => reverse_create_type(&statement),
         ChangeKind::CreateTable => reverse_create_table(&statement),
         ChangeKind::CreateIndex => {
             reverse_create_index(&statement, target_dialect).unwrap_or_else(|| {
@@ -63,6 +65,19 @@ pub(super) fn reverse_change(change: &Change, target_dialect: Dialect) -> String
             &change.sql,
         ),
     }
+}
+
+fn reverse_create_sequence(statement: &str) -> String {
+    let rest = statement["CREATE SEQUENCE".len()..].trim();
+    let rest = rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim();
+    let sequence_name = qualified_sql_identifier(rest).unwrap_or(rest);
+    format!("DROP SEQUENCE IF EXISTS {sequence_name};")
+}
+
+fn reverse_create_type(statement: &str) -> String {
+    let rest = statement["CREATE TYPE".len()..].trim();
+    let type_name = qualified_sql_identifier(rest).unwrap_or(rest);
+    format!("DROP TYPE IF EXISTS {type_name};")
 }
 
 fn executable_statement(sql: &str) -> Option<String> {
@@ -148,6 +163,49 @@ pub(super) fn first_sql_token(input: &str) -> Option<&str> {
         _ => input
             .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
             .map(|idx| &input[..idx])
+            .or(Some(input)),
+    }
+}
+
+/// Read a possibly schema-qualified SQL identifier without splitting quoted
+/// components that contain spaces. Generated PostgreSQL types quote each
+/// component independently (`"schema name"."type name"`), so a plain
+/// whitespace split would produce an invalid DOWN statement.
+fn qualified_sql_identifier(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    let first = sql_identifier_component(input)?;
+    let mut end = first.len();
+
+    loop {
+        let remainder = &input[end..];
+        let before_dot = remainder.len() - remainder.trim_start().len();
+        let remainder = &remainder[before_dot..];
+        let Some(after_dot) = remainder.strip_prefix('.') else {
+            break;
+        };
+        let before_component = after_dot.len() - after_dot.trim_start().len();
+        let component_input = &after_dot[before_component..];
+        let Some(component) = sql_identifier_component(component_input) else {
+            break;
+        };
+        end += before_dot + 1 + before_component + component.len();
+    }
+
+    Some(input[..end].trim_end())
+}
+
+fn sql_identifier_component(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    let mut chars = input.char_indices();
+    match chars.next()? {
+        (_, '"') => quoted_sql_token(input, '"'),
+        (_, '`') => quoted_sql_token(input, '`'),
+        (_, '[') => bracketed_sql_token(input),
+        _ => input
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '.' | ';' | ',' | '(' | ')')
+            })
+            .map(|index| &input[..index])
             .or(Some(input)),
     }
 }

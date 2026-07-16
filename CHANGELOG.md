@@ -19,6 +19,71 @@ Suggested headings:
 
 ## Unreleased
 
+## v1.7.0-rc.1 - 2026-07-16
+
+### Added
+
+- Added a reusable library surface for connection parsing and guarded DDL
+  application. The CLI and interactive TUI now share marker validation,
+  parse-check behavior, retry configuration, progress accounting, URL
+  redaction, and rollback/partial-migration reporting. (#108)
+- Added PostgreSQL sequence and index-method fidelity needed by the Pagila
+  real-schema gate: shared `nextval()` sequences retain one identity across
+  tables, and non-btree indexes retain their access method.
+- Added repeatable generated-Python syntax/import checks and database/version
+  metadata to the beta/RC validation helper without persisting connection
+  URLs.
+
+### Fixed
+
+- Fixed PostgreSQL native enum creation in empty-target diffs and generated
+  DOWN migrations for the new schema-scoped operation.
+- Fixed generated SQLAlchemy output for PostgreSQL `TSVECTOR`, native enums in
+  no-primary-key `Table()` fallbacks, positional `Sequence()` arguments, and
+  singleton declarative `__table_args__` tuples. These defects were found by
+  importing models generated from Pagila under SQLAlchemy 2.0.
+- Preserve PostgreSQL GiST index declarations and detect same-named index drift
+  in uniqueness, columns, or access method instead of comparing names alone.
+- Windows release checksum files now use UTF-8 without a BOM and LF line
+  endings, so the documented Unix `shasum -a 256 -c *.sha256` command can
+  verify all platforms together. (#126)
+- Credential-bearing connection and Anthropic configuration values no longer
+  expose secrets through `Debug` formatting; the raw DDL executor is no longer
+  part of the public library API.
+
+### Generated output
+
+- PostgreSQL-to-PostgreSQL DDL now emits one schema-scoped sequence plus exact
+  `nextval()` defaults when multiple columns share a sequence. Ordinary
+  single-owner auto-increment columns continue to use `SERIAL`/`BIGSERIAL`.
+- PostgreSQL index DDL now includes `USING <method>` for non-btree access
+  methods, and generated declarative singleton table arguments carry the
+  required trailing comma.
+
+### Migration output
+
+- Empty-target PostgreSQL revisions create shared sequences and native enum
+  types before dependent tables. Their generated DOWN sections reverse those
+  schema-scoped creations after dependent tables are removed.
+
+### Release
+
+- Prerelease versions and promotion are documented, and hyphenated SemVer tags
+  such as `v1.7.0-rc.1` are automatically marked as GitHub prereleases.
+- Release-candidate validation now uses the independently maintained Pagila
+  schema in addition to the StackOverflow2010 drift matrix. See
+  `docs/beta-validation.md` for the recorded gate result.
+
+### Known limitations
+
+- PostgreSQL DDL generation does not yet preserve domain definitions,
+  partition attachments/bounds, view definitions, routines, triggers, or
+  standalone sequence ownership/options. Pagila validation covers the
+  supported table, column, constraint, index, enum, generated-model, apply,
+  and migration surfaces; the unsupported metadata remains explicitly
+  deferred in [#128](https://github.com/johndauphine/uvg/issues/128) and must
+  not be described as round-trip fidelity.
+
 ## v1.6.0 - 2026-07-08
 
 ### Added

@@ -1,39 +1,17 @@
-mod apply_progress;
-mod cli;
-mod codegen;
-mod db;
-mod ddl_typemap;
-mod dialect;
-mod error;
-mod init;
-mod introspect;
-mod migrations;
-mod naming;
-mod output;
-mod profile;
-mod redaction;
-mod risk_classify;
-mod schema;
-mod snapshot;
-mod table_filter;
-#[cfg(test)]
-mod testutil;
-mod tui;
-mod typemap;
-
 use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Command, ConnectionConfig, GeneratorOptions, SnapshotCommand};
-use crate::codegen::ddl_diff::{compute_changes, render_changes};
-use crate::codegen::{declarative, tables};
-use crate::dialect::Dialect;
-use crate::output::{apply_order, write_split_changes, Manifest, OutputContext};
-use crate::schema::{IntrospectedSchema, TableType};
-use crate::table_filter::TableFilter;
+use uvg::apply::{apply_inline, apply_manifest, ApplyOptions};
+use uvg::cli::{Cli, Command, ConnectionConfig, GeneratorOptions, SnapshotCommand};
+use uvg::codegen::ddl_diff::{compute_changes, render_changes};
+use uvg::codegen::{declarative, tables};
+use uvg::output::{write_split_changes, OutputContext};
+use uvg::schema::{IntrospectedSchema, TableType};
+use uvg::table_filter::TableFilter;
+use uvg::{db, error, migrations, risk_classify, snapshot, tui};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -89,7 +67,7 @@ async fn main() -> Result<()> {
             }
         }
         "ddl" => {
-            use crate::codegen::ddl::{DdlGenerator, DdlOutput};
+            use uvg::codegen::ddl::{DdlGenerator, DdlOutput};
 
             // --apply needs a target to execute against. Fail fast before we
             // do any work the user would have to throw away.
@@ -158,9 +136,11 @@ async fn main() -> Result<()> {
                                     &manifest,
                                     out_dir,
                                     target_url,
-                                    cli.progress.resolved(),
-                                    cli.apply_retries,
-                                    !cli.no_parse_check,
+                                    ApplyOptions::new(
+                                        !cli.no_parse_check,
+                                        cli.apply_retries,
+                                        cli.progress.resolved(),
+                                    ),
                                 )
                                 .await?;
                             }
@@ -187,9 +167,11 @@ async fn main() -> Result<()> {
                         &target_config,
                         &content,
                         target_url,
-                        cli.progress.resolved(),
-                        cli.apply_retries,
-                        !cli.no_parse_check,
+                        ApplyOptions::new(
+                            !cli.no_parse_check,
+                            cli.apply_retries,
+                            cli.progress.resolved(),
+                        ),
                     )
                     .await?;
                 }
@@ -211,9 +193,11 @@ async fn main() -> Result<()> {
                             &target_config,
                             &content,
                             target_url,
-                            cli.progress.resolved(),
-                            cli.apply_retries,
-                            !cli.no_parse_check,
+                            ApplyOptions::new(
+                                !cli.no_parse_check,
+                                cli.apply_retries,
+                                cli.progress.resolved(),
+                            ),
                         )
                         .await?;
                     }
@@ -323,7 +307,7 @@ fn validate_apply_cli(cli: &Cli) -> Result<()> {
     }
     if let Some(target_dialect) = cli.target_dialect.as_deref() {
         let explicit = target_dialect
-            .parse::<crate::dialect::Dialect>()
+            .parse::<uvg::dialect::Dialect>()
             .map_err(error::UvgError::InvalidDialect)?;
         let url_dialect = cli.parse_target_connection(target_url)?.dialect();
         if explicit != url_dialect {
@@ -340,8 +324,8 @@ fn validate_apply_cli(cli: &Cli) -> Result<()> {
 
 async fn classify_or_warn(
     cli: &Cli,
-    changes: Vec<crate::output::Change>,
-) -> Result<Vec<crate::output::Change>> {
+    changes: Vec<uvg::output::Change>,
+) -> Result<Vec<uvg::output::Change>> {
     if !cli.risk_classify {
         return Ok(changes);
     }
@@ -375,247 +359,6 @@ fn write_split_output(files: &[(String, String)], outfile: &Option<String>) -> a
                 print!("{content}");
             }
         }
-    }
-    Ok(())
-}
-
-/// Strip credentials from a connection URL before it lands in a stderr
-/// message. Database URLs commonly carry credentials in userinfo or
-/// query parameters; emitting them verbatim leaks secrets into CI logs
-/// and terminal scrollback. Best-effort: a URL the `url` crate can't
-/// parse (e.g. `sqlite:relative/path`) is returned unchanged, since
-/// those forms don't carry network credentials.
-fn redact_target_url(raw: &str) -> String {
-    redaction::redact_connection_url(raw)
-}
-
-/// Run the per-dialect parse-check probe. Aborts with all collected
-/// parse errors on any failure (not just the first) so the user can
-/// fix everything in one round. Silently skipped on dialects that
-/// don't support parse-only mode (MySQL, SQLite) — print a one-line
-/// note instead of aborting, since the apply will still surface real
-/// errors at exec time and we don't want to falsely block on dialects
-/// we just can't probe.
-async fn run_parse_check(config: &ConnectionConfig, content: &str) -> Result<()> {
-    if !db::supports_parse_check(config) {
-        eprintln!(
-            "uvg: parse-check skipped (no parse-only mode for this dialect; pass --no-parse-check to silence)"
-        );
-        return Ok(());
-    }
-    let errors = db::parse_check_ddl(config, content).await?;
-    if errors.is_empty() {
-        return Ok(());
-    }
-    // Compose a multi-line error report so every parse failure shows
-    // up at once, not just the first one. Each entry includes the
-    // SQL preview (truncated like the progress line) plus the raw
-    // dialect error.
-    let mut msg = format!(
-        "uvg: parse-check found {} error(s) before applying — fix and retry, or pass --no-parse-check to skip:\n",
-        errors.len()
-    );
-    for (i, e) in errors.iter().enumerate() {
-        let collapsed: String = e.sql.split_whitespace().collect::<Vec<_>>().join(" ");
-        let preview = if collapsed.chars().count() > 120 {
-            let cut: String = collapsed.chars().take(117).collect();
-            format!("{cut}...")
-        } else {
-            collapsed
-        };
-        msg.push_str(&format!(
-            "  [{}/{}] {}\n      {}\n",
-            i + 1,
-            errors.len(),
-            preview,
-            e.error,
-        ));
-    }
-    Err(anyhow::anyhow!(msg))
-}
-
-const UNAPPLIABLE_MARKERS: &[&str] = &[
-    "-- WARNING: SQLite does not support ALTER COLUMN",
-    "-- NOTE: MSSQL requires dropping the named default constraint",
-    "-- DROPPED CHECK ",
-];
-
-fn validate_apply_blob(sql: &str, source_label: &str, dialect: Dialect) -> Result<()> {
-    if let Some(marker) = UNAPPLIABLE_MARKERS
-        .iter()
-        .find(|marker| sql.contains(*marker))
-    {
-        return Err(anyhow::anyhow!(
-            "refusing to apply ({source_label}): contains an instruction uvg cannot execute on its own:\n  {marker}\n\
-             Inspect the full diff with `--outfile` or `--out-dir` and apply the actionable parts \
-             manually so the target doesn't end up partially migrated."
-        ));
-    }
-
-    let statements = db::split_statements(sql, dialect);
-    if statements.is_empty() {
-        let trimmed = sql.trim();
-        let is_noop_sentinel =
-            trimmed.is_empty() || trimmed.starts_with("-- No schema changes detected");
-        if !is_noop_sentinel {
-            return Err(anyhow::anyhow!(
-                "refusing to apply ({source_label}): produced changes but they're all non-executable text. \
-                 Inspect with `--outfile` or `--out-dir` and apply the actionable parts by hand."
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Apply a freshly-rendered diff (single SQL blob) against `config`.
-/// Empty diffs report "no schema changes" and succeed; first failed
-/// statement bubbles up as a non-zero exit. `target_url` is redacted
-/// before being printed. When `progress_enabled` is true, one
-/// `[i/total] <preview>  <ms>ms` line is emitted per statement and a
-/// class-breakdown summary follows.
-async fn apply_inline(
-    config: &ConnectionConfig,
-    content: &str,
-    target_url: &str,
-    progress_enabled: bool,
-    max_retries: u8,
-    parse_check: bool,
-) -> Result<()> {
-    validate_apply_blob(content, "inline ddl", config.dialect())?;
-    if parse_check {
-        run_parse_check(config, content).await?;
-    }
-    let mut stats = apply_progress::ApplyStats::new();
-    let results = {
-        let observer = |r: &db::StmtResult, i: usize, total: usize| {
-            if progress_enabled {
-                apply_progress::print_progress(r, i, total);
-            }
-            stats.record(r);
-        };
-        db::execute_ddl(config, content, max_retries, observer).await?
-    };
-    if results.is_empty() {
-        eprintln!("uvg: no schema changes");
-        return Ok(());
-    }
-    let label = redact_target_url(target_url);
-    let applied = results.iter().take_while(|r| r.error.is_none()).count();
-    if let Some(failed) = results.iter().find(|r| r.error.is_some()) {
-        return Err(anyhow::anyhow!(
-            "uvg: apply failed on statement {}/{} against {}: {}{}\n--- SQL ---\n{}",
-            applied + 1,
-            results.len(),
-            label,
-            failed.error.as_deref().unwrap_or(""),
-            apply_rollback_note(&results),
-            failed.sql,
-        ));
-    }
-    eprintln!("uvg: applied {} statement(s) to {}", applied, label);
-    if progress_enabled {
-        eprintln!("{}", stats.render_summary());
-    }
-    Ok(())
-}
-
-/// Trailing note appended to an apply failure message. When the failed batch
-/// ran transactionally (PostgreSQL) it was rolled back, so the target is
-/// unchanged; otherwise earlier statements may have landed.
-fn apply_rollback_note(results: &[db::StmtResult]) -> &'static str {
-    if results.iter().any(|r| r.rolled_back) {
-        "\n(the apply ran in a transaction and was rolled back; the target is unchanged)"
-    } else {
-        ""
-    }
-}
-
-/// Apply a manifest's per-table files in `apply_order` (schema-scoped
-/// first, then tables in topo order). Each file is parsed and executed
-/// independently so the error message can pinpoint which file failed.
-/// `target_url` is redacted before being printed. `progress_enabled`
-/// behaves the same as `apply_inline`: per-statement lines + a single
-/// final class-breakdown summary across ALL files (not per file).
-async fn apply_manifest(
-    config: &ConnectionConfig,
-    manifest: &Manifest,
-    out_dir: &std::path::Path,
-    target_url: &str,
-    progress_enabled: bool,
-    max_retries: u8,
-    parse_check: bool,
-) -> Result<()> {
-    let paths = apply_order(manifest, out_dir);
-    let contents = paths
-        .iter()
-        .map(|path| fs::read_to_string(path).map(|content| (path.clone(), content)))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    for (path, content) in &contents {
-        validate_apply_blob(content, &path.display().to_string(), config.dialect())?;
-    }
-
-    let mut total_applied = 0usize;
-    let mut stats = apply_progress::ApplyStats::new();
-    if parse_check {
-        // Concatenate every file's contents and parse-check the whole
-        // batch in one pass. Per-statement parse errors carry the SQL
-        // text so the user can still locate the offending statement
-        // even though the file boundary is lost in the error list.
-        let combined = contents
-            .iter()
-            .map(|(_, content)| {
-                let mut content = content.clone();
-                content.push('\n');
-                content
-            })
-            .collect::<String>();
-        run_parse_check(config, &combined).await?;
-    }
-    for (path, content) in &contents {
-        let results = {
-            let observer = |r: &db::StmtResult, i: usize, total: usize| {
-                if progress_enabled {
-                    apply_progress::print_progress(r, i, total);
-                }
-                stats.record(r);
-            };
-            db::execute_ddl(config, content, max_retries, observer).await?
-        };
-        let applied_here = results.iter().take_while(|r| r.error.is_none()).count();
-        if let Some(failed) = results.iter().find(|r| r.error.is_some()) {
-            // Each file is applied in its own transaction, so a rollback here
-            // only guarantees THIS file is unchanged — earlier files in the run
-            // may already have committed. Scope the note accordingly.
-            let note = if results.iter().any(|r| r.rolled_back) {
-                if total_applied > 0 {
-                    "\n(this file's transaction was rolled back, but earlier files in this run \
-                     were already applied — the target is partially migrated; verify before retrying)"
-                } else {
-                    "\n(the apply ran in a transaction and was rolled back; the target is unchanged)"
-                }
-            } else {
-                ""
-            };
-            return Err(anyhow::anyhow!(
-                "uvg: apply failed in {} (statement {}/{}): {}{}\n--- SQL ---\n{}",
-                path.display(),
-                applied_here + 1,
-                results.len(),
-                failed.error.as_deref().unwrap_or(""),
-                note,
-                failed.sql,
-            ));
-        }
-        total_applied += applied_here;
-    }
-    eprintln!(
-        "uvg: applied {} statement(s) across {} file(s) to {}",
-        total_applied,
-        paths.len(),
-        redact_target_url(target_url),
-    );
-    if progress_enabled {
-        eprintln!("{}", stats.render_summary());
     }
     Ok(())
 }

@@ -2,14 +2,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::cli::{ConnectionConfig, GeneratorOptions};
+use crate::cli::GeneratorOptions;
+use crate::connection::ConnectionConfig;
 use crate::dialect::Dialect;
 use crate::introspect;
 use crate::schema::IntrospectedSchema;
 use crate::table_filter::TableFilter;
 
 /// Introspect a database given a ConnectionConfig.
-pub(crate) async fn introspect_with_config(
+pub async fn introspect_with_config(
     config: ConnectionConfig,
     schemas: &[String],
     table_filter: &TableFilter,
@@ -85,7 +86,8 @@ fn pool_size(concurrency: usize) -> u32 {
 }
 
 /// Result of executing a single DDL statement.
-pub(crate) struct StmtResult {
+#[derive(Debug)]
+pub struct StmtResult {
     pub sql: String,
     pub error: Option<String>,
     /// Wall-clock time the statement took to execute on the target.
@@ -123,7 +125,7 @@ pub(crate) struct StmtResult {
 ///
 /// Leading comment-only/blank lines are stripped from each statement chunk so
 /// header comments don't become empty executions.
-pub(crate) fn split_statements(ddl: &str, dialect: Dialect) -> Vec<String> {
+pub fn split_statements(ddl: &str, dialect: Dialect) -> Vec<String> {
     // Only the active dialect's identifier quote style is tracked; the other
     // quote characters are ordinary text (e.g. `[` in PostgreSQL arrays).
     let (double_quote_ident, backtick_ident, bracket_ident) = match dialect {
@@ -335,7 +337,8 @@ fn strip_leading_comments(s: &str) -> Option<String> {
 }
 
 /// One statement-level parse error from `parse_check_ddl`.
-pub(crate) struct ParseError {
+#[derive(Debug)]
+pub struct ParseError {
     pub sql: String,
     pub error: String,
 }
@@ -348,7 +351,7 @@ pub(crate) struct ParseError {
 /// parse-only mode (DDL auto-commits and there's no equivalent of
 /// `SET PARSEONLY`), and SQLite's `EXPLAIN` doesn't cover most DDL —
 /// those dialects skip silently per #44.
-pub(crate) fn supports_parse_check(config: &ConnectionConfig) -> bool {
+pub fn supports_parse_check(config: &ConnectionConfig) -> bool {
     config.dialect().supports_parse_check()
 }
 
@@ -361,10 +364,7 @@ pub(crate) fn supports_parse_check(config: &ConnectionConfig) -> bool {
 /// Caller decides what to do with parse errors. The apply path aborts
 /// with the full list rather than only the first, so the user can
 /// fix all issues in one round.
-pub(crate) async fn parse_check_ddl(
-    config: &ConnectionConfig,
-    ddl: &str,
-) -> Result<Vec<ParseError>> {
+pub async fn parse_check_ddl(config: &ConnectionConfig, ddl: &str) -> Result<Vec<ParseError>> {
     let statements = split_statements(ddl, config.dialect());
     let mut errors = Vec::new();
 
@@ -482,9 +482,9 @@ pub(crate) async fn parse_check_ddl(
         }
         ConnectionConfig::Mysql(_) | ConnectionConfig::Sqlite(_) => {
             // No parse-only mode. Caller is expected to gate this
-            // path with `supports_parse_check` and decide whether to
-            // skip silently or emit an info note. The apply path
-            // prints a one-line note rather than aborting.
+            // path with `supports_parse_check`; guarded apply returns
+            // a status so each caller can render the skip notice in
+            // its own output surface rather than aborting.
         }
     }
 

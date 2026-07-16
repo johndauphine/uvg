@@ -1,6 +1,9 @@
 use super::*;
 use crate::cli::DdlOptions;
-use crate::testutil::{col, schema_mssql, schema_mysql, schema_pg, schema_sqlite, table};
+use crate::schema::EnumInfo;
+use crate::testutil::{
+    col, schema_mssql, schema_mysql, schema_pg, schema_pg_with_enums, schema_sqlite, table,
+};
 
 fn default_options(target: Dialect) -> DdlOptions {
     DdlOptions {
@@ -22,6 +25,357 @@ fn test_diff_new_table() {
     let target = schema_pg(vec![]);
     let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
     assert!(ddl.contains("CREATE TABLE \"users\""));
+}
+
+#[test]
+fn test_diff_creates_postgres_enum_before_table_that_uses_it() {
+    let enum_info = EnumInfo {
+        name: "mpaa_rating".to_string(),
+        schema: Some("public".to_string()),
+        values: vec!["G".to_string(), "PG-13".to_string()],
+    };
+    let source = schema_pg_with_enums(
+        vec![table("film")
+            .column(col("id").build())
+            .column(
+                col("rating")
+                    .udt("mpaa_rating")
+                    .udt_schema("public")
+                    .data_type("USER-DEFINED")
+                    .nullable()
+                    .build(),
+            )
+            .pk("film_pkey", &["id"])
+            .build()],
+        vec![enum_info.clone()],
+    );
+    let target = schema_pg(vec![]);
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Postgres));
+
+    assert_eq!(changes[0].kind, crate::output::ChangeKind::CreateType);
+    assert_eq!(
+        changes[0].sql,
+        "CREATE TYPE \"public\".\"mpaa_rating\" AS ENUM ('G', 'PG-13');"
+    );
+    assert_eq!(changes[1].kind, crate::output::ChangeKind::CreateTable);
+    assert!(changes[1]
+        .sql
+        .contains("\"rating\" \"public\".\"mpaa_rating\""));
+
+    let target_with_enum = schema_pg_with_enums(vec![], vec![enum_info]);
+    let ddl = diff_schemas(
+        &source,
+        &target_with_enum,
+        &default_options(Dialect::Postgres),
+    );
+    assert_eq!(ddl.matches("CREATE TYPE").count(), 0, "{ddl}");
+}
+
+#[test]
+fn test_diff_enum_identity_is_schema_scoped_and_unused_enum_is_filtered() {
+    let source = schema_pg_with_enums(
+        vec![table("events")
+            .schema("a")
+            .column(col("id").build())
+            .column(
+                col("status")
+                    .udt("status")
+                    .udt_schema("a")
+                    .data_type("USER-DEFINED")
+                    .build(),
+            )
+            .pk("events_pkey", &["id"])
+            .build()],
+        vec![
+            EnumInfo {
+                name: "status".to_string(),
+                schema: Some("a".to_string()),
+                values: vec!["open".to_string()],
+            },
+            EnumInfo {
+                name: "status".to_string(),
+                schema: Some("b".to_string()),
+                values: vec!["unrelated".to_string()],
+            },
+        ],
+    );
+    let target = schema_pg_with_enums(
+        vec![],
+        vec![EnumInfo {
+            name: "status".to_string(),
+            schema: Some("b".to_string()),
+            values: vec!["unrelated".to_string()],
+        }],
+    );
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Postgres));
+    let type_changes: Vec<&crate::output::Change> = changes
+        .iter()
+        .filter(|change| change.kind == crate::output::ChangeKind::CreateType)
+        .collect();
+
+    assert_eq!(type_changes.len(), 1, "changes: {changes:#?}");
+    assert!(type_changes[0]
+        .sql
+        .starts_with("CREATE TYPE \"a\".\"status\" AS ENUM"));
+    assert!(!changes
+        .iter()
+        .any(|change| change.sql.contains("\"b\".\"status\"")));
+}
+
+#[test]
+fn test_diff_does_not_create_unreferenced_enum() {
+    let users = table("users")
+        .column(col("id").build())
+        .pk("users_pkey", &["id"])
+        .build();
+    let source = schema_pg_with_enums(
+        vec![users.clone()],
+        vec![EnumInfo {
+            name: "orphan_state".to_string(),
+            schema: Some("public".to_string()),
+            values: vec!["unused".to_string()],
+        }],
+    );
+    let target = schema_pg(vec![users]);
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Postgres));
+
+    assert!(changes.is_empty(), "changes: {changes:#?}");
+}
+
+#[test]
+fn test_diff_treats_missing_enum_schema_as_postgres_default() {
+    let table = table("events")
+        .column(col("id").build())
+        .column(
+            col("status")
+                .udt("status")
+                .data_type("USER-DEFINED")
+                .build(),
+        )
+        .pk("events_pkey", &["id"])
+        .build();
+    let source = schema_pg_with_enums(
+        vec![table.clone()],
+        vec![EnumInfo {
+            name: "status".to_string(),
+            schema: None,
+            values: vec!["open".to_string(), "closed".to_string()],
+        }],
+    );
+    let target = schema_pg_with_enums(
+        vec![table],
+        vec![EnumInfo {
+            name: "status".to_string(),
+            schema: Some("public".to_string()),
+            values: vec!["open".to_string(), "closed".to_string()],
+        }],
+    );
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Postgres));
+
+    assert!(changes.is_empty(), "changes: {changes:#?}");
+}
+
+#[test]
+fn test_diff_blocks_existing_postgres_enum_column_identity_drift() {
+    let desired_enum = EnumInfo {
+        name: "order status".to_string(),
+        schema: Some("tenant \"types".to_string()),
+        values: vec!["open".to_string(), "closed".to_string()],
+    };
+    let current_enum = EnumInfo {
+        name: "order status".to_string(),
+        schema: Some("legacy types".to_string()),
+        values: desired_enum.values.clone(),
+    };
+    let source = schema_pg_with_enums(
+        vec![
+            table("events")
+                .column(col("id").build())
+                .column(
+                    col("status")
+                        .udt("order status")
+                        .udt_schema("tenant \"types")
+                        .data_type("USER-DEFINED")
+                        .build(),
+                )
+                .pk("events_pkey", &["id"])
+                .build(),
+            table("audit_log")
+                .column(col("id").build())
+                .pk("audit_log_pkey", &["id"])
+                .build(),
+        ],
+        vec![desired_enum.clone()],
+    );
+    // Both types already exist on the target, but the column is bound to the
+    // same-named enum in the wrong schema. A generic cast is not safe for all
+    // data/default/shape combinations, so the entire plan must be withheld.
+    let target = schema_pg_with_enums(
+        vec![table("events")
+            .column(col("id").build())
+            .column(
+                col("status")
+                    .udt("order status")
+                    .udt_schema("legacy types")
+                    .data_type("USER-DEFINED")
+                    .build(),
+            )
+            .pk("events_pkey", &["id"])
+            .build()],
+        vec![desired_enum, current_enum],
+    );
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Postgres));
+
+    assert_eq!(changes.len(), 1, "changes: {changes:#?}");
+    assert_eq!(changes[0].kind, crate::output::ChangeKind::Other);
+    assert_eq!(
+        changes[0].sql,
+        "-- UVG-BLOCKED: PostgreSQL enum column type drift for \"public\".\"events\".\"status\"\n\
+         -- Desired source type: \"tenant \"\"types\".\"order status\"\n\
+         -- Current target type: \"legacy types\".\"order status\"\n\
+         -- uvg will not alter enum column identity automatically: distinct enums require explicit data casts, defaults are converted separately, and array or scalar-shape changes may need custom transforms.\n\
+         -- Migrate this column manually to the exact desired enum type, then rerun uvg. Other schema changes are withheld."
+    );
+    assert!(changes[0].sql.lines().all(|line| line.starts_with("--")));
+    assert!(!changes[0].sql.contains("CREATE TABLE \"audit_log\""));
+}
+
+#[test]
+fn test_diff_blocks_existing_postgres_enum_array_identity_drift() {
+    let desired_enum = EnumInfo {
+        name: "order status".to_string(),
+        schema: Some("tenant types".to_string()),
+        values: vec!["open".to_string(), "closed".to_string()],
+    };
+    let current_enum = EnumInfo {
+        name: "order status".to_string(),
+        schema: Some("legacy types".to_string()),
+        values: desired_enum.values.clone(),
+    };
+    let source = schema_pg_with_enums(
+        vec![table("events")
+            .column(col("id").build())
+            .column(
+                col("statuses")
+                    .udt("_order status")
+                    .udt_schema("tenant types")
+                    .data_type("ARRAY")
+                    .build(),
+            )
+            .pk("events_pkey", &["id"])
+            .build()],
+        vec![desired_enum.clone()],
+    );
+    let target = schema_pg_with_enums(
+        vec![table("events")
+            .column(col("id").build())
+            .column(
+                col("statuses")
+                    .udt("_order status")
+                    .udt_schema("legacy types")
+                    .data_type("ARRAY")
+                    .build(),
+            )
+            .pk("events_pkey", &["id"])
+            .build()],
+        vec![desired_enum, current_enum],
+    );
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Postgres));
+
+    assert_eq!(changes.len(), 1, "changes: {changes:#?}");
+    assert_eq!(changes[0].kind, crate::output::ChangeKind::Other);
+    assert_eq!(
+        changes[0].sql,
+        "-- UVG-BLOCKED: PostgreSQL enum column type drift for \"public\".\"events\".\"statuses\"\n\
+         -- Desired source type: \"tenant types\".\"order status\"[]\n\
+         -- Current target type: \"legacy types\".\"order status\"[]\n\
+         -- uvg will not alter enum column identity automatically: distinct enums require explicit data casts, defaults are converted separately, and array or scalar-shape changes may need custom transforms.\n\
+         -- Migrate this column manually to the exact desired enum type, then rerun uvg. Other schema changes are withheld."
+    );
+}
+
+#[test]
+fn test_diff_postgres_builtin_udt_schema_is_not_enum_identity() {
+    let source = schema_pg(vec![table("events")
+        .column(col("id").udt("int4").udt_schema("pg_catalog").build())
+        .pk("events_pkey", &["id"])
+        .build()]);
+    let target = source.clone();
+
+    let changes = compute_changes(&source, &target, &default_options(Dialect::Postgres));
+
+    assert!(
+        changes.is_empty(),
+        "built-in type unexpectedly drifted: {changes:#?}"
+    );
+}
+
+#[test]
+fn test_diff_blocks_all_sql_when_postgres_enum_labels_drift() {
+    let enum_table = table("events")
+        .column(col("id").build())
+        .column(
+            col("status")
+                .udt("status")
+                .udt_schema("public")
+                .data_type("USER-DEFINED")
+                .build(),
+        )
+        .pk("events_pkey", &["id"])
+        .build();
+    let unrelated_new_table = table("audit_log")
+        .column(col("id").build())
+        .pk("audit_log_pkey", &["id"])
+        .build();
+    let desired_values = vec!["draft".to_string(), "live\nDROP TABLE users;".to_string()];
+    let drift_cases = [
+        vec!["draft".to_string()],
+        vec!["draft".to_string(), "obsolete".to_string()],
+        vec!["live\nDROP TABLE users;".to_string(), "draft".to_string()],
+    ];
+
+    for target_values in drift_cases {
+        let source = schema_pg_with_enums(
+            vec![enum_table.clone(), unrelated_new_table.clone()],
+            vec![EnumInfo {
+                name: "status".to_string(),
+                schema: Some("public".to_string()),
+                values: desired_values.clone(),
+            }],
+        );
+        let target = schema_pg_with_enums(
+            vec![enum_table.clone()],
+            vec![EnumInfo {
+                name: "status".to_string(),
+                schema: Some("public".to_string()),
+                values: target_values,
+            }],
+        );
+
+        let changes = compute_changes(&source, &target, &default_options(Dialect::Postgres));
+
+        assert_eq!(changes.len(), 1, "changes: {changes:#?}");
+        assert_eq!(changes[0].kind, crate::output::ChangeKind::Other);
+        assert!(changes[0].sql.starts_with("-- UVG-BLOCKED:"));
+        assert!(changes[0].sql.contains("\\nDROP TABLE users;"));
+        assert!(
+            changes[0].sql.lines().all(|line| line.starts_with("--")),
+            "blocker leaked executable SQL: {}",
+            changes[0].sql
+        );
+        assert!(!changes[0].sql.contains("CREATE TABLE"));
+
+        let rendered = render_changes(&changes, Dialect::Postgres, Dialect::Postgres);
+        assert!(rendered.contains("UVG-BLOCKED"));
+        assert!(!rendered.contains("No schema changes detected"));
+        assert!(!rendered.contains("CREATE TABLE \"audit_log\""));
+    }
 }
 
 #[test]
@@ -132,6 +486,73 @@ fn test_diff_pg_serial_with_divergent_sequences_still_drifts() {
         ddl.contains("SET DEFAULT") || ddl.contains("DROP DEFAULT"),
         "Same-dialect divergent sequences should drift, got: {ddl}"
     );
+}
+
+#[test]
+fn test_diff_empty_postgres_target_creates_and_preserves_shared_sequence() {
+    let shared_default = "nextval('payment_payment_id_seq'::regclass)";
+    let source = schema_pg(vec![
+        table("payment")
+            .column(col("payment_id").default_val(shared_default).build())
+            .pk("payment_pkey", &["payment_id"])
+            .build(),
+        table("payment_p2022_01")
+            .column(col("payment_id").default_val(shared_default).build())
+            .pk("payment_p2022_01_pkey", &["payment_id"])
+            .build(),
+    ]);
+    let target = schema_pg(Vec::new());
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+
+    let sequence_pos = ddl
+        .find("CREATE SEQUENCE payment_payment_id_seq;")
+        .expect("missing sequence declaration");
+    let table_pos = ddl
+        .find("CREATE TABLE \"payment_p2022_01\"")
+        .expect("missing table declaration");
+    assert!(sequence_pos < table_pos);
+    assert!(ddl.contains(
+        "\"payment_id\" INTEGER NOT NULL DEFAULT nextval('payment_payment_id_seq'::regclass)"
+    ));
+
+    let converged = diff_schemas(&source, &source, &default_options(Dialect::Postgres));
+    assert!(converged.contains("No schema changes detected"));
+}
+
+#[test]
+fn test_diff_replaces_same_named_postgres_index_when_method_changes() {
+    let source = schema_pg(vec![table("film")
+        .column(col("film_id").build())
+        .column(col("fulltext").udt("tsvector").build())
+        .pk("film_pkey", &["film_id"])
+        .index_with_kwargs(
+            "film_fulltext_idx",
+            &["fulltext"],
+            false,
+            &[("postgresql_using", "gist")],
+        )
+        .build()]);
+    let target = schema_pg(vec![table("film")
+        .column(col("film_id").build())
+        .column(col("fulltext").udt("tsvector").build())
+        .pk("film_pkey", &["film_id"])
+        .index("film_fulltext_idx", &["fulltext"], false)
+        .build()]);
+
+    let ddl = diff_schemas(&source, &target, &default_options(Dialect::Postgres));
+
+    assert!(ddl.contains("DROP INDEX IF EXISTS \"film_fulltext_idx\";"));
+    assert!(
+        ddl.contains("CREATE INDEX \"film_fulltext_idx\" ON \"film\" USING gist (\"fulltext\");")
+    );
+    assert!(
+        ddl.find("DROP INDEX").unwrap() < ddl.find("CREATE INDEX").unwrap(),
+        "method replacement must drop before reusing the name: {ddl}"
+    );
+
+    let converged = diff_schemas(&source, &source, &default_options(Dialect::Postgres));
+    assert!(converged.contains("No schema changes detected"));
 }
 
 #[test]

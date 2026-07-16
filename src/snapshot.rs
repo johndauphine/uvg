@@ -50,7 +50,7 @@ impl SnapshotFile {
     }
 }
 
-pub(crate) fn write(path: &Path, schema: &IntrospectedSchema) -> Result<()> {
+pub fn write(path: &Path, schema: &IntrospectedSchema) -> Result<()> {
     let snapshot = SnapshotFile::from_schema(schema);
     let raw = serde_yaml::to_string(&snapshot).context("failed to serialize snapshot YAML")?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -60,7 +60,7 @@ pub(crate) fn write(path: &Path, schema: &IntrospectedSchema) -> Result<()> {
     fs::write(path, raw).with_context(|| format!("failed to write snapshot {}", path.display()))
 }
 
-pub(crate) fn load(path: &Path) -> Result<IntrospectedSchema> {
+pub fn load(path: &Path) -> Result<IntrospectedSchema> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read snapshot {}", path.display()))?;
     load_str(&raw).with_context(|| format!("failed to load snapshot {}", path.display()))

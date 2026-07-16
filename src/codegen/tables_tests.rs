@@ -476,8 +476,14 @@ fn test_tables_postgresql_sequence_nonstandard_name() {
         .pk("simple_items_pkey", &["id"])
         .build()]);
     let output = generate(&schema, &GeneratorOptions::default());
-    assert!(output.contains("Sequence('test_seq')"));
-    assert!(output.contains("primary_key=True"));
+    let id_column = output
+        .lines()
+        .find(|line| line.contains("Column('id'"))
+        .expect("id column");
+    assert_eq!(
+        id_column,
+        "    Column('id', Integer, Sequence('test_seq'), primary_key=True),"
+    );
     assert!(output.contains("from sqlalchemy import"));
     assert!(output.contains("Sequence"));
 }
@@ -535,6 +541,31 @@ fn test_tables_json_default() {
     let output = generate(&schema, &GeneratorOptions::default());
     assert!(output.contains("Column('json', JSON)"));
     assert!(output.contains("from sqlalchemy.dialects.postgresql import JSON"));
+}
+
+/// Pagila's film.fulltext column uses PostgreSQL's dialect-only TSVECTOR type.
+#[test]
+fn test_tables_postgresql_tsvector_import() {
+    let schema = schema_pg(vec![table("film")
+        .column(col("fulltext").udt("tsvector").nullable().build())
+        .build()]);
+    let output = generate(&schema, &GeneratorOptions::default());
+
+    assert_eq!(
+        output,
+        concat!(
+            "from sqlalchemy import Column, MetaData, Table\n",
+            "from sqlalchemy.dialects.postgresql import TSVECTOR\n",
+            "\n",
+            "metadata = MetaData()\n",
+            "\n",
+            "\n",
+            "t_film = Table(\n",
+            "    'film', metadata,\n",
+            "    Column('fulltext', TSVECTOR)\n",
+            ")\n",
+        )
+    );
 }
 
 /// Adapted from sqlacodegen test_arrays (basic).

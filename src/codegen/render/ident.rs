@@ -9,6 +9,25 @@ pub(in crate::codegen) fn quote_identifier(name: &str, dialect: Dialect) -> Stri
     }
 }
 
+/// Quote an object name and preserve its explicit schema, including a
+/// dialect-default schema. PostgreSQL enum identity is schema-scoped, so
+/// suppressing `public` here could make a declaration or column bind to a
+/// different type under a caller-controlled search_path.
+pub(in crate::codegen) fn qualified_object_name(
+    schema: Option<&str>,
+    name: &str,
+    dialect: Dialect,
+) -> String {
+    match schema.filter(|schema| !schema.is_empty()) {
+        Some(schema) => format!(
+            "{}.{}",
+            quote_identifier(schema, dialect),
+            quote_identifier(name, dialect)
+        ),
+        None => quote_identifier(name, dialect),
+    }
+}
+
 /// Generate a qualified table name with schema prefix if non-default.
 /// Maps source default schemas to target default schemas (e.g. PG "public" -> MSSQL "dbo").
 pub(in crate::codegen) fn qualified_table_name(

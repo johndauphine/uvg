@@ -139,6 +139,7 @@ pub(super) async fn apply_migration(
     config: &ConnectionConfig,
     migration: &MigrationFile,
 ) -> Result<()> {
+    validate_migration_plan(config, migration, MigrationDirection::Up)?;
     execute_migration_section(config, migration, MigrationSection::Pre, &migration.pre_sql).await?;
     execute_migration_section(config, migration, MigrationSection::Up, &migration.up_sql).await?;
     execute_migration_section(
@@ -154,6 +155,7 @@ pub(super) async fn apply_down_migration(
     config: &ConnectionConfig,
     migration: &MigrationFile,
 ) -> Result<()> {
+    validate_migration_plan(config, migration, MigrationDirection::Down)?;
     let down_sql = checked_down_sql(migration)?;
     execute_migration_section(
         config,
@@ -170,6 +172,50 @@ pub(super) async fn apply_down_migration(
         &migration.pre_down_sql,
     )
     .await
+}
+
+fn validate_migration_plan(
+    config: &ConnectionConfig,
+    migration: &MigrationFile,
+    direction: MigrationDirection,
+) -> Result<()> {
+    if is_generated_noop_revision(migration) {
+        return Ok(());
+    }
+
+    let sql = migration_plan_sql(migration, direction)?;
+    let source = format!(
+        "migration {} {} ({})",
+        migration.revision,
+        direction.label(),
+        migration.path.display()
+    );
+    crate::apply::validate_apply_blob(&sql, &source, config.dialect()).with_context(|| {
+        format!(
+            "uvg: migration {} {} failed safety validation before any migration SQL was applied and before uvg_version was changed",
+            migration.revision,
+            direction.label()
+        )
+    })
+}
+
+fn is_generated_noop_revision(migration: &MigrationFile) -> bool {
+    let empty_wrappers = migration.pre_sql.trim().is_empty()
+        && migration.post_sql.trim().is_empty()
+        && migration.pre_down_sql.trim().is_empty()
+        && migration.post_down_sql.trim().is_empty();
+    let scaffolded_baseline = migration.revision == crate::init::BASELINE_REVISION
+        && migration.parents.is_empty()
+        && migration.description == crate::init::BASELINE_DESCRIPTION
+        && migration.up_sql.trim() == crate::init::BASELINE_UP_SQL
+        && migration.down_sql.as_deref().map(str::trim) == Some(crate::init::BASELINE_DOWN_SQL)
+        && empty_wrappers;
+    let generated_merge = migration.parents.len() > 1
+        && migration.up_sql.trim() == super::files::GENERATED_MERGE_UP_SQL
+        && migration.down_sql.as_deref().map(str::trim)
+            == Some(super::files::GENERATED_MERGE_DOWN_SQL)
+        && empty_wrappers;
+    scaffolded_baseline || generated_merge
 }
 
 async fn execute_migration_section(

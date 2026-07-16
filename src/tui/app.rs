@@ -48,6 +48,8 @@ pub(super) struct App {
     pub(super) success_msg: Option<String>,
     pub(super) apply_results: Vec<db::StmtResult>,
     pub(super) trust_cert: bool,
+    pub(super) apply_retries: u8,
+    pub(super) parse_check: bool,
 }
 
 impl App {
@@ -71,6 +73,8 @@ impl App {
             success_msg: None,
             apply_results: Vec::new(),
             trust_cert: cli.trust_cert,
+            apply_retries: cli.apply_retries,
+            parse_check: !cli.no_parse_check,
         }
     }
 
@@ -131,7 +135,7 @@ impl App {
     }
 
     pub(super) fn refresh_executable_statement_count(&mut self) {
-        let dialect = crate::cli::dialect_from_url(&self.target_url);
+        let dialect = crate::connection::dialect_from_url(&self.target_url);
         self.executable_statement_count = count_checked_statements(&self.nodes, dialect);
     }
 }

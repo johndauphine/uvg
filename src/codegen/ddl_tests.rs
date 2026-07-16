@@ -3,7 +3,182 @@ use crate::codegen::render::{
     check_predicate_is_portable, format_ddl_default_typed, qualified_table_name, quote_identifier,
     translate_check_predicate,
 };
-use crate::testutil::{col, schema_pg, table};
+use crate::schema::EnumInfo;
+use crate::testutil::{col, schema_pg, schema_pg_with_enums, table};
+
+#[test]
+fn test_full_postgres_ddl_qualifies_and_filters_enum_dependencies() {
+    let used_enum = EnumInfo {
+        name: "Review State".to_string(),
+        schema: Some("tenant data".to_string()),
+        values: vec!["in review".to_string(), "approved".to_string()],
+    };
+    let unused_enum = EnumInfo {
+        name: "Unrelated State".to_string(),
+        schema: Some("tenant data".to_string()),
+        values: vec!["unused".to_string()],
+    };
+    let schema = schema_pg_with_enums(
+        vec![table("reviews")
+            .schema("tenant data")
+            .column(col("id").build())
+            .column(
+                col("state")
+                    .udt("Review State")
+                    .udt_schema("tenant data")
+                    .data_type("USER-DEFINED")
+                    .build(),
+            )
+            .column(
+                col("prior_states")
+                    .udt("_Review State")
+                    .udt_schema("tenant data")
+                    .data_type("ARRAY")
+                    .build(),
+            )
+            .pk("reviews_pkey", &["id"])
+            .build()],
+        vec![used_enum, unused_enum],
+    );
+    let options = DdlOptions {
+        target_dialect: Dialect::Postgres,
+        split_tables: false,
+        apply: false,
+        noindexes: false,
+        noconstraints: false,
+        nocomments: false,
+    };
+
+    let output = match DdlGenerator.generate(&schema, None, &options) {
+        DdlOutput::Single(output) => output,
+        DdlOutput::Split(_) => panic!("expected single output"),
+    };
+
+    let create_type =
+        "CREATE TYPE \"tenant data\".\"Review State\" AS ENUM ('in review', 'approved');";
+    assert!(output.contains(create_type), "DDL was: {output}");
+    assert!(
+        output.contains("\"state\" \"tenant data\".\"Review State\" NOT NULL"),
+        "DDL was: {output}"
+    );
+    assert!(
+        output.contains("\"prior_states\" \"tenant data\".\"Review State\"[] NOT NULL"),
+        "DDL was: {output}"
+    );
+    assert!(!output.contains("Unrelated State"), "DDL was: {output}");
+    assert!(
+        output.find(create_type).unwrap() < output.find("CREATE TABLE").unwrap(),
+        "enum must precede its table: {output}"
+    );
+}
+
+#[test]
+fn test_postgres_shared_sequence_is_created_once_and_preserved() {
+    let shared_default = "nextval('payment_payment_id_seq'::regclass)";
+    let schema = schema_pg(vec![
+        table("payment")
+            .column(col("payment_id").default_val(shared_default).build())
+            .pk("payment_pkey", &["payment_id"])
+            .build(),
+        table("payment_p2022_01")
+            .column(col("payment_id").default_val(shared_default).build())
+            .pk("payment_p2022_01_pkey", &["payment_id"])
+            .build(),
+    ]);
+
+    let output = match DdlGenerator.generate(
+        &schema,
+        None,
+        &crate::cli::DdlOptions {
+            target_dialect: Dialect::Postgres,
+            split_tables: false,
+            apply: false,
+            noindexes: false,
+            noconstraints: false,
+            nocomments: false,
+        },
+    ) {
+        DdlOutput::Single(output) => output,
+        DdlOutput::Split(_) => panic!("expected single DDL output"),
+    };
+
+    assert_eq!(
+        output
+            .matches("CREATE SEQUENCE payment_payment_id_seq;")
+            .count(),
+        1
+    );
+    assert_eq!(
+        output
+            .matches("INTEGER NOT NULL DEFAULT nextval('payment_payment_id_seq'::regclass)")
+            .count(),
+        2
+    );
+    assert!(!output.contains("SERIAL"));
+    assert!(
+        output.find("CREATE SEQUENCE").unwrap() < output.find("CREATE TABLE").unwrap(),
+        "sequence must be created before referencing tables: {output}"
+    );
+}
+
+#[test]
+fn test_postgres_single_owner_sequence_remains_serial() {
+    let schema = schema_pg(vec![table("simple_items")
+        .column(
+            col("id")
+                .default_val("nextval('simple_items_id_seq'::regclass)")
+                .build(),
+        )
+        .pk("simple_items_pkey", &["id"])
+        .build()]);
+    let options = DdlOptions {
+        target_dialect: Dialect::Postgres,
+        split_tables: false,
+        apply: false,
+        noindexes: false,
+        noconstraints: false,
+        nocomments: false,
+    };
+
+    let output = match DdlGenerator.generate(&schema, None, &options) {
+        DdlOutput::Single(output) => output,
+        DdlOutput::Split(_) => panic!("expected single DDL output"),
+    };
+
+    assert!(output.contains("\"id\" SERIAL"));
+    assert!(!output.contains("CREATE SEQUENCE"));
+}
+
+#[test]
+fn test_postgres_non_btree_index_method_is_preserved() {
+    let schema = schema_pg(vec![table("film")
+        .column(col("film_id").build())
+        .column(col("fulltext").udt("tsvector").build())
+        .pk("film_pkey", &["film_id"])
+        .index_with_kwargs(
+            "film_fulltext_idx",
+            &["fulltext"],
+            false,
+            &[("postgresql_using", "gist")],
+        )
+        .build()]);
+    let options = DdlOptions {
+        target_dialect: Dialect::Postgres,
+        split_tables: false,
+        apply: false,
+        noindexes: false,
+        noconstraints: false,
+        nocomments: false,
+    };
+
+    let output = match DdlGenerator.generate(&schema, None, &options) {
+        DdlOutput::Single(output) => output,
+        DdlOutput::Split(_) => panic!("expected single DDL output"),
+    };
+
+    assert!(output
+        .contains("CREATE INDEX \"film_fulltext_idx\" ON \"film\" USING gist (\"fulltext\");"));
+}
 
 #[test]
 fn test_quote_identifier_pg() {
@@ -372,7 +547,14 @@ fn test_json_default_dropped_on_mysql_target() {
         noconstraints: false,
         nocomments: false,
     };
-    let ddl = generate_create_table(&t, Dialect::Postgres, Dialect::Mysql, &options);
+    let ddl = generate_create_table(
+        &t,
+        Dialect::Postgres,
+        Dialect::Mysql,
+        &options,
+        &Default::default(),
+        &[],
+    );
 
     // The columns themselves are still emitted; only the DEFAULT is dropped.
     assert!(ddl.contains("`settings` JSON"), "DDL was: {ddl}");
@@ -413,7 +595,14 @@ fn test_json_default_kept_on_pg_target() {
         noconstraints: false,
         nocomments: false,
     };
-    let ddl = generate_create_table(&t, Dialect::Postgres, Dialect::Postgres, &options);
+    let ddl = generate_create_table(
+        &t,
+        Dialect::Postgres,
+        Dialect::Postgres,
+        &options,
+        &Default::default(),
+        &[],
+    );
     assert!(
         ddl.contains("DEFAULT '{}'"),
         "PG should preserve JSON default: {ddl}"
@@ -437,7 +626,14 @@ fn test_generate_create_table_pg_to_mysql() {
         noconstraints: false,
         nocomments: false,
     };
-    let ddl = generate_create_table(&t, Dialect::Postgres, Dialect::Mysql, &options);
+    let ddl = generate_create_table(
+        &t,
+        Dialect::Postgres,
+        Dialect::Mysql,
+        &options,
+        &Default::default(),
+        &[],
+    );
     assert!(ddl.contains("CREATE TABLE `users`"), "DDL was: {ddl}");
     assert!(ddl.contains("`id` INT NOT NULL"), "DDL was: {ddl}");
     assert!(
@@ -463,7 +659,14 @@ fn test_generate_create_table_pg_to_pg() {
         noconstraints: false,
         nocomments: false,
     };
-    let ddl = generate_create_table(&t, Dialect::Postgres, Dialect::Postgres, &options);
+    let ddl = generate_create_table(
+        &t,
+        Dialect::Postgres,
+        Dialect::Postgres,
+        &options,
+        &Default::default(),
+        &[],
+    );
     assert!(ddl.contains("\"id\" INTEGER NOT NULL"));
     assert!(ddl.contains("\"price\" NUMERIC(10, 2) NOT NULL"));
 }

@@ -24,6 +24,16 @@ impl ColumnInfoBuilder {
         self
     }
 
+    pub fn udt_schema(mut self, schema: &str) -> Self {
+        self.inner.udt_schema = Some(schema.to_string());
+        self
+    }
+
+    pub fn data_type(mut self, data_type: &str) -> Self {
+        self.inner.data_type = data_type.to_string();
+        self
+    }
+
     pub fn nullable(mut self) -> Self {
         self.inner.is_nullable = true;
         self

@@ -32,6 +32,8 @@ use crate::dialect::Dialect;
 /// `match` to handle it — the coverage is compiler-enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChangeKind {
+    CreateSequence,
+    CreateType,
     CreateTable,
     DropTable,
     AddColumn,

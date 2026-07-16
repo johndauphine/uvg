@@ -7,7 +7,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RiskClass {
+pub enum RiskClass {
     Safe,
     Blocking,
     Rebuild,
@@ -47,14 +47,23 @@ impl<'de> Deserialize<'de> for RiskClass {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct AnthropicConfig {
+pub struct AnthropicConfig {
     api_key: String,
     model: String,
 }
 
+impl std::fmt::Debug for AnthropicConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnthropicConfig")
+            .field("api_key", &"***")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
 impl AnthropicConfig {
-    pub(crate) fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self> {
         Self::from_api_key(std::env::var("ANTHROPIC_API_KEY").ok())
     }
 
@@ -69,7 +78,7 @@ impl AnthropicConfig {
     }
 }
 
-pub(crate) async fn classify_changes(
+pub async fn classify_changes(
     config: &AnthropicConfig,
     changes: &[Change],
 ) -> Result<Vec<RiskClass>> {
@@ -110,7 +119,7 @@ pub(crate) async fn classify_changes(
     parse_classification_text(&text, changes.len())
 }
 
-pub(crate) fn annotate_changes(changes: &[Change], risks: &[RiskClass]) -> Result<Vec<Change>> {
+pub fn annotate_changes(changes: &[Change], risks: &[RiskClass]) -> Result<Vec<Change>> {
     if changes.len() != risks.len() {
         bail!(
             "risk classifier returned {} result(s) for {} change(s)",

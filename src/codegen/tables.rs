@@ -281,17 +281,8 @@ fn generate_table(
             }
         }
 
-        // Primary key
-        if is_primary_key_column(&col.name, &table.constraints) {
-            col_args.push("primary_key=True".to_string());
-        }
-
-        // Nullable (only emit if explicitly False for non-PK columns)
-        if !col.is_nullable && !is_primary_key_column(&col.name, &table.constraints) {
-            col_args.push("nullable=False".to_string());
-        }
-
-        // Server default / Sequence
+        // Sequence is a positional Column() argument, so it must be emitted
+        // before keyword arguments such as primary_key and nullable.
         if let Some(ref default) = col.column_default {
             if is_serial_default(default, dialect) {
                 // Check for non-standard sequence name → emit Sequence()
@@ -315,7 +306,22 @@ fn generate_table(
                         }
                     }
                 }
-            } else {
+            }
+        }
+
+        // Primary key
+        if is_primary_key_column(&col.name, &table.constraints) {
+            col_args.push("primary_key=True".to_string());
+        }
+
+        // Nullable (only emit if explicitly False for non-PK columns)
+        if !col.is_nullable && !is_primary_key_column(&col.name, &table.constraints) {
+            col_args.push("nullable=False".to_string());
+        }
+
+        // Non-sequence server default
+        if let Some(ref default) = col.column_default {
+            if !is_serial_default(default, dialect) {
                 imports.add("sqlalchemy", "text");
                 let formatted = format_server_default(default, dialect);
                 col_args.push(format!("server_default={formatted}"));

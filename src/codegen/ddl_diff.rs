@@ -11,13 +11,17 @@ use crate::ddl_typemap;
 use crate::dialect::Dialect;
 use crate::output::{Change, ChangeKind};
 use crate::schema::{
-    ColumnInfo, ConstraintInfo, ConstraintType, IndexInfo, IntrospectedSchema, TableInfo, TableType,
+    ColumnInfo, ConstraintInfo, ConstraintType, EnumInfo, IndexInfo, IntrospectedSchema, TableInfo,
+    TableType,
 };
 
+use super::ddl::{
+    generate_enum_type, generate_sequence, referenced_enums, referenced_sequences, shared_sequences,
+};
 use super::render::{
     check_predicate_is_portable, format_ddl_default_typed, generate_column_def,
-    generate_create_table, generate_indexes, qualified_table_name, quote_identifier,
-    translate_check_predicate,
+    generate_create_table, generate_indexes, postgres_index_method, qualified_object_name,
+    qualified_table_name, quote_identifier, translate_check_predicate,
 };
 
 /// Compute the schema diff as a stream of tagged `Change` records.
@@ -64,7 +68,151 @@ pub fn compute_changes(
         })
         .collect();
 
+    // PostgreSQL enum types are schema-scoped dependencies. Only source enums
+    // referenced by the already-filtered table set participate, while the
+    // complete target registry remains visible so an existing orphan type is
+    // not recreated. Compare ordered labels as well as identity: PostgreSQL
+    // enum ordering is semantic, and silently accepting label drift would
+    // falsely report convergence.
+    let mut enum_changes: Vec<Change> = Vec::new();
+    let mut enum_blockers: Vec<Change> = Vec::new();
+    if target_dialect.supports_native_enums() {
+        let target_enums: HashMap<(&str, &str), &EnumInfo> = target
+            .enums
+            .iter()
+            .map(|enum_info| {
+                (
+                    (
+                        enum_identity_schema(enum_info, target_dialect),
+                        enum_info.name.as_str(),
+                    ),
+                    enum_info,
+                )
+            })
+            .collect();
+
+        for enum_info in referenced_enums(source) {
+            let schema = enum_identity_schema(enum_info, source_dialect);
+            let routing_schema = if schema == target_dialect.default_schema() {
+                String::new()
+            } else {
+                schema.to_string()
+            };
+            match target_enums.get(&(schema, enum_info.name.as_str())) {
+                Some(target_enum) if target_enum.values != enum_info.values => {
+                    enum_blockers.push(Change {
+                        table_schema: routing_schema,
+                        table_name: None,
+                        sql: enum_label_drift_blocker(enum_info, target_enum, target_dialect),
+                        kind: ChangeKind::Other,
+                    });
+                }
+                Some(_) => {}
+                None => enum_changes.push(Change {
+                    table_schema: routing_schema,
+                    table_name: None,
+                    sql: generate_enum_type(enum_info, target_dialect),
+                    kind: ChangeKind::CreateType,
+                }),
+            }
+        }
+    }
+
+    // Changing an existing PostgreSQL column between enum identities is not
+    // safely automatable as a generic ALTER: distinct enums have no implicit
+    // cast, column defaults are converted separately from USING, and arrays
+    // or scalar/array shape changes can require data-specific transforms.
+    // Detect the full schema/name/shape identity before canonical type
+    // mapping discards it, then withhold the entire executable plan just as
+    // we do for enum-label drift.
+    if source_dialect == Dialect::Postgres && target_dialect == Dialect::Postgres {
+        for source_table in source
+            .tables
+            .iter()
+            .filter(|table| table.table_type == TableType::Table)
+        {
+            let key = (
+                normalize_schema(&source_table.schema, &mysql_defaults),
+                source_table.name.as_str(),
+            );
+            let Some(target_table) = target_map.get(&key) else {
+                continue;
+            };
+            let target_columns: HashMap<&str, &ColumnInfo> = target_table
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), column))
+                .collect();
+
+            for source_column in &source_table.columns {
+                let Some(target_column) = target_columns.get(source_column.name.as_str()) else {
+                    continue;
+                };
+                let source_identity = PostgresEnumColumnIdentity::resolve(
+                    source_column,
+                    &source_table.schema,
+                    &source.enums,
+                );
+                let target_identity = PostgresEnumColumnIdentity::resolve(
+                    target_column,
+                    &target_table.schema,
+                    &target.enums,
+                );
+                if (source_identity.is_some() || target_identity.is_some())
+                    && source_identity != target_identity
+                {
+                    enum_blockers.push(Change {
+                        table_schema: normalize_schema(&source_table.schema, &mysql_defaults)
+                            .to_string(),
+                        table_name: Some(source_table.name.clone()),
+                        sql: enum_column_identity_drift_blocker(
+                            source_table,
+                            source_column,
+                            target_column,
+                            source_identity.as_ref(),
+                            target_identity.as_ref(),
+                        ),
+                        kind: ChangeKind::Other,
+                    });
+                }
+            }
+        }
+    }
+
+    // Withhold every executable statement until enum drift is resolved. The
+    // returned blob is entirely comments, so direct apply paths reject it as
+    // non-executable rather than partially applying unrelated changes.
+    if !enum_blockers.is_empty() {
+        return enum_blockers;
+    }
+
     let mut changes: Vec<Change> = Vec::new();
+    let source_shared_sequences = shared_sequences(source);
+
+    // Preserve PostgreSQL sequence identity before creating columns that
+    // share one nextval() source. A plain CREATE intentionally fails if an
+    // orphaned target sequence is invisible through column defaults; unlike
+    // IF NOT EXISTS, that keeps the generated DOWN migration from dropping a
+    // sequence it did not create.
+    if source_dialect == Dialect::Postgres && target_dialect == Dialect::Postgres {
+        let target_sequences = referenced_sequences(target)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for sequence in &source_shared_sequences {
+            if !target_sequences.contains(sequence.as_str()) {
+                changes.push(Change {
+                    table_schema: String::new(),
+                    table_name: None,
+                    sql: generate_sequence(sequence),
+                    kind: ChangeKind::CreateSequence,
+                });
+            }
+        }
+    }
+
+    // Sequences retain their established ordering before enum declarations;
+    // both dependency classes still precede tables.
+    changes.extend(enum_changes);
 
     // New tables (in source, not in target)
     let sorted_source = topo_sort_tables(&source.tables);
@@ -82,7 +230,14 @@ pub fn compute_changes(
             changes.push(Change {
                 table_schema: schema.clone(),
                 table_name: Some(name.clone()),
-                sql: generate_create_table(table, source_dialect, target_dialect, options),
+                sql: generate_create_table(
+                    table,
+                    source_dialect,
+                    target_dialect,
+                    options,
+                    &source_shared_sequences,
+                    &source.enums,
+                ),
                 kind: ChangeKind::CreateTable,
             });
             if !options.noindexes {
@@ -149,6 +304,8 @@ pub fn compute_changes(
                 target_table,
                 source_dialect,
                 target_dialect,
+                &source_shared_sequences,
+                &source.enums,
             ));
             table_sql.extend(
                 constraint_adds
@@ -227,6 +384,88 @@ pub fn diff_schemas(
     render_changes(&changes, source_dialect, target_dialect)
 }
 
+fn enum_identity_schema(enum_info: &EnumInfo, dialect: Dialect) -> &str {
+    enum_info
+        .schema
+        .as_deref()
+        .unwrap_or_else(|| dialect.default_schema())
+}
+
+fn enum_label_drift_blocker(
+    source: &EnumInfo,
+    target: &EnumInfo,
+    target_dialect: Dialect,
+) -> String {
+    let identity = qualified_object_name(source.schema.as_deref(), &source.name, target_dialect);
+    format!(
+        "-- UVG-BLOCKED: PostgreSQL enum label drift for {}\n\
+         -- Desired source labels: {:?}\n\
+         -- Current target labels: {:?}\n\
+         -- uvg will not alter enum labels automatically: additions can have transaction-ordering constraints, while removal or reordering generally requires replacing the type.\n\
+         -- Migrate this enum manually so the target labels and order exactly match the source, then rerun uvg. Other schema changes are withheld.",
+        flatten_sql_comment(&identity),
+        source.values,
+        target.values,
+    )
+}
+
+fn enum_column_identity_drift_blocker(
+    table: &TableInfo,
+    source_column: &ColumnInfo,
+    target_column: &ColumnInfo,
+    source_identity: Option<&PostgresEnumColumnIdentity>,
+    target_identity: Option<&PostgresEnumColumnIdentity>,
+) -> String {
+    let table_name = qualified_object_name(Some(&table.schema), &table.name, Dialect::Postgres);
+    let column_name = quote_identifier(&source_column.name, Dialect::Postgres);
+    let desired_type = postgres_column_type_label(source_column, source_identity);
+    let current_type = postgres_column_type_label(target_column, target_identity);
+    format!(
+        "-- UVG-BLOCKED: PostgreSQL enum column type drift for {}.{}\n\
+         -- Desired source type: {}\n\
+         -- Current target type: {}\n\
+         -- uvg will not alter enum column identity automatically: distinct enums require explicit data casts, defaults are converted separately, and array or scalar-shape changes may need custom transforms.\n\
+         -- Migrate this column manually to the exact desired enum type, then rerun uvg. Other schema changes are withheld.",
+        flatten_sql_comment(&table_name),
+        flatten_sql_comment(&column_name),
+        flatten_sql_comment(&desired_type),
+        flatten_sql_comment(&current_type),
+    )
+}
+
+fn postgres_column_type_label(
+    column: &ColumnInfo,
+    identity: Option<&PostgresEnumColumnIdentity>,
+) -> String {
+    identity.map_or_else(
+        || {
+            let canonical = ddl_typemap::to_canonical(column, Dialect::Postgres);
+            format!(
+                "non-enum or unresolved {}",
+                ddl_typemap::from_canonical(&canonical, Dialect::Postgres).sql_type
+            )
+        },
+        PostgresEnumColumnIdentity::sql_type,
+    )
+}
+
+fn flatten_sql_comment(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(escaped, "\\u{{{:x}}}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 /// Build the set of MySQL database names to treat as defaults for diff normalization.
 fn build_mysql_defaults(
     source: &IntrospectedSchema,
@@ -269,6 +508,8 @@ fn diff_table_columns(
     target: &TableInfo,
     source_dialect: Dialect,
     target_dialect: Dialect,
+    shared_sequences: &std::collections::BTreeSet<String>,
+    source_enums: &[EnumInfo],
 ) -> Vec<(ChangeKind, String)> {
     let mut stmts: Vec<(ChangeKind, String)> = Vec::new();
     let tname = qualified_table_name(&source.schema, &source.name, source_dialect, target_dialect);
@@ -287,8 +528,14 @@ fn diff_table_columns(
     // New columns
     for col in &source.columns {
         if !target_cols.contains_key(col.name.as_str()) {
-            let col_def =
-                generate_column_def(col, &source.constraints, source_dialect, target_dialect);
+            let col_def = generate_column_def(
+                col,
+                &source.constraints,
+                source_dialect,
+                target_dialect,
+                shared_sequences,
+                crate::codegen::find_enum_for_ddl_column(col, &source.schema, source_enums),
+            );
             let col_def = col_def.trim();
             let add_clause = match target_dialect {
                 Dialect::Mssql => "ADD",
@@ -793,12 +1040,26 @@ fn diff_table_indexes(
     source_dialect: Dialect,
     target_dialect: Dialect,
 ) -> (Vec<String>, Vec<String>) {
-    let target_names: HashSet<&str> = target.indexes.iter().map(|idx| idx.name.as_str()).collect();
-    let source_names: HashSet<&str> = source.indexes.iter().map(|idx| idx.name.as_str()).collect();
+    let target_by_name: HashMap<&str, &IndexInfo> = target
+        .indexes
+        .iter()
+        .map(|index| (index.name.as_str(), index))
+        .collect();
+    let source_by_name: HashMap<&str, &IndexInfo> = source
+        .indexes
+        .iter()
+        .map(|index| (index.name.as_str(), index))
+        .collect();
     let drops: Vec<String> = target
         .indexes
         .iter()
-        .filter(|idx| !source_names.contains(idx.name.as_str()))
+        .filter(|index| {
+            source_by_name
+                .get(index.name.as_str())
+                .is_none_or(|source_index| {
+                    !indexes_equivalent(source_index, index, source_dialect, target_dialect)
+                })
+        })
         .filter(|idx| !is_constraint_backing_index(idx, &target.constraints, target_dialect))
         .map(|idx| render_dropped_index(source, idx, source_dialect, target_dialect))
         .collect();
@@ -806,11 +1067,46 @@ fn diff_table_indexes(
     let adds: Vec<String> = source
         .indexes
         .iter()
-        .filter(|idx| !target_names.contains(idx.name.as_str()))
+        .filter(|index| {
+            target_by_name
+                .get(index.name.as_str())
+                .is_none_or(|target_index| {
+                    !indexes_equivalent(index, target_index, source_dialect, target_dialect)
+                })
+        })
         .filter(|idx| !is_unique_constraint_index(idx, &source.constraints))
         .map(|idx| render_added_index(source, idx, source_dialect, target_dialect))
         .collect();
     (drops, adds)
+}
+
+fn indexes_equivalent(
+    source: &IndexInfo,
+    target: &IndexInfo,
+    source_dialect: Dialect,
+    target_dialect: Dialect,
+) -> bool {
+    if source.is_unique != target.is_unique || source.columns != target.columns {
+        return false;
+    }
+
+    if source_dialect == Dialect::Postgres && target_dialect == Dialect::Postgres {
+        let source_method = source
+            .kwargs
+            .get("postgresql_using")
+            .filter(|method| !method.is_empty())
+            .map(String::as_str)
+            .unwrap_or("btree");
+        let target_method = target
+            .kwargs
+            .get("postgresql_using")
+            .filter(|method| !method.is_empty())
+            .map(String::as_str)
+            .unwrap_or("btree");
+        return source_method == target_method;
+    }
+
+    true
 }
 
 fn is_constraint_backing_index(
@@ -870,8 +1166,9 @@ fn render_added_index(
         .iter()
         .map(|col| quote_identifier(col, target_dialect))
         .collect();
+    let using = postgres_index_method(index, target_dialect);
     format!(
-        "CREATE {unique}INDEX {} ON {tname} ({});",
+        "CREATE {unique}INDEX {} ON {tname}{using} ({});",
         quote_identifier(&index.name, target_dialect),
         cols.join(", ")
     )
@@ -879,6 +1176,42 @@ fn render_added_index(
 
 /// Compare a single column and emit ALTER statements if different.
 /// Compares type, nullability, and default values.
+#[derive(Debug, PartialEq, Eq)]
+struct PostgresEnumColumnIdentity {
+    schema: String,
+    name: String,
+    is_array: bool,
+}
+
+impl PostgresEnumColumnIdentity {
+    fn resolve(column: &ColumnInfo, table_schema: &str, enums: &[EnumInfo]) -> Option<Self> {
+        let enum_info = crate::codegen::find_enum_for_ddl_column(column, table_schema, enums)?;
+        let fallback_schema = if table_schema.is_empty() {
+            Dialect::Postgres.default_schema()
+        } else {
+            table_schema
+        };
+        Some(Self {
+            schema: enum_info
+                .schema
+                .as_deref()
+                .or(column.udt_schema.as_deref())
+                .unwrap_or(fallback_schema)
+                .to_string(),
+            name: enum_info.name.clone(),
+            is_array: crate::codegen::is_enum_array_column(column),
+        })
+    }
+
+    fn sql_type(&self) -> String {
+        let mut sql_type = qualified_object_name(Some(&self.schema), &self.name, Dialect::Postgres);
+        if self.is_array {
+            sql_type.push_str("[]");
+        }
+        sql_type
+    }
+}
+
 fn diff_column(
     source: &ColumnInfo,
     target: &ColumnInfo,

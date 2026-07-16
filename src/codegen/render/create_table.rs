@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
+
 use crate::cli::DdlOptions;
-use crate::codegen::{is_auto_increment_column, is_primary_key_column};
+use crate::codegen::{find_enum_for_ddl_column, is_auto_increment_column, is_primary_key_column};
 use crate::dialect::Dialect;
-use crate::schema::{ConstraintType, TableInfo};
+use crate::schema::{ConstraintType, EnumInfo, TableInfo};
 
 use super::checks::{check_predicate_is_portable, translate_check_predicate};
 use super::column::generate_column_def;
@@ -13,6 +15,8 @@ pub(in crate::codegen) fn generate_create_table(
     source_dialect: Dialect,
     target_dialect: Dialect,
     options: &DdlOptions,
+    shared_sequences: &BTreeSet<String>,
+    enums: &[EnumInfo],
 ) -> String {
     let qname = qualified_table_name(&table.schema, &table.name, source_dialect, target_dialect);
     let mut parts: Vec<String> = Vec::new();
@@ -36,6 +40,8 @@ pub(in crate::codegen) fn generate_create_table(
             &table.constraints,
             source_dialect,
             target_dialect,
+            shared_sequences,
+            find_enum_for_ddl_column(col, &table.schema, enums),
         ));
     }
 

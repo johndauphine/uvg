@@ -119,6 +119,7 @@ fn raw(type_name: &str, source: Dialect) -> MappedType {
         match type_name {
             "INET" => return simple("INET", "str", PG),
             "CIDR" => return simple("CIDR", "str", PG),
+            "TSVECTOR" => return simple("TSVECTOR", "str", PG),
             "" => return simple("NullType", "str", "sqlalchemy.sql.sqltypes"),
             _ => {}
         }
