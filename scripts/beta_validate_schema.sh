@@ -425,6 +425,34 @@ run_step() {
   fi
 }
 
+run_step_capture_stdout() {
+  local step=$1
+  local artifact=$2
+  shift 2
+  local log="$OUT_DIR/logs/${step}.log"
+  local start end seconds
+
+  start=$(date +%s)
+  {
+    echo "step=$step"
+    echo "started_at=$(timestamp_utc)"
+    echo "artifact=$artifact"
+  } > "$log"
+
+  if "$@" > "$artifact" 2>> "$log"; then
+    end=$(date +%s)
+    seconds=$((end - start))
+    printf '%s\tOK\t%s\t%s\t%s\n' "$step" "$seconds" "$artifact" "$log" >> "$MANIFEST"
+    printf -- '- `%s`: OK in %ss\n' "$step" "$seconds" >> "$SUMMARY"
+  else
+    end=$(date +%s)
+    seconds=$((end - start))
+    printf '%s\tFAIL\t%s\t%s\t%s\n' "$step" "$seconds" "$artifact" "$log" >> "$MANIFEST"
+    printf -- '- `%s`: FAIL in %ss, see `%s`\n' "$step" "$seconds" "$log" >> "$SUMMARY"
+    fail_count=$((fail_count + 1))
+  fi
+}
+
 skip_step() {
   local step=$1
   local artifact=$2
@@ -546,7 +574,7 @@ if [[ -n "$MIGRATION_TARGET_URL" ]]; then
   run_step migration-upgrade "$MIGRATIONS_DIR" \
     "$UVG" "${COMMON_ARGS[@]}" upgrade "$MIGRATION_TARGET_URL" --migrations-dir "$MIGRATIONS_DIR"
 
-  run_step migration-current "$OUT_DIR/migration_current.txt" \
+  run_step_capture_stdout migration-current "$OUT_DIR/migration_current.txt" \
     "$UVG" "${COMMON_ARGS[@]}" current "$MIGRATION_TARGET_URL"
 
   run_step post-migration-diff "$OUT_DIR/post_migration_diff.sql" \
